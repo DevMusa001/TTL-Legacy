@@ -6894,3 +6894,33 @@ fn test_min_balance_guard_allows_safe_withdrawal() {
     let result = client.try_withdraw(&owner, &id, &withdrawal_amount);
     assert!(result.is_ok());
 }
+
+// --- Issue #1087: Attach Reason Code to Withdrawal Events ---
+
+#[test]
+fn test_withdrawal_with_reason_short() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 1_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let reason = String::from_str(&env, "Emergency expense");
+    let result = client.try_withdraw_with_reason(&owner, &id, &500_000i128, &Some(reason));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_withdrawal_with_reason_too_long() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 1_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let long_reason = String::from_str(&env, "This is a very long reason that exceeds 64 characters and should be rejected");
+    let result = client.try_withdraw_with_reason(&owner, &id, &500_000i128, &Some(long_reason));
+    assert!(result.is_err());
+}

@@ -235,6 +235,8 @@ pub enum ContractError {
     InvalidNonce = 83,
     // Issue #1088: minimum balance guard
     BelowMinimumBalance = 84,
+    // Issue #1087: withdrawal reason code
+    ReasonTooLong = 85,
 }
 
 #[contract]
@@ -13764,5 +13766,28 @@ impl TtlVaultContract {
     pub fn get_min_balance_guard(env: Env, vault_id: u64) -> Option<i128> {
         let vault = Self::load_vault(&env, vault_id);
         vault.min_balance_guard
+    }
+
+    // --- Issue #1087: Attach Reason Code to Withdrawal Events for Audit Trail ---
+
+    pub fn withdraw_with_reason(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        amount: i128,
+        reason: Option<String>,
+    ) -> Result<(), ContractError> {
+        if let Some(ref r) = reason {
+            if r.len() > 64 {
+                return Err(ContractError::ReasonTooLong);
+            }
+        }
+
+        Self::withdraw(&env, vault_id, caller.clone(), amount)?;
+
+        env.events()
+            .publish((symbol_short!("wd_rsn"), vault_id), (&caller, amount, reason));
+
+        Ok(())
     }
 }
