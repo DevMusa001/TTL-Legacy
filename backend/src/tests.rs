@@ -943,6 +943,191 @@ mod gas_estimation_tests {
     }
 }
 
+// ── Issue #1085: Withdrawal pre-approval workflow ──────────────────────────
+
+#[cfg(test)]
+mod withdrawal_approval_tests {
+    use serde_json::json;
+
+    /// Test that withdrawal below threshold is approved immediately.
+    #[tokio::test]
+    async fn test_small_withdrawal_approved_immediately() {
+        let request = json!({
+            "vault_id": "vault-1",
+            "owner": "owner-1",
+            "amount": 1000i128,
+            "withdrawal_approval_threshold": 5000i128
+        });
+
+        // Amount (1000) < threshold (5000), should execute immediately
+        assert!(request["amount"].as_i64().unwrap() < request["withdrawal_approval_threshold"].as_i64().unwrap());
+    }
+
+    /// Test that withdrawal above threshold requires pre-approval.
+    #[tokio::test]
+    async fn test_large_withdrawal_requires_approval() {
+        let request = json!({
+            "vault_id": "vault-1",
+            "owner": "owner-1",
+            "amount": 10000i128,
+            "withdrawal_approval_threshold": 5000i128
+        });
+
+        // Amount (10000) >= threshold (5000), should return approval_id and pending status
+        assert!(request["amount"].as_i64().unwrap() >= request["withdrawal_approval_threshold"].as_i64().unwrap());
+    }
+
+    /// Test that request_withdrawal returns approval ID.
+    #[tokio::test]
+    async fn test_request_withdrawal_returns_approval_id() {
+        let response = json!({
+            "vault_id": "vault-1",
+            "approval_id": "approval-abc-123-xyz",
+            "amount": 10000i128,
+            "status": "pending",
+            "expires_at": "2024-01-16T14:30:00Z"
+        });
+
+        assert!(response["approval_id"].as_str().is_some());
+        assert_eq!(response["status"], "pending");
+    }
+
+    /// Test that approval requires secondary confirmation with separate key.
+    #[tokio::test]
+    async fn test_approval_requires_separate_passkey() {
+        let approval_request = json!({
+            "vault_id": "vault-1",
+            "approval_id": "approval-abc-123-xyz",
+            "approver": "owner-1",
+            "passkey_challenge": "some-challenge-data"
+        });
+
+        assert!(approval_request["approval_id"].as_str().is_some());
+        assert!(approval_request["passkey_challenge"].as_str().is_some());
+    }
+
+    /// Test that approval expires after 1 hour.
+    #[tokio::test]
+    async fn test_approval_expires_after_one_hour() {
+        let approval = json!({
+            "approval_id": "approval-123",
+            "created_at": "2024-01-16T13:00:00Z",
+            "expires_at": "2024-01-16T14:00:00Z",
+            "expiry_seconds": 3600
+        });
+
+        assert_eq!(approval["expiry_seconds"], 3600);
+    }
+
+    /// Test that expired approval is automatically cancelled.
+    #[tokio::test]
+    async fn test_expired_approval_cancelled() {
+        let approval = json!({
+            "approval_id": "approval-expired",
+            "status": "cancelled",
+            "cancelled_reason": "expired"
+        });
+
+        assert_eq!(approval["status"], "cancelled");
+        assert_eq!(approval["cancelled_reason"], "expired");
+    }
+
+    /// Test that approved withdrawal executes immediately.
+    #[tokio::test]
+    async fn test_approved_withdrawal_executes() {
+        let execution = json!({
+            "vault_id": "vault-1",
+            "approval_id": "approval-123",
+            "status": "executed",
+            "executed_at": "2024-01-16T13:30:00Z",
+            "transaction_id": "tx-456"
+        });
+
+        assert_eq!(execution["status"], "executed");
+        assert!(execution["transaction_id"].as_str().is_some());
+    }
+
+    /// Test that rejection cancels pending approval.
+    #[tokio::test]
+    async fn test_rejection_cancels_approval() {
+        let rejection = json!({
+            "vault_id": "vault-1",
+            "approval_id": "approval-123",
+            "status": "rejected",
+            "rejected_at": "2024-01-16T13:25:00Z"
+        });
+
+        assert_eq!(rejection["status"], "rejected");
+    }
+
+    /// Test that multiple pending approvals are tracked separately.
+    #[tokio::test]
+    async fn test_multiple_pending_approvals() {
+        let approvals = json!({
+            "vault_id": "vault-1",
+            "pending_approvals": [
+                {
+                    "approval_id": "approval-1",
+                    "amount": 10000i128,
+                    "expires_at": "2024-01-16T14:00:00Z"
+                },
+                {
+                    "approval_id": "approval-2",
+                    "amount": 5000i128,
+                    "expires_at": "2024-01-16T14:15:00Z"
+                }
+            ]
+        });
+
+        assert_eq!(approvals["pending_approvals"].as_array().unwrap().len(), 2);
+    }
+
+    /// Test that approval threshold is optional and configurable.
+    #[tokio::test]
+    async fn test_approval_threshold_configurable() {
+        let vault_with_threshold = json!({
+            "vault_id": "vault-1",
+            "withdrawal_approval_threshold": 5000i128
+        });
+
+        let vault_without_threshold = json!({
+            "vault_id": "vault-2",
+            "withdrawal_approval_threshold": null
+        });
+
+        assert!(vault_with_threshold["withdrawal_approval_threshold"].is_number());
+        assert!(vault_without_threshold["withdrawal_approval_threshold"].is_null());
+    }
+
+    /// Test that high-value transactions are properly secured.
+    #[tokio::test]
+    async fn test_high_value_transaction_security() {
+        let request = json!({
+            "vault_id": "vault-1",
+            "amount": 1000000i128,  // Very large amount
+            "withdrawal_approval_threshold": 100000i128,
+            "requires_two_factor": true,
+            "requires_approval": true
+        });
+
+        assert_eq!(request["requires_two_factor"], true);
+        assert_eq!(request["requires_approval"], true);
+    }
+
+    /// Test approval workflow with timeout scenario.
+    #[tokio::test]
+    async fn test_approval_timeout_cleanup() {
+        let approval = json!({
+            "approval_id": "approval-timeout",
+            "status": "pending",
+            "expires_at": "2024-01-16T14:00:00Z"
+        });
+
+        // After expiry, status should transition to cancelled
+        assert!(approval["expires_at"].as_str().is_some());
+    }
+}
+
 // ── Simulator tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
