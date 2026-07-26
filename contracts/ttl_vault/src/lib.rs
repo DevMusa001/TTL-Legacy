@@ -11281,14 +11281,28 @@ impl TtlVaultContract {
     }
 
     /// Returns a paginated page of the check-in history for a vault.
+    ///
+    /// History is stored as individual `DataKey::CheckInEntry(vault_id, slot)` keys
+    /// in a ring buffer capped at 50 entries. Each page read fetches only the
+    /// `page_size` entries for that page — no full-Vec deserialization occurs.
+    ///
     /// Entries are returned in chronological order (oldest first).
     /// Returns an empty vec if `page` is beyond the available entries.
+    ///
+    /// # Arguments
+    /// * `vault_id`  - The vault whose history to query
+    /// * `page`      - Zero-based page number
+    /// * `page_size` - Number of entries per page (automatically capped at 50)
     pub fn get_check_in_history_page(
         env: Env,
         vault_id: u64,
         page: u32,
         page_size: u32,
     ) -> Vec<CheckInHistoryEntry> {
+        let page_size = page_size.min(50);
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
         let len: u32 = env
             .storage()
             .persistent()
@@ -11307,6 +11321,9 @@ impl TtlVaultContract {
 
         let mut result: Vec<CheckInHistoryEntry> = Vec::new(&env);
         for i in start..end {
+            // When the buffer has not yet filled (len < 50) head is always 0,
+            // so slot i == i. Once full (len == 50) head points at the oldest
+            // entry and we map logical index i to physical slot (head+i)%50.
             let phys = if len < 50 { i } else { (head + i) % 50 };
             if let Some(entry) = env.storage().persistent().get::<DataKey, CheckInHistoryEntry>(
                 &DataKey::CheckInEntry(vault_id, phys),
@@ -11317,7 +11334,47 @@ impl TtlVaultContract {
         result
     }
 
-    /// Returns the full check-in history for a vault (backward compatible).
+    /// Returns a single check-in history entry by its logical index in O(1).
+    ///
+    /// `index` is zero-based and ordered oldest-first, matching the order returned
+    /// by `get_check_in_history_page`. Only the single `DataKey::CheckInEntry` key
+    /// for that slot is read — no Vec is deserialized.
+    ///
+    /// Returns `None` if `index` is out of bounds or the vault has no history.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault whose history to query
+    /// * `index`    - Zero-based logical index of the entry
+    pub fn get_check_in_history_entry(
+        env: Env,
+        vault_id: u64,
+        index: u32,
+    ) -> Option<CheckInHistoryEntry> {
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInHistoryLen(vault_id))
+            .unwrap_or(0);
+        if index >= len {
+            return None;
+        }
+        let head: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInHistoryHead(vault_id))
+            .unwrap_or(0);
+        let phys = if len < 50 { index } else { (head + index) % 50 };
+        env.storage()
+            .persistent()
+            .get::<DataKey, CheckInHistoryEntry>(&DataKey::CheckInEntry(vault_id, phys))
+    }
+
+    /// Returns the full check-in history for a vault (up to 50 entries).
+    ///
+    /// Reads each of the (up to 50) individual `DataKey::CheckInEntry` keys
+    /// in order — no monolithic Vec is stored or deserialized.
+    /// For large histories prefer `get_check_in_history_page` to limit
+    /// per-call instruction consumption.
     pub fn get_check_in_history(env: Env, vault_id: u64) -> Vec<CheckInHistoryEntry> {
         let len: u32 = env
             .storage()
@@ -11343,51 +11400,6 @@ impl TtlVaultContract {
             }
         }
         result
-    }
-
-    /// Returns a page of check-in history for a vault.
-    ///
-    /// Entries are ordered oldest-first (index 0 is the oldest stored entry).
-    /// `cursor` is the zero-based index of the first entry to return; passing
-    /// `cursor = 0` starts from the oldest entry.  `limit` is capped at 50.
-    ///
-    /// Returns an empty `Vec` when `cursor` is out of bounds or the history is
-    /// empty.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault whose check-in history to page through.
-    /// * `cursor`   - Zero-based index of the first entry to return.
-    /// * `limit`    - Maximum number of entries to return (capped at 50).
-    pub fn get_check_in_history_page(
-        env: Env,
-        vault_id: u64,
-        cursor: u64,
-        limit: u32,
-    ) -> Vec<CheckInHistoryEntry> {
-        const MAX_PAGE_SIZE: u32 = 50;
-        let page_size = limit.min(MAX_PAGE_SIZE);
-
-        let history: Vec<CheckInHistoryEntry> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CheckInHistory(vault_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let total = history.len() as u64;
-
-        // cursor beyond the end of the list → return empty page
-        if cursor >= total || page_size == 0 {
-            return Vec::new(&env);
-        }
-
-        let start = cursor as u32;
-        let end = ((cursor + page_size as u64).min(total)) as u32;
-
-        let mut page = Vec::new(&env);
-        for i in start..end {
-            page.push_back(history.get(i).unwrap());
-        }
-        page
     }
 
     /// Returns the current check-in streak for a vault.
@@ -11606,22 +11618,42 @@ impl TtlVaultContract {
         let mut head: u32 = env.storage().persistent().get(&head_key).unwrap_or(0);
         let entry = CheckInHistoryEntry { timestamp };
 
+        // Ring buffer capped at 50 entries.
+        // While filling (<50): write to slot `len`, then increment len.
+        // Once full (==50): overwrite slot `head` (the oldest), then advance head.
         if len < 50 {
             let entry_key = DataKey::CheckInEntry(vault_id, len);
             env.storage().persistent().set(&entry_key, &entry);
+            env.storage().persistent().extend_ttl(
+                &entry_key,
+                VAULT_TTL_THRESHOLD,
+                VAULT_TTL_LEDGERS,
+            );
             len += 1;
         } else {
             let entry_key = DataKey::CheckInEntry(vault_id, head);
             env.storage().persistent().set(&entry_key, &entry);
+            env.storage().persistent().extend_ttl(
+                &entry_key,
+                VAULT_TTL_THRESHOLD,
+                VAULT_TTL_LEDGERS,
+            );
             head = (head + 1) % 50;
         }
 
-        let vault = Self::load_vault(env, vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Persist updated metadata
+        env.storage().persistent().set(&len_key, &len);
+        env.storage().persistent().extend_ttl(
+            &len_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage().persistent().set(&head_key, &head);
+        env.storage().persistent().extend_ttl(
+            &head_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
     }
 
     fn update_check_in_streak(env: &Env, vault_id: u64, vault: &Vault, now: u64) {
