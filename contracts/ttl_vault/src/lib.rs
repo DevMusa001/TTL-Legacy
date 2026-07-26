@@ -237,6 +237,9 @@ pub enum ContractError {
     BelowMinimumBalance = 84,
     // Issue #1087: withdrawal reason code
     ReasonTooLong = 85,
+    // Issue #1086: recurring withdrawal
+    RecurringWithdrawalNotFound = 86,
+    RecurringWithdrawalNotReady = 87,
 }
 
 #[contract]
@@ -13789,5 +13792,87 @@ impl TtlVaultContract {
             .publish((symbol_short!("wd_rsn"), vault_id), (&caller, amount, reason));
 
         Ok(())
+    }
+
+    // --- Issue #1086: Implement Recurring Withdrawal Schedule for Regular Transfers ---
+
+    pub fn set_recurring_withdrawal(
+        env: Env,
+        vault_id: u64,
+        amount: i128,
+        interval_seconds: u64,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let recurring = RecurringWithdrawal {
+            amount,
+            interval_seconds,
+            destination: destination.clone(),
+            next_at: now + interval_seconds,
+        };
+
+        vault.recurring_withdrawal = Some(recurring);
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("rec_wd"), vault_id), (amount, interval_seconds, &destination));
+
+        Ok(())
+    }
+
+    pub fn execute_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        let recurring = vault.recurring_withdrawal.as_ref()
+            .ok_or(ContractError::RecurringWithdrawalNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < recurring.next_at {
+            return Err(ContractError::RecurringWithdrawalNotReady);
+        }
+
+        if vault.balance < recurring.amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &recurring.destination, &recurring.amount);
+        vault.balance -= recurring.amount;
+
+        if let Some(ref mut rec) = vault.recurring_withdrawal {
+            rec.next_at = now + rec.interval_seconds;
+        }
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("exec_rw"), vault_id), (recurring.amount, now));
+
+        Ok(())
+    }
+
+    pub fn cancel_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        vault.recurring_withdrawal = None;
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("can_rw"), vault_id), ());
+
+        Ok(())
+    }
+
+    pub fn get_recurring_withdrawal(env: Env, vault_id: u64) -> Option<RecurringWithdrawal> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.recurring_withdrawal
     }
 }

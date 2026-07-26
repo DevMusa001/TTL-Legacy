@@ -6924,3 +6924,48 @@ fn test_withdrawal_with_reason_too_long() {
     let result = client.try_withdraw_with_reason(&owner, &id, &500_000i128, &Some(long_reason));
     assert!(result.is_err());
 }
+
+// --- Issue #1086: Recurring Withdrawal ---
+
+#[test]
+fn test_set_recurring_withdrawal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let recipient = Address::generate(&env);
+    let result = client.try_set_recurring_withdrawal(&owner, &id, &100_000i128, &3600u64, &recipient);
+    assert!(result.is_ok());
+
+    let recurring = client.get_recurring_withdrawal(&id);
+    assert!(recurring.is_some());
+}
+
+#[test]
+fn test_execute_recurring_withdrawal_not_ready() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 1_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let recipient = Address::generate(&env);
+    client.set_recurring_withdrawal(&owner, &id, &100_000i128, &3600u64, &recipient).unwrap();
+
+    let result = client.try_execute_recurring_withdrawal(&id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cancel_recurring_withdrawal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let recipient = Address::generate(&env);
+    client.set_recurring_withdrawal(&owner, &id, &100_000i128, &3600u64, &recipient).unwrap();
+
+    assert!(client.get_recurring_withdrawal(&id).is_some());
+
+    client.cancel_recurring_withdrawal(&owner, &id).unwrap();
+    assert!(client.get_recurring_withdrawal(&id).is_none());
+}

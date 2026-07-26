@@ -460,6 +460,8 @@ pub enum DataKey {
     TwoFactorVerified(u64),
     // Issue #1088: minimum balance guard
     MinBalanceGuard(u64),
+    // Issue #1086: recurring withdrawal
+    RecurringWithdrawal(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -748,6 +750,16 @@ pub struct WithdrawalRateLimit {
     pub cooldown_seconds: u64,
 }
 
+/// Recurring withdrawal configuration - Issue #1086
+#[contracttype]
+#[derive(Clone)]
+pub struct RecurringWithdrawal {
+    pub amount: i128,
+    pub interval_seconds: u64,
+    pub destination: Address,
+    pub next_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Vault {
@@ -790,6 +802,8 @@ pub struct Vault {
     pub penalty_recipient: Option<Address>,
     /// Minimum balance guard to prevent vault drainage - Issue #1088
     pub min_balance_guard: Option<i128>,
+    /// Recurring withdrawal configuration - Issue #1086
+    pub recurring_withdrawal: Option<RecurringWithdrawal>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
