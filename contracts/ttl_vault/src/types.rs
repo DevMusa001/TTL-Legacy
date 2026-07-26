@@ -458,6 +458,8 @@ pub enum DataKey {
     // Issue #965: two-factor authentication
     TwoFactorConfig(u64),
     TwoFactorVerified(u64),
+    // Issue #1088: minimum balance guard
+    MinBalanceGuard(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -786,6 +788,8 @@ pub struct Vault {
     pub burn_percentage: u32,
     /// Address that receives inactivity penalty transfers
     pub penalty_recipient: Option<Address>,
+    /// Minimum balance guard to prevent vault drainage - Issue #1088
+    pub min_balance_guard: Option<i128>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395

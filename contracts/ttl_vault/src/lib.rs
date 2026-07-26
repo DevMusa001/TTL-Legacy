@@ -233,6 +233,8 @@ pub enum ContractError {
     InvalidVestingSchedule = 82,
     // Per-delegation nonce mismatch (replay attack prevention)
     InvalidNonce = 83,
+    // Issue #1088: minimum balance guard
+    BelowMinimumBalance = 84,
 }
 
 #[contract]
@@ -1811,6 +1813,21 @@ impl TtlVaultContract {
                 "Insufficient balance",
             );
             return Err(ContractError::InsufficientBalance);
+        }
+
+        // Check minimum balance guard - Issue #1088
+        if let Some(min_guard) = vault.min_balance_guard {
+            if vault.balance - amount < min_guard {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Below minimum balance",
+                );
+                return Err(ContractError::BelowMinimumBalance);
+            }
         }
 
         // Check withdrawal approval threshold - Issue #404
@@ -13726,5 +13743,26 @@ impl TtlVaultContract {
             }
             None => false,
         }
+    }
+
+    // --- Issue #1088: Enforce Minimum Balance Guard to Prevent Vault Drainage ---
+
+    pub fn set_min_balance_guard(
+        env: Env,
+        vault_id: u64,
+        min: i128,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+        vault.min_balance_guard = Some(min);
+        Self::save_vault(&env, vault_id, &vault);
+        env.events()
+            .publish((symbol_short!("minbal"), vault_id), (min,));
+        Ok(())
+    }
+
+    pub fn get_min_balance_guard(env: Env, vault_id: u64) -> Option<i128> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.min_balance_guard
     }
 }

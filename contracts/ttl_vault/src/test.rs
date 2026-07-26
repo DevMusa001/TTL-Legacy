@@ -6856,3 +6856,41 @@ fn test_check_in_history_page_consistent_with_full_history() {
         );
     }
 }
+
+// --- Issue #1088: Enforce Minimum Balance Guard ---
+
+#[test]
+fn test_min_balance_guard_prevents_excessive_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 1_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let min_guard = 500_000i128;
+    client.set_min_balance_guard(&id, &min_guard).unwrap();
+
+    assert_eq!(client.get_min_balance_guard(&id), Some(min_guard));
+
+    let withdrawal_amount = 600_000i128;
+    let result = client.try_withdraw(&owner, &id, &withdrawal_amount);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_min_balance_guard_allows_safe_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 1_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let min_guard = 300_000i128;
+    client.set_min_balance_guard(&id, &min_guard).unwrap();
+
+    let withdrawal_amount = 500_000i128;
+    let result = client.try_withdraw(&owner, &id, &withdrawal_amount);
+    assert!(result.is_ok());
+}
