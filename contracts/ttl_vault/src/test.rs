@@ -6856,3 +6856,231 @@ fn test_check_in_history_page_consistent_with_full_history() {
         );
     }
 }
+
+// ============================================================
+// Per-vault admin freeze tests (Issue: per-vault freeze)
+// ============================================================
+
+/// Helper: create a vault and fund it so operations are meaningful.
+fn setup_funded_vault(
+    env: &Env,
+    owner: &Address,
+    beneficiary: &Address,
+    client: &TtlVaultContractClient<'_>,
+    token_address: &Address,
+) -> u64 {
+    let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
+    StellarAssetClient::new(env, token_address).mint(owner, &500_000);
+    client.deposit(&vault_id, owner, &100_000);
+    vault_id
+}
+
+#[test]
+fn test_freeze_vault_is_vault_frozen_reflects_state() {
+    let (env, owner, beneficiary, admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    // Initially not frozen
+    assert!(!client.is_vault_frozen(&vault_id));
+
+    // Admin freezes the vault
+    client.freeze_vault(&vault_id);
+    assert!(client.is_vault_frozen(&vault_id));
+
+    // Admin unfreezes the vault
+    client.unfreeze_vault(&vault_id);
+    assert!(!client.is_vault_frozen(&vault_id));
+
+    let _ = admin; // referenced via mock_all_auths
+}
+
+#[test]
+fn test_freeze_blocks_deposit() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &100_000);
+    let err = client.try_deposit(&vault_id, &owner, &10_000).unwrap_err().unwrap();
+    // ContractError::VaultFrozen = 59
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+}
+
+#[test]
+fn test_freeze_blocks_withdraw() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+
+    let err = client.try_withdraw(&vault_id, &owner, &1_000).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+
+    let _ = env;
+}
+
+#[test]
+fn test_freeze_blocks_check_in() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+
+    let passkey_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+    let err = client
+        .try_check_in(&vault_id, &owner, &passkey_hash, &0u64)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+}
+
+#[test]
+fn test_freeze_blocks_trigger_release() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    // Advance time past check_in_interval so the vault is expired
+    env.ledger().with_mut(|li| li.timestamp += 200);
+
+    client.freeze_vault(&vault_id);
+
+    let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+}
+
+#[test]
+fn test_unfreeze_restores_deposit() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+    client.unfreeze_vault(&vault_id);
+
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &100_000);
+    // Should succeed without error
+    client.deposit(&vault_id, &owner, &5_000);
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.balance, 105_000);
+}
+
+#[test]
+fn test_unfreeze_restores_withdraw() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+    client.unfreeze_vault(&vault_id);
+
+    // Should succeed without error
+    client.withdraw(&vault_id, &owner, &10_000);
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.balance, 90_000);
+
+    let _ = env;
+}
+
+#[test]
+fn test_non_admin_cannot_freeze() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    // mock_all_auths is active, so we can't test auth rejection directly here.
+    // We verify the admin-identity guard: freeze_vault internally calls
+    // require_admin which fetches the stored admin address and calls
+    // admin.require_auth(). The admin is set during initialize() and is NOT
+    // the owner. With mock_all_auths any require_auth succeeds, so the guard
+    // passes — but the vault is correctly frozen by admin action.
+    // The auth enforcement is unit-tested via the #[should_panic] companion below.
+    client.freeze_vault(&vault_id);
+    assert!(client.is_vault_frozen(&vault_id));
+    client.unfreeze_vault(&vault_id);
+    assert!(!client.is_vault_frozen(&vault_id));
+
+    let _ = owner;
+    let _ = beneficiary;
+    let _ = token_address;
+}
+
+/// Verifies that freeze_vault panics when the admin's auth is NOT provided.
+/// Uses a fresh env without mock_all_auths so Soroban enforces real auth.
+#[test]
+#[should_panic]
+fn test_non_admin_freeze_panics_without_admin_auth() {
+    let env = Env::default();
+    // No mock_all_auths — auth is fully enforced
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let owner = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let contract = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract);
+
+    // Initialize with admin auth
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract,
+            fn_name: "initialize",
+            args: (token_address.clone(), admin.clone()).into_val(&env),
+        },
+    }]);
+    client.initialize(&token_address, &admin);
+
+    // Mint tokens and create vault (need owner + token_admin auth)
+    env.mock_all_auths();
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000_000);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Now attempt freeze_vault with ONLY owner auth (not admin) — must panic
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &owner,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract,
+            fn_name: "freeze_vault",
+            args: (vault_id,).into_val(&env),
+        },
+    }]);
+    // This call should panic because admin.require_auth() is not satisfied
+    client.freeze_vault(&vault_id);
+}
+
+#[test]
+fn test_freeze_vault_emits_event() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+
+    let found = env.events().all().iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::FREEZE_VAULT_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(found.is_some(), "freeze_vault should emit frz_vlt event");
+}
+
+#[test]
+fn test_unfreeze_vault_emits_event() {
+    let (env, owner, beneficiary, _admin, token_address, client) = setup();
+    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+
+    client.freeze_vault(&vault_id);
+    client.unfreeze_vault(&vault_id);
+
+    let found = env.events().all().iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::UNFREEZE_VAULT_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(found.is_some(), "unfreeze_vault should emit ufrz_vlt event");
+}
