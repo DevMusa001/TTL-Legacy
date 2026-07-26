@@ -240,6 +240,8 @@ pub enum ContractError {
     // Issue #1086: recurring withdrawal
     RecurringWithdrawalNotFound = 86,
     RecurringWithdrawalNotReady = 87,
+    // Issue #1084: withdrawal rate limiting
+    WithdrawalRateLimitExceeded = 88,
 }
 
 #[contract]
@@ -1853,6 +1855,32 @@ impl TtlVaultContract {
         // Check withdrawal limits - Issue #566
         Self::check_withdrawal_limits(&env, vault_id, amount)?;
 
+        // Check withdrawal rate limiting - Issue #1084
+        if let Some(limit) = vault.withdrawal_limit_per_window {
+            let now = env.ledger().timestamp();
+            let window_elapsed = now - vault.window_start;
+
+            let mut vault_mut = vault.clone();
+            if window_elapsed >= vault_mut.withdrawal_window_seconds {
+                vault_mut.withdrawn_in_window = 0;
+                vault_mut.window_start = now;
+            }
+
+            if vault_mut.withdrawn_in_window + amount > limit {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Withdrawal rate limit exceeded",
+                );
+                return Err(ContractError::WithdrawalRateLimitExceeded);
+            }
+
+            vault = vault_mut;
+        }
+
         // Check whitelist - Issue #567
         if !Self::is_whitelisted(&env, vault_id, &vault.owner) {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
@@ -1861,6 +1889,11 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Update withdrawal rate tracking - Issue #1084
+        if vault.withdrawal_limit_per_window.is_some() {
+            vault.withdrawn_in_window += amount;
+        }
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -13874,5 +13907,42 @@ impl TtlVaultContract {
     pub fn get_recurring_withdrawal(env: Env, vault_id: u64) -> Option<RecurringWithdrawal> {
         let vault = Self::load_vault(&env, vault_id);
         vault.recurring_withdrawal
+    }
+
+    // --- Issue #1084: Implement Withdrawal Rate Limiting Per Time Window ---
+
+    pub fn set_withdrawal_rate_limit(
+        env: Env,
+        vault_id: u64,
+        limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if limit <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        if window_seconds == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        vault.withdrawal_limit_per_window = Some(limit);
+        vault.withdrawal_window_seconds = window_seconds;
+        vault.window_start = env.ledger().timestamp();
+        vault.withdrawn_in_window = 0;
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("set_rl"), vault_id), (limit, window_seconds));
+
+        Ok(())
+    }
+
+    pub fn get_withdrawal_rate_limit(env: Env, vault_id: u64) -> Option<(i128, u64)> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.withdrawal_limit_per_window.map(|limit| (limit, vault.withdrawal_window_seconds))
     }
 }

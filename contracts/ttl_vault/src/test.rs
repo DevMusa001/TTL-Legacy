@@ -6969,3 +6969,37 @@ fn test_cancel_recurring_withdrawal() {
     client.cancel_recurring_withdrawal(&owner, &id).unwrap();
     assert!(client.get_recurring_withdrawal(&id).is_none());
 }
+
+// --- Issue #1084: Withdrawal Rate Limiting ---
+
+#[test]
+fn test_set_withdrawal_rate_limit() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let result = client.try_set_withdrawal_rate_limit(&owner, &id, &1_000_000i128, &86_400u64);
+    assert!(result.is_ok());
+
+    let limit = client.get_withdrawal_rate_limit(&id);
+    assert_eq!(limit, Some((1_000_000i128, 86_400u64)));
+}
+
+#[test]
+fn test_withdrawal_rate_limit_exceeded() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let deposit_amount = 5_000_000i128;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &deposit_amount);
+    client.deposit(&owner, &id, &deposit_amount).unwrap();
+
+    let daily_limit = 1_000_000i128;
+    client.set_withdrawal_rate_limit(&owner, &id, &daily_limit, &86_400u64).unwrap();
+
+    let first_withdrawal = 800_000i128;
+    assert!(client.try_withdraw(&owner, &id, &first_withdrawal).is_ok());
+
+    let second_withdrawal = 300_000i128;
+    let result = client.try_withdraw(&owner, &id, &second_withdrawal);
+    assert!(result.is_err());
+}

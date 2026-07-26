@@ -462,6 +462,8 @@ pub enum DataKey {
     MinBalanceGuard(u64),
     // Issue #1086: recurring withdrawal
     RecurringWithdrawal(u64),
+    // Issue #1084: withdrawal rate limiting
+    WithdrawalRateLimitConfig(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -804,6 +806,14 @@ pub struct Vault {
     pub min_balance_guard: Option<i128>,
     /// Recurring withdrawal configuration - Issue #1086
     pub recurring_withdrawal: Option<RecurringWithdrawal>,
+    /// Withdrawal rate limit per time window - Issue #1084
+    pub withdrawal_limit_per_window: Option<i128>,
+    /// Time window for withdrawal rate limiting in seconds - Issue #1084
+    pub withdrawal_window_seconds: u64,
+    /// Amount withdrawn in current window - Issue #1084
+    pub withdrawn_in_window: i128,
+    /// Start time of current withdrawal window - Issue #1084
+    pub window_start: u64,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
