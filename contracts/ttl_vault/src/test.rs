@@ -6856,3 +6856,104 @@ fn test_check_in_history_page_consistent_with_full_history() {
         );
     }
 }
+
+// ── Issue #936: Passkey Rotation with Grace Period Tests ──────────────────────
+
+#[test]
+fn test_passkey_rotation_grace_period() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+    client.set_passkey_rotation_period(&vault_id, &owner, &3600u64);
+    client.deprecate_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Within grace period (1800s later), passkey check-in still succeeds
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&vault_id, &owner, &passkey_hash, &0u64);
+
+    // After grace period (> 3600s total from deprecation), check-in fails
+    env.ledger().with_mut(|l| l.timestamp += 2000);
+    let res = client.try_check_in(&vault_id, &owner, &passkey_hash, &0u64);
+    assert!(res.is_err());
+}
+
+// ── Issue #937: Passkey Usage Analytics Tests ──────────────────────────────────
+
+#[test]
+fn test_passkey_usage_analytics_tracking() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey1 = BytesN::from_array(&env, &[1u8; 32]);
+    let passkey2 = BytesN::from_array(&env, &[2u8; 32]);
+
+    client.add_passkey(&vault_id, &owner, &passkey1);
+    client.add_passkey(&vault_id, &owner, &passkey2);
+
+    client.check_in(&vault_id, &owner, &passkey1, &0u64);
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.check_in(&vault_id, &owner, &passkey1, &0u64);
+
+    let analytics = client.get_passkey_analytics(&vault_id);
+    assert_eq!(analytics.len(), 2);
+    let pk1_stat = analytics.get(0).unwrap();
+    assert_eq!(pk1_stat.passkey_hash, passkey1);
+    assert_eq!(pk1_stat.usage_count, 2);
+}
+
+// ── Issue #938: Passkey Challenge-Response Timeout Tests ─────────────────────
+
+#[test]
+fn test_passkey_challenge_timeout_enforcement() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let challenge_id = BytesN::from_array(&env, &[9u8; 32]);
+
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+    client.set_challenge_timeout(&vault_id, &owner, &300u64);
+    client.create_passkey_challenge(&vault_id, &owner, &challenge_id);
+
+    // Verify within 300s timeout -> true
+    env.ledger().with_mut(|l| l.timestamp += 150);
+    let res = client.verify_passkey_challenge(&vault_id, &challenge_id, &passkey_hash);
+    assert_eq!(res, true);
+
+    // Verify after timeout (> 300s from creation) -> Err(ChallengeExpired)
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    let err = client.try_verify_passkey_challenge(&vault_id, &challenge_id, &passkey_hash).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(87)); // ChallengeExpired
+}
+
+// ── Issue #939: Multi-Sig Passkey Requirement Tests ─────────────────────────
+
+#[test]
+fn test_multi_sig_passkey_withdrawal_flow() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    let passkey1 = BytesN::from_array(&env, &[1u8; 32]);
+    let passkey2 = BytesN::from_array(&env, &[2u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey1);
+    client.add_passkey(&vault_id, &owner, &passkey2);
+
+    client.set_multi_sig_threshold(&vault_id, &owner, &2u32);
+
+    // Attempt withdrawal with 1 signature -> fails MultiSigRequired (42)
+    let sigs_one = soroban_sdk::vec![&env, passkey1.clone()];
+    let err = client.try_withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_one).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(42));
+
+    // Attempt withdrawal with duplicate signatures -> fails DuplicateSignature (88)
+    let sigs_dup = soroban_sdk::vec![&env, passkey1.clone(), passkey1.clone()];
+    let err_dup = client.try_withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_dup).unwrap_err().unwrap();
+    assert_eq!(err_dup, soroban_sdk::Error::from_contract_error(88));
+
+    // Withdrawal with 2 distinct valid signatures -> succeeds
+    let sigs_two = soroban_sdk::vec![&env, passkey1.clone(), passkey2.clone()];
+    client.withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_two);
+
+    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+}

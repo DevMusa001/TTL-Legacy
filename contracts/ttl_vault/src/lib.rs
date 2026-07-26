@@ -233,6 +233,11 @@ pub enum ContractError {
     InvalidVestingSchedule = 82,
     // Per-delegation nonce mismatch (replay attack prevention)
     InvalidNonce = 83,
+    PasskeyExpired = 84,
+    PasskeyCompromised = 85,
+    ChallengeNotFound = 86,
+    ChallengeExpired = 87,
+    DuplicateSignature = 88,
 }
 
 #[contract]
@@ -1340,7 +1345,11 @@ impl TtlVaultContract {
             withdrawal_approval_threshold: None,
             spending_limit: None,
             inactivity_penalty_bps: None,
+            burn_percentage: 0,
             penalty_recipient: None,
+            passkey_rotation_period_seconds: 0,
+            challenge_timeout_seconds: 300,
+            multi_sig_threshold: 1,
         };
         Self::save_vault(&env, vault_id, &vault);
         Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -7093,7 +7102,11 @@ impl TtlVaultContract {
             withdrawal_approval_threshold: None,
             spending_limit: None,
             inactivity_penalty_bps: None,
+            burn_percentage: 0,
             penalty_recipient: None,
+            passkey_rotation_period_seconds: 0,
+            challenge_timeout_seconds: 300,
+            multi_sig_threshold: 1,
         };
 
         Self::save_vault(&env, vault_id, &new_vault);
@@ -7877,6 +7890,10 @@ impl TtlVaultContract {
             passkeys.push_back(PasskeyHash {
                 hash: req.new_passkey_hash.clone(),
                 added_at: env.ledger().timestamp(),
+                biometric_hash: None,
+                deprecated_at: None,
+                usage_count: 0,
+                last_used_timestamp: 0,
             });
             env.storage().persistent().set(&key, &passkeys);
             env.storage()
@@ -8432,9 +8449,24 @@ impl TtlVaultContract {
 
         if !passkeys.is_empty() {
             // Multi-passkey list is configured — hash must be in it.
-            let registered = passkeys.iter().any(|p| &p.hash == passkey_hash);
-            if !registered {
+            let mut matched_pk: Option<PasskeyHash> = None;
+            for pk in passkeys.iter() {
+                if &pk.hash == passkey_hash {
+                    matched_pk = Some(pk);
+                    break;
+                }
+            }
+            if matched_pk.is_none() {
                 return Err(ContractError::InvalidPasskey);
+            }
+            let pk = matched_pk.unwrap();
+            // Issue #936: check passkey rotation deprecation & grace period
+            if let Some(dep_time) = pk.deprecated_at {
+                if now > dep_time + vault.passkey_rotation_period_seconds {
+                    env.events()
+                        .publish((PASSKEY_EXPIRED_TOPIC, vault_id), passkey_hash.clone());
+                    return Err(ContractError::PasskeyExpired);
+                }
             }
         } else if let Some(ref primary) = vault.passkey_hash {
             // Fallback: single primary passkey on vault struct.
@@ -8475,10 +8507,26 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    // --- Issue #395: Passkey Usage Analytics ---
+    // --- Issue #395 & #937: Passkey Usage Analytics ---
 
     /// Logs a passkey usage entry for a vault check-in and runs anomaly detection.
     fn log_passkey_usage(env: &Env, vault_id: u64, passkey_hash: &BytesN<32>, timestamp: u64) {
+        // Issue #937: update usage_count and last_used_timestamp on PasskeyHash entry
+        let pk_key = DataKey::VaultPasskeys(vault_id);
+        if let Some(mut passkeys) = env.storage().persistent().get::<DataKey, Vec<PasskeyHash>>(&pk_key) {
+            for i in 0..passkeys.len() {
+                if let Some(mut pk) = passkeys.get(i) {
+                    if &pk.hash == passkey_hash {
+                        pk.usage_count += 1;
+                        pk.last_used_timestamp = timestamp;
+                        passkeys.set(i, pk);
+                        break;
+                    }
+                }
+            }
+            env.storage().persistent().set(&pk_key, &passkeys);
+        }
+
         let mut usage: Vec<PasskeyUsageEntry> = env
             .storage()
             .persistent()
@@ -8668,7 +8716,11 @@ impl TtlVaultContract {
             withdrawal_approval_threshold: original.withdrawal_approval_threshold,
             spending_limit: original.spending_limit,
             inactivity_penalty_bps: original.inactivity_penalty_bps,
+            burn_percentage: original.burn_percentage,
             penalty_recipient: original.penalty_recipient.clone(),
+            passkey_rotation_period_seconds: original.passkey_rotation_period_seconds,
+            challenge_timeout_seconds: original.challenge_timeout_seconds,
+            multi_sig_threshold: original.multi_sig_threshold,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, original.check_in_interval);
@@ -8803,6 +8855,12 @@ impl TtlVaultContract {
             max_deposit_amount: original.max_deposit_amount,
             withdrawal_approval_threshold: original.withdrawal_approval_threshold,
             spending_limit: original.spending_limit,
+            inactivity_penalty_bps: original.inactivity_penalty_bps,
+            burn_percentage: original.burn_percentage,
+            penalty_recipient: original.penalty_recipient.clone(),
+            passkey_rotation_period_seconds: original.passkey_rotation_period_seconds,
+            challenge_timeout_seconds: original.challenge_timeout_seconds,
+            multi_sig_threshold: original.multi_sig_threshold,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, check_in_interval);
@@ -9158,6 +9216,9 @@ impl TtlVaultContract {
             hash: passkey_hash.clone(),
             added_at: timestamp,
             biometric_hash: None,
+            deprecated_at: None,
+            usage_count: 0,
+            last_used_timestamp: 0,
         });
 
         env.storage().persistent().set(&key, &passkeys);
@@ -9438,6 +9499,230 @@ impl TtlVaultContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    // --- Issue #936: Passkey Rotation with Grace Period ---
+
+    /// Deprecates an existing passkey for a vault (initiates rotation grace period).
+    pub fn deprecate_passkey(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = DataKey::VaultPasskeys(vault_id);
+        let mut passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::PasskeyNotFound)?;
+
+        let mut found = false;
+        let now = env.ledger().timestamp();
+        for i in 0..passkeys.len() {
+            if let Some(mut pk) = passkeys.get(i) {
+                if pk.hash == passkey_hash {
+                    pk.deprecated_at = Some(now);
+                    passkeys.set(i, pk);
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            return Err(ContractError::PasskeyNotFound);
+        }
+
+        env.storage().persistent().set(&key, &passkeys);
+        env.events()
+            .publish((PASSKEY_ROTATION_ENFORCED_TOPIC, vault_id), passkey_hash);
+        Ok(())
+    }
+
+    /// Sets the passkey rotation grace period in seconds for a vault.
+    pub fn set_passkey_rotation_period(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        period_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        vault.passkey_rotation_period_seconds = period_seconds;
+        Self::save_vault(&env, vault_id, &vault);
+        Ok(())
+    }
+
+    // --- Issue #937: Passkey Usage Analytics ---
+
+    /// Gets usage analytics for all passkeys registered to a vault.
+    pub fn get_passkey_analytics(env: Env, vault_id: u64) -> Vec<PasskeyAnalytics> {
+        let key = DataKey::VaultPasskeys(vault_id);
+        let passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        for pk in passkeys.iter() {
+            result.push_back(PasskeyAnalytics {
+                passkey_hash: pk.hash,
+                usage_count: pk.usage_count,
+                last_used_timestamp: pk.last_used_timestamp,
+            });
+        }
+        result
+    }
+
+    // --- Issue #938: Passkey Challenge-Response Timeout ---
+
+    /// Configures the challenge-response timeout in seconds for a vault.
+    pub fn set_challenge_timeout(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        timeout_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        vault.challenge_timeout_seconds = timeout_seconds;
+        Self::save_vault(&env, vault_id, &vault);
+        Ok(())
+    }
+
+    /// Creates a challenge timestamp for a vault operation.
+    pub fn create_passkey_challenge(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        challenge_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner && caller != vault.beneficiary {
+            return Err(ContractError::NotOwner);
+        }
+        let now = env.ledger().timestamp();
+        let key = DataKey::PasskeyChallenge(vault_id, challenge_id);
+        env.storage().persistent().set(&key, &now);
+        Ok(())
+    }
+
+    /// Verifies that a challenge has not expired and the passkey is valid.
+    pub fn verify_passkey_challenge(
+        env: Env,
+        vault_id: u64,
+        challenge_id: BytesN<32>,
+        passkey_hash: BytesN<32>,
+    ) -> Result<bool, ContractError> {
+        let key = DataKey::PasskeyChallenge(vault_id, challenge_id);
+        let created_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::ChallengeNotFound)?;
+
+        let vault = Self::load_vault(&env, vault_id);
+        let timeout = if vault.challenge_timeout_seconds == 0 {
+            300
+        } else {
+            vault.challenge_timeout_seconds
+        };
+
+        let now = env.ledger().timestamp();
+        if now > created_at + timeout {
+            return Err(ContractError::ChallengeExpired);
+        }
+
+        Self::validate_passkey_for_checkin(&env, vault_id, &vault, &passkey_hash, now)?;
+        Ok(true)
+    }
+
+    // --- Issue #939: Multi-Sig Passkey Requirement ---
+
+    /// Sets the multi-sig passkey threshold requirement for high-value operations.
+    pub fn set_multi_sig_threshold(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if threshold == 0 {
+            return Err(ContractError::InvalidThreshold);
+        }
+        vault.multi_sig_threshold = threshold;
+        Self::save_vault(&env, vault_id, &vault);
+        Ok(())
+    }
+
+    /// Executes a withdrawal requiring multi-sig passkey signatures.
+    pub fn withdraw_multi_sig(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        amount: i128,
+        signatures: Vec<BytesN<32>>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner && caller != vault.beneficiary {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if amount <= 0 || amount > vault.balance {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let threshold = if vault.multi_sig_threshold == 0 { 1 } else { vault.multi_sig_threshold };
+
+        let mut valid_count = 0u32;
+        let mut seen = Vec::new(&env);
+        let now = env.ledger().timestamp();
+
+        for sig in signatures.iter() {
+            if seen.iter().any(|s| s == sig) {
+                return Err(ContractError::DuplicateSignature);
+            }
+            seen.push_back(sig.clone());
+            Self::validate_passkey_for_checkin(&env, vault_id, &vault, &sig, now)?;
+            valid_count += 1;
+        }
+
+        if valid_count < threshold {
+            return Err(ContractError::MultiSigRequired);
+        }
+
+        vault.balance -= amount;
+        Self::save_vault(&env, vault_id, &vault);
+
+        let key = DataKey::WithdrawalApprovals(vault_id);
+        env.storage().persistent().set(&key, &signatures);
+
+        Ok(())
+    }
+
     /// Checks if a passkey is valid for a vault.
     ///
     /// # Arguments
@@ -9570,6 +9855,9 @@ impl TtlVaultContract {
             hash: new_passkey_proof.clone(),
             added_at: now,
             biometric_hash: None,
+            deprecated_at: None,
+            usage_count: 0,
+            last_used_timestamp: 0,
         });
         let pk_key = DataKey::VaultPasskeys(vault_id);
         env.storage().persistent().set(&pk_key, &passkeys);
