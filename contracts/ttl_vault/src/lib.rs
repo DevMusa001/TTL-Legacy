@@ -65,7 +65,7 @@ use types::{
     WITHDRAWAL_LIMIT_EXCEEDED_TOPIC, WITHDRAWAL_LIMIT_SET_TOPIC, WITHDRAWAL_NOTIF_TOPIC,
     WITHDRAWAL_REVERSED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_VALIDATION_TOPIC,
     WITHDRAW_TOPIC, WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
-    YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
+    YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -1450,6 +1450,9 @@ impl TtlVaultContract {
         if vault.is_paused {
             return Err(ContractError::Paused);
         }
+        if Self::check_vault_frozen(&env, vault_id) {
+            return Err(ContractError::VaultFrozen);
+        }
         let is_delegate = caller != vault.owner && Self::is_check_in_delegate(&env, vault_id, &caller);
         if caller != vault.owner && !is_delegate {
             return Err(ContractError::NotOwner);
@@ -1623,6 +1626,9 @@ impl TtlVaultContract {
         }
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
+        }
+        if Self::check_vault_frozen(&env, vault_id) {
+            panic_with_error!(&env, ContractError::VaultFrozen);
         }
         if vault.status != ReleaseStatus::Locked {
             panic_with_error!(&env, ContractError::AlreadyReleased);
@@ -1802,6 +1808,10 @@ impl TtlVaultContract {
         }
         if vault.status == ReleaseStatus::EmergencyFrozen {
             Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Vault frozen");
+            return Err(ContractError::VaultFrozen);
+        }
+        if Self::check_vault_frozen(&env, vault_id) {
+            Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Vault admin-frozen");
             return Err(ContractError::VaultFrozen);
         }
         if vault.status != ReleaseStatus::Locked {
@@ -2468,6 +2478,9 @@ impl TtlVaultContract {
         // Attempt to restore archived vault state before proceeding - Issue #443
         Self::try_restore_archived_vault(&env, vault_id);
         let mut vault = Self::load_vault(&env, vault_id);
+        if Self::check_vault_frozen(&env, vault_id) {
+            panic_with_error!(&env, ContractError::VaultFrozen);
+        }
         if env
             .storage()
             .persistent()
@@ -6992,6 +7005,75 @@ impl TtlVaultContract {
         }
     }
 
+    // --- Per-vault admin freeze (Issue: per-vault freeze) ---
+
+    /// Freezes a specific vault, blocking deposit, withdraw, check_in, and trigger_release.
+    ///
+    /// Unlike the global contract pause or the per-vault owner pause, this is an **admin-only**
+    /// action intended for incident response when a single vault is believed to be compromised.
+    /// The freeze flag is stored as a separate persistent key (`DataKey::VaultFrozen`) so it
+    /// survives vault-struct updates and can be inspected independently.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault to freeze
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin`      - If the caller is not the contract admin
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    pub fn freeze_vault(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        // Verify the vault exists before acting on it
+        Self::load_vault(&env, vault_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VaultFrozen(vault_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VaultFrozen(vault_id),
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((FREEZE_VAULT_TOPIC, vault_id), true);
+        Ok(())
+    }
+
+    /// Unfreezes a previously frozen vault, restoring normal operation.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault to unfreeze
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin`      - If the caller is not the contract admin
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    pub fn unfreeze_vault(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        // Verify the vault exists before acting on it
+        Self::load_vault(&env, vault_id);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VaultFrozen(vault_id));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((UNFREEZE_VAULT_TOPIC, vault_id), false);
+        Ok(())
+    }
+
+    /// Returns `true` if the vault is currently frozen by an admin.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    pub fn is_vault_frozen(env: Env, vault_id: u64) -> bool {
+        Self::check_vault_frozen(&env, vault_id)
+    }
+
     // --- Issue #379: Conditional Release Logic ---
 
     /// Sets the release condition for a vault.
@@ -8144,6 +8226,15 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` when the vault's admin freeze flag is set.
+    /// Used internally by deposit, withdraw, check_in, and trigger_release.
+    fn check_vault_frozen(env: &Env, vault_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::VaultFrozen(vault_id))
             .unwrap_or(false)
     }
 
