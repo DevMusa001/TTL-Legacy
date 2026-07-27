@@ -89,6 +89,14 @@ mod beneficiary_notification_tests;
 mod beneficiary_identity_verification_tests;
 #[cfg(test)]
 mod beneficiary_memo_tests;
+#[cfg(test)]
+mod withdrawal_hold_tests;
+#[cfg(test)]
+mod withdrawal_audit_compression_tests;
+#[cfg(test)]
+mod withdrawal_splitting_tests;
+#[cfg(test)]
+mod vault_pruning_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
