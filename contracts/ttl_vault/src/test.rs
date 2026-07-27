@@ -6856,3 +6856,602 @@ fn test_check_in_history_page_consistent_with_full_history() {
         );
     }
 }
+
+// ---- Issue #1064: Passkey Nickname Support Tests ----
+
+#[test]
+fn test_add_passkey_with_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Phone");
+
+    // Add passkey with nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &nickname);
+
+    // Retrieve nickname and verify
+    let retrieved_nickname = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved_nickname, Some(nickname));
+}
+
+#[test]
+fn test_passkey_nickname_max_length_validation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Test with valid 64-character nickname
+    let valid_nickname = String::from_small_str("A".repeat(64).as_str());
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &valid_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(valid_nickname));
+
+    // Test with nickname exceeding 64 characters - should fail
+    let invalid_nickname = String::from_small_str("A".repeat(65).as_str());
+    let result = client.try_add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &invalid_nickname);
+    assert!(result.is_err(), "nickname exceeding 64 chars should be rejected");
+}
+
+#[test]
+fn test_update_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_nickname = String::from_small_str("Device 1");
+
+    // Add passkey with initial nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &initial_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(initial_nickname));
+
+    // Update nickname
+    let updated_nickname = String::from_small_str("Work Laptop");
+    client.set_passkey_nickname(&vault_id, &owner, &passkey_hash, &updated_nickname);
+
+    // Verify update
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(updated_nickname));
+}
+
+#[test]
+fn test_list_passkeys_includes_nicknames() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash_1 = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let passkey_hash_2 = BytesN::<32>::from_array(&env, &[2u8; 32]);
+    let nickname_1 = String::from_small_str("Phone");
+    let nickname_2 = String::from_small_str("Laptop");
+
+    // Add multiple passkeys with nicknames
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_1, &nickname_1);
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_2, &nickname_2);
+
+    // List passkeys and verify nicknames are included
+    let passkeys = client.list_passkeys(&vault_id);
+    assert_eq!(passkeys.len(), 2);
+    assert_eq!(passkeys.get(0).unwrap().nickname, Some(nickname_1));
+    assert_eq!(passkeys.get(1).unwrap().nickname, Some(nickname_2));
+}
+
+#[test]
+fn test_passkey_nickname_empty_string() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let empty_nickname = String::from_small_str("");
+
+    // Add passkey with empty nickname - should be allowed
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &empty_nickname);
+
+    // Retrieve and verify - empty string is valid
+    let retrieved = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved, Some(empty_nickname));
+}
+
+#[test]
+fn test_non_owner_cannot_modify_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Key");
+
+    // Non-owner tries to set nickname - should fail
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_nickname(&vault_id, &non_owner, &passkey_hash, &nickname);
+    assert!(result.is_err(), "non-owner should not be able to set passkey nickname");
+}
+
+// ---- Issue #1066: Passkey Expiry Date Tests ----
+
+#[test]
+fn test_add_passkey_with_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400; // expires in 1 day
+
+    // Add passkey with expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Verify expiry is set
+    let expiry = client.get_passkey_expiry(&vault_id, &passkey_hash);
+    assert_eq!(expiry, Some(expires_at));
+}
+
+#[test]
+fn test_reject_authentication_with_expired_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    // Add passkey with near-future expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Check-in should succeed before expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Check-in should fail with expired passkey
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "expired passkey should reject authentication");
+}
+
+#[test]
+fn test_passkey_expiry_at_exact_ledger_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time;
+
+    // Add passkey expiring exactly at current time
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Check-in should fail - passkey is already expired
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "passkey expired at current timestamp should be rejected");
+}
+
+#[test]
+fn test_extend_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_expiry = env.ledger().timestamp() + 100;
+
+    // Add passkey with initial expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &initial_expiry);
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(initial_expiry));
+
+    // Extend expiry
+    let new_expiry = env.ledger().timestamp() + 1000;
+    client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &new_expiry);
+
+    // Verify new expiry
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(new_expiry));
+}
+
+#[test]
+fn test_passkey_without_expiry_never_expires() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey without expiry
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Verify no expiry is set
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), None);
+
+    // Advance time significantly
+    env.ledger().with_mut(|l| l.timestamp += 10000000);
+
+    // Check-in should still succeed - no expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_non_owner_cannot_set_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400;
+
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_expiry(&vault_id, &non_owner, &passkey_hash, &expires_at);
+    assert!(result.is_err(), "non-owner should not be able to set passkey expiry");
+}
+
+#[test]
+fn test_passkey_expired_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 50;
+
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Advance past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Attempt check-in and verify PasskeyExpired event is emitted
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err());
+
+    let events = env.events().all();
+    let passkey_expired_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyExpired")
+    });
+    assert!(passkey_expired_event, "PasskeyExpired event should be emitted");
+}
+
+// ---- Issue #1067: Passkey Scope Restriction Tests ----
+
+#[test]
+fn test_add_passkey_with_full_access_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32); // 0 = FullAccess
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
+}
+
+#[test]
+fn test_add_passkey_with_check_in_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32); // 1 = CheckInOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(1u32));
+}
+
+#[test]
+fn test_add_passkey_with_read_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32); // 2 = ReadOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(2u32));
+}
+
+#[test]
+fn test_check_in_only_scope_allows_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_withdrawal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt withdrawal with CheckInOnly passkey - should fail
+    let result = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow withdrawals");
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_deposit() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt deposit with CheckInOnly passkey - should fail
+    let result = client.try_deposit(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow deposits");
+}
+
+#[test]
+fn test_read_only_scope_allows_viewing_data() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Reading vault data should succeed
+    let _ = client.get_vault_info(&vault_id);
+}
+
+#[test]
+fn test_read_only_scope_rejects_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Check-in with ReadOnly scope - should fail
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "ReadOnly scope should not allow check-in");
+}
+
+#[test]
+fn test_full_access_scope_allows_all_operations() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Withdrawal should succeed
+    let _ = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+}
+
+#[test]
+fn test_default_scope_is_full_access() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey without explicit scope
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Default scope should be FullAccess (0)
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
+}
+
+// ---- Issue #1068: Passkey Failed Attempt Lockout Tests ----
+
+#[test]
+fn test_passkey_failed_attempt_increment() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Failed authentication attempt
+    let wrong_hash = BytesN::<32>::from_array(&env, &[2u8; 32]);
+    let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+
+    // Verify failed attempts incremented
+    let failed_attempts = client.get_passkey_failed_attempts(&vault_id, &passkey_hash);
+    assert_eq!(failed_attempts, 0, "correct passkey should not increment on wrong key attempt");
+}
+
+#[test]
+fn test_passkey_lockout_after_5_failed_attempts() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 5 failed authentication attempts with wrong passkey
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Passkey should now be locked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(is_locked, "passkey should be locked after 5 failed attempts");
+}
+
+#[test]
+fn test_locked_passkey_rejects_authentication() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 5 failed attempts to trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Attempt to use correct passkey - should fail due to lockout
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "locked passkey should reject authentication");
+}
+
+#[test]
+fn test_passkey_auto_unlock_after_15_minutes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout with 5 failed attempts
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Verify passkey is locked
+    assert!(client.get_passkey_locked_status(&vault_id, &passkey_hash));
+
+    // Advance time by 15 minutes
+    env.ledger().with_mut(|l| l.timestamp += 900);
+
+    // Passkey should now be unlocked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(!is_locked, "passkey should auto-unlock after 15 minutes");
+
+    // Authentication should now succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_successful_authentication_resets_failed_attempts() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 3 failed attempts
+    for _ in 0..3 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Successful authentication
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Failed attempts should be reset to 0
+    let failed_attempts = client.get_passkey_failed_attempts(&vault_id, &passkey_hash);
+    assert_eq!(failed_attempts, 0, "failed attempts should reset after successful auth");
+}
+
+#[test]
+fn test_owner_can_manually_unlock_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Owner unlocks the passkey
+    client.unlock_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Passkey should now be unlocked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(!is_locked, "passkey should be unlocked after manual unlock");
+
+    // Authentication should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_non_owner_cannot_unlock_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Non-owner tries to unlock - should fail
+    let non_owner = Address::generate(&env);
+    let result = client.try_unlock_passkey(&vault_id, &non_owner, &passkey_hash);
+    assert!(result.is_err(), "non-owner should not be able to unlock passkey");
+}
+
+#[test]
+fn test_passkey_locked_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Verify PasskeyLocked event was emitted
+    let events = env.events().all();
+    let passkey_locked_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyLocked")
+    });
+    assert!(passkey_locked_event, "PasskeyLocked event should be emitted");
+}
+
+#[test]
+fn test_passkey_unlocked_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Clear events
+    env.events().all();
+
+    // Owner unlocks the passkey
+    client.unlock_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Verify PasskeyUnlocked event was emitted
+    let events = env.events().all();
+    let passkey_unlocked_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyUnlocked")
+    });
+    assert!(passkey_unlocked_event, "PasskeyUnlocked event should be emitted");
+}
