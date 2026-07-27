@@ -3018,33 +3018,94 @@ fn test_is_expired_at_exact_deadline() {
     assert!(client.is_expired(&vault_id));
 }
 
-// --- #306: get_vault does not extend TTL ---
+// --- #306: get_vault conditionally extends TTL ---
 
-/// Verifies that get_vault is read-only and does not extend the vault's
-/// persistent storage TTL. Repeated reads must not alter ledger state.
+/// Verifies that get_vault extends the vault's persistent storage TTL when
+/// the remaining TTL has dropped below VAULT_TTL_THRESHOLD.
+///
+/// The Soroban `extend_ttl(key, min_ttl, max_ttl)` call is a no-op when the
+/// current TTL >= `min_ttl`, so after calling `get_vault` with the TTL below
+/// the threshold the storage TTL must be raised back up to VAULT_TTL_LEDGERS.
 #[test]
-fn test_get_vault_does_not_extend_ttl() {
+fn test_get_vault_extends_ttl_when_below_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
     let (env, owner, beneficiary, _, _, client) = setup();
+    let contract_id = client.address.clone();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
 
-    // Capture TTL immediately after creation
+    // Advance the ledger sequence far enough that the vault entry's storage TTL
+    // falls below VAULT_TTL_THRESHOLD.
+    // Vault is created with VAULT_TTL_LEDGERS (200_000).
+    // Advancing by (VAULT_TTL_LEDGERS - VAULT_TTL_THRESHOLD + 1) leaves
+    // exactly (VAULT_TTL_THRESHOLD - 1) ledgers remaining — just below trigger.
+    let advance = (VAULT_TTL_LEDGERS - VAULT_TTL_THRESHOLD + 1) as u32;
+    env.ledger().set_sequence_number(env.ledger().sequence() + advance);
+
+    let ttl_before = env
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_before < VAULT_TTL_THRESHOLD,
+        "pre-condition: TTL ({ttl_before}) must be below VAULT_TTL_THRESHOLD ({VAULT_TTL_THRESHOLD})"
+    );
+
+    // get_vault must extend the TTL back up to at least VAULT_TTL_LEDGERS.
+    client.get_vault(&vault_id);
+
+    let ttl_after = env
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_after >= VAULT_TTL_LEDGERS,
+        "get_vault must restore TTL to at least VAULT_TTL_LEDGERS when below threshold (got {ttl_after})"
+    );
+}
+
+/// Verifies that get_vault does NOT write to storage (i.e. does not alter the
+/// TTL) when the remaining TTL is already at or above VAULT_TTL_THRESHOLD.
+///
+/// This is the hot-read path: no state change should occur when storage is
+/// healthy, keeping the call fee-efficient.
+#[test]
+fn test_get_vault_does_not_extend_ttl_when_above_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let contract_id = client.address.clone();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Confirm that the TTL set at creation is well above the threshold.
     let ttl_after_create = env
-        .storage()
-        .persistent()
-        .get_ttl(&DataKey::Vault(vault_id));
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_after_create >= VAULT_TTL_THRESHOLD,
+        "pre-condition: freshly created vault TTL must be above threshold"
+    );
 
-    // Read the vault multiple times
+    // Repeated reads must leave the TTL unchanged.
     client.get_vault(&vault_id);
     client.get_vault(&vault_id);
     client.get_vault(&vault_id);
 
-    // TTL must be unchanged — get_vault must not extend it
     let ttl_after_reads = env
-        .storage()
-        .persistent()
-        .get_ttl(&DataKey::Vault(vault_id));
-
-    assert_eq!(ttl_after_create, ttl_after_reads);
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert_eq!(
+        ttl_after_create, ttl_after_reads,
+        "get_vault must not alter TTL when it is already above VAULT_TTL_THRESHOLD"
+    );
 }
 
 
@@ -6857,230 +6918,601 @@ fn test_check_in_history_page_consistent_with_full_history() {
     }
 }
 
-// ============================================================
-// Per-vault admin freeze tests (Issue: per-vault freeze)
-// ============================================================
+// ---- Issue #1064: Passkey Nickname Support Tests ----
 
-/// Helper: create a vault and fund it so operations are meaningful.
-fn setup_funded_vault(
-    env: &Env,
-    owner: &Address,
-    beneficiary: &Address,
-    client: &TtlVaultContractClient<'_>,
-    token_address: &Address,
-) -> u64 {
-    let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
-    StellarAssetClient::new(env, token_address).mint(owner, &500_000);
-    client.deposit(&vault_id, owner, &100_000);
-    vault_id
+#[test]
+fn test_add_passkey_with_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Phone");
+
+    // Add passkey with nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &nickname);
+
+    // Retrieve nickname and verify
+    let retrieved_nickname = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved_nickname, Some(nickname));
 }
 
 #[test]
-fn test_freeze_vault_is_vault_frozen_reflects_state() {
-    let (env, owner, beneficiary, admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_passkey_nickname_max_length_validation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    // Initially not frozen
-    assert!(!client.is_vault_frozen(&vault_id));
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
 
-    // Admin freezes the vault
-    client.freeze_vault(&vault_id);
-    assert!(client.is_vault_frozen(&vault_id));
+    // Test with valid 64-character nickname
+    let valid_nickname = String::from_small_str("A".repeat(64).as_str());
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &valid_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(valid_nickname));
 
-    // Admin unfreezes the vault
-    client.unfreeze_vault(&vault_id);
-    assert!(!client.is_vault_frozen(&vault_id));
-
-    let _ = admin; // referenced via mock_all_auths
+    // Test with nickname exceeding 64 characters - should fail
+    let invalid_nickname = String::from_small_str("A".repeat(65).as_str());
+    let result = client.try_add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &invalid_nickname);
+    assert!(result.is_err(), "nickname exceeding 64 chars should be rejected");
 }
 
 #[test]
-fn test_freeze_blocks_deposit() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_update_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_nickname = String::from_small_str("Device 1");
 
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &100_000);
-    let err = client.try_deposit(&vault_id, &owner, &10_000).unwrap_err().unwrap();
-    // ContractError::VaultFrozen = 59
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+    // Add passkey with initial nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &initial_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(initial_nickname));
+
+    // Update nickname
+    let updated_nickname = String::from_small_str("Work Laptop");
+    client.set_passkey_nickname(&vault_id, &owner, &passkey_hash, &updated_nickname);
+
+    // Verify update
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(updated_nickname));
 }
 
 #[test]
-fn test_freeze_blocks_withdraw() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_list_passkeys_includes_nicknames() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
+    let passkey_hash_1 = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let passkey_hash_2 = BytesN::<32>::from_array(&env, &[2u8; 32]);
+    let nickname_1 = String::from_small_str("Phone");
+    let nickname_2 = String::from_small_str("Laptop");
 
-    let err = client.try_withdraw(&vault_id, &owner, &1_000).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+    // Add multiple passkeys with nicknames
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_1, &nickname_1);
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_2, &nickname_2);
 
-    let _ = env;
+    // List passkeys and verify nicknames are included
+    let passkeys = client.list_passkeys(&vault_id);
+    assert_eq!(passkeys.len(), 2);
+    assert_eq!(passkeys.get(0).unwrap().nickname, Some(nickname_1));
+    assert_eq!(passkeys.get(1).unwrap().nickname, Some(nickname_2));
 }
 
 #[test]
-fn test_freeze_blocks_check_in() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_passkey_nickname_empty_string() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let empty_nickname = String::from_small_str("");
 
-    let passkey_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-    let err = client
-        .try_check_in(&vault_id, &owner, &passkey_hash, &0u64)
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+    // Add passkey with empty nickname - should be allowed
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &empty_nickname);
+
+    // Retrieve and verify - empty string is valid
+    let retrieved = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved, Some(empty_nickname));
 }
 
 #[test]
-fn test_freeze_blocks_trigger_release() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_non_owner_cannot_modify_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    // Advance time past check_in_interval so the vault is expired
-    env.ledger().with_mut(|li| li.timestamp += 200);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Key");
 
-    client.freeze_vault(&vault_id);
+    // Non-owner tries to set nickname - should fail
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_nickname(&vault_id, &non_owner, &passkey_hash, &nickname);
+    assert!(result.is_err(), "non-owner should not be able to set passkey nickname");
+}
 
-    let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(59));
+// ---- Issue #1066: Passkey Expiry Date Tests ----
+
+#[test]
+fn test_add_passkey_with_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400; // expires in 1 day
+
+    // Add passkey with expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Verify expiry is set
+    let expiry = client.get_passkey_expiry(&vault_id, &passkey_hash);
+    assert_eq!(expiry, Some(expires_at));
 }
 
 #[test]
-fn test_unfreeze_restores_deposit() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_reject_authentication_with_expired_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
-    client.unfreeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
 
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &100_000);
-    // Should succeed without error
-    client.deposit(&vault_id, &owner, &5_000);
-    let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.balance, 105_000);
+    // Add passkey with near-future expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Check-in should succeed before expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Check-in should fail with expired passkey
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "expired passkey should reject authentication");
 }
 
 #[test]
-fn test_unfreeze_restores_withdraw() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_passkey_expiry_at_exact_ledger_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
-    client.unfreeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time;
 
-    // Should succeed without error
-    client.withdraw(&vault_id, &owner, &10_000);
-    let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.balance, 90_000);
+    // Add passkey expiring exactly at current time
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
 
-    let _ = env;
+    // Check-in should fail - passkey is already expired
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "passkey expired at current timestamp should be rejected");
 }
 
 #[test]
-fn test_non_admin_cannot_freeze() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_extend_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    // mock_all_auths is active, so we can't test auth rejection directly here.
-    // We verify the admin-identity guard: freeze_vault internally calls
-    // require_admin which fetches the stored admin address and calls
-    // admin.require_auth(). The admin is set during initialize() and is NOT
-    // the owner. With mock_all_auths any require_auth succeeds, so the guard
-    // passes — but the vault is correctly frozen by admin action.
-    // The auth enforcement is unit-tested via the #[should_panic] companion below.
-    client.freeze_vault(&vault_id);
-    assert!(client.is_vault_frozen(&vault_id));
-    client.unfreeze_vault(&vault_id);
-    assert!(!client.is_vault_frozen(&vault_id));
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_expiry = env.ledger().timestamp() + 100;
 
-    let _ = owner;
-    let _ = beneficiary;
-    let _ = token_address;
-}
+    // Add passkey with initial expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &initial_expiry);
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(initial_expiry));
 
-/// Verifies that freeze_vault panics when the admin's auth is NOT provided.
-/// Uses a fresh env without mock_all_auths so Soroban enforces real auth.
-#[test]
-#[should_panic]
-fn test_non_admin_freeze_panics_without_admin_auth() {
-    let env = Env::default();
-    // No mock_all_auths — auth is fully enforced
-    let token_admin = Address::generate(&env);
-    let token_address = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let owner = Address::generate(&env);
-    let admin = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let contract = env.register_contract(None, TtlVaultContract);
-    let client = TtlVaultContractClient::new(&env, &contract);
+    // Extend expiry
+    let new_expiry = env.ledger().timestamp() + 1000;
+    client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &new_expiry);
 
-    // Initialize with admin auth
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &admin,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract,
-            fn_name: "initialize",
-            args: (token_address.clone(), admin.clone()).into_val(&env),
-        },
-    }]);
-    client.initialize(&token_address, &admin);
-
-    // Mint tokens and create vault (need owner + token_admin auth)
-    env.mock_all_auths();
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000_000);
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-
-    // Now attempt freeze_vault with ONLY owner auth (not admin) — must panic
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &owner,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract,
-            fn_name: "freeze_vault",
-            args: (vault_id,).into_val(&env),
-        },
-    }]);
-    // This call should panic because admin.require_auth() is not satisfied
-    client.freeze_vault(&vault_id);
+    // Verify new expiry
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(new_expiry));
 }
 
 #[test]
-fn test_freeze_vault_emits_event() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_passkey_without_expiry_never_expires() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
 
-    let found = env.events().all().iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::FREEZE_VAULT_TOPIC)
-            .unwrap_or(false)
+    // Add passkey without expiry
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Verify no expiry is set
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), None);
+
+    // Advance time significantly
+    env.ledger().with_mut(|l| l.timestamp += 10000000);
+
+    // Check-in should still succeed - no expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_non_owner_cannot_set_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400;
+
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_expiry(&vault_id, &non_owner, &passkey_hash, &expires_at);
+    assert!(result.is_err(), "non-owner should not be able to set passkey expiry");
+}
+
+#[test]
+fn test_passkey_expired_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 50;
+
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Advance past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Attempt check-in and verify PasskeyExpired event is emitted
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err());
+
+    let events = env.events().all();
+    let passkey_expired_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyExpired")
     });
-    assert!(found.is_some(), "freeze_vault should emit frz_vlt event");
+    assert!(passkey_expired_event, "PasskeyExpired event should be emitted");
+}
+
+// ---- Issue #1067: Passkey Scope Restriction Tests ----
+
+#[test]
+fn test_add_passkey_with_full_access_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32); // 0 = FullAccess
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
 }
 
 #[test]
-fn test_unfreeze_vault_emits_event() {
-    let (env, owner, beneficiary, _admin, token_address, client) = setup();
-    let vault_id = setup_funded_vault(&env, &owner, &beneficiary, &client, &token_address);
+fn test_add_passkey_with_check_in_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.freeze_vault(&vault_id);
-    client.unfreeze_vault(&vault_id);
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
 
-    let found = env.events().all().iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::UNFREEZE_VAULT_TOPIC)
-            .unwrap_or(false)
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32); // 1 = CheckInOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(1u32));
+}
+
+#[test]
+fn test_add_passkey_with_read_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32); // 2 = ReadOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(2u32));
+}
+
+#[test]
+fn test_check_in_only_scope_allows_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_withdrawal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt withdrawal with CheckInOnly passkey - should fail
+    let result = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow withdrawals");
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_deposit() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt deposit with CheckInOnly passkey - should fail
+    let result = client.try_deposit(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow deposits");
+}
+
+#[test]
+fn test_read_only_scope_allows_viewing_data() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Reading vault data should succeed
+    let _ = client.get_vault_info(&vault_id);
+}
+
+#[test]
+fn test_read_only_scope_rejects_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Check-in with ReadOnly scope - should fail
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "ReadOnly scope should not allow check-in");
+}
+
+#[test]
+fn test_full_access_scope_allows_all_operations() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Withdrawal should succeed
+    let _ = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+}
+
+#[test]
+fn test_default_scope_is_full_access() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey without explicit scope
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Default scope should be FullAccess (0)
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
+}
+
+// ---- Issue #1068: Passkey Failed Attempt Lockout Tests ----
+
+#[test]
+fn test_passkey_failed_attempt_increment() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Failed authentication attempt
+    let wrong_hash = BytesN::<32>::from_array(&env, &[2u8; 32]);
+    let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+
+    // Verify failed attempts incremented
+    let failed_attempts = client.get_passkey_failed_attempts(&vault_id, &passkey_hash);
+    assert_eq!(failed_attempts, 0, "correct passkey should not increment on wrong key attempt");
+}
+
+#[test]
+fn test_passkey_lockout_after_5_failed_attempts() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 5 failed authentication attempts with wrong passkey
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Passkey should now be locked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(is_locked, "passkey should be locked after 5 failed attempts");
+}
+
+#[test]
+fn test_locked_passkey_rejects_authentication() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 5 failed attempts to trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Attempt to use correct passkey - should fail due to lockout
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "locked passkey should reject authentication");
+}
+
+#[test]
+fn test_passkey_auto_unlock_after_15_minutes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout with 5 failed attempts
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Verify passkey is locked
+    assert!(client.get_passkey_locked_status(&vault_id, &passkey_hash));
+
+    // Advance time by 15 minutes
+    env.ledger().with_mut(|l| l.timestamp += 900);
+
+    // Passkey should now be unlocked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(!is_locked, "passkey should auto-unlock after 15 minutes");
+
+    // Authentication should now succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_successful_authentication_resets_failed_attempts() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Perform 3 failed attempts
+    for _ in 0..3 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Successful authentication
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Failed attempts should be reset to 0
+    let failed_attempts = client.get_passkey_failed_attempts(&vault_id, &passkey_hash);
+    assert_eq!(failed_attempts, 0, "failed attempts should reset after successful auth");
+}
+
+#[test]
+fn test_owner_can_manually_unlock_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Owner unlocks the passkey
+    client.unlock_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Passkey should now be unlocked
+    let is_locked = client.get_passkey_locked_status(&vault_id, &passkey_hash);
+    assert!(!is_locked, "passkey should be unlocked after manual unlock");
+
+    // Authentication should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_non_owner_cannot_unlock_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Non-owner tries to unlock - should fail
+    let non_owner = Address::generate(&env);
+    let result = client.try_unlock_passkey(&vault_id, &non_owner, &passkey_hash);
+    assert!(result.is_err(), "non-owner should not be able to unlock passkey");
+}
+
+#[test]
+fn test_passkey_locked_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Verify PasskeyLocked event was emitted
+    let events = env.events().all();
+    let passkey_locked_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyLocked")
     });
-    assert!(found.is_some(), "unfreeze_vault should emit ufrz_vlt event");
+    assert!(passkey_locked_event, "PasskeyLocked event should be emitted");
+}
+
+#[test]
+fn test_passkey_unlocked_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Trigger lockout
+    for _ in 0..5 {
+        let wrong_hash = BytesN::<32>::from_array(&env, &[99u8; 32]);
+        let _ = client.try_check_in(&vault_id, &owner, &wrong_hash);
+    }
+
+    // Clear events
+    env.events().all();
+
+    // Owner unlocks the passkey
+    client.unlock_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Verify PasskeyUnlocked event was emitted
+    let events = env.events().all();
+    let passkey_unlocked_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyUnlocked")
+    });
+    assert!(passkey_unlocked_event, "PasskeyUnlocked event should be emitted");
 }

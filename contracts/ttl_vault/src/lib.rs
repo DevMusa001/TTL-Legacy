@@ -81,6 +81,22 @@ mod bps_invariant_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_waitlist_tests;
+#[cfg(test)]
+mod beneficiary_notification_tests;
+#[cfg(test)]
+mod beneficiary_identity_verification_tests;
+#[cfg(test)]
+mod beneficiary_memo_tests;
+#[cfg(test)]
+mod vault_notes_tests;
+#[cfg(test)]
+mod vault_expiry_tests;
+#[cfg(test)]
+mod vault_pause_tests;
+#[cfg(test)]
+mod passkey_device_type_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -233,6 +249,15 @@ pub enum ContractError {
     InvalidVestingSchedule = 82,
     // Per-delegation nonce mismatch (replay attack prevention)
     InvalidNonce = 83,
+    // Issue #1088: minimum balance guard
+    BelowMinimumBalance = 84,
+    // Issue #1087: withdrawal reason code
+    ReasonTooLong = 85,
+    // Issue #1086: recurring withdrawal
+    RecurringWithdrawalNotFound = 86,
+    RecurringWithdrawalNotReady = 87,
+    // Issue #1084: withdrawal rate limiting
+    WithdrawalRateLimitExceeded = 88,
 }
 
 #[contract]
@@ -1823,6 +1848,21 @@ impl TtlVaultContract {
             return Err(ContractError::InsufficientBalance);
         }
 
+        // Check minimum balance guard - Issue #1088
+        if let Some(min_guard) = vault.min_balance_guard {
+            if vault.balance - amount < min_guard {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Below minimum balance",
+                );
+                return Err(ContractError::BelowMinimumBalance);
+            }
+        }
+
         // Check withdrawal approval threshold - Issue #404
         if let Some(threshold) = vault.withdrawal_approval_threshold {
             if amount > threshold {
@@ -1841,6 +1881,32 @@ impl TtlVaultContract {
         // Check withdrawal limits - Issue #566
         Self::check_withdrawal_limits(&env, vault_id, amount)?;
 
+        // Check withdrawal rate limiting - Issue #1084
+        if let Some(limit) = vault.withdrawal_limit_per_window {
+            let now = env.ledger().timestamp();
+            let window_elapsed = now - vault.window_start;
+
+            let mut vault_mut = vault.clone();
+            if window_elapsed >= vault_mut.withdrawal_window_seconds {
+                vault_mut.withdrawn_in_window = 0;
+                vault_mut.window_start = now;
+            }
+
+            if vault_mut.withdrawn_in_window + amount > limit {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Withdrawal rate limit exceeded",
+                );
+                return Err(ContractError::WithdrawalRateLimitExceeded);
+            }
+
+            vault = vault_mut;
+        }
+
         // Check whitelist - Issue #567
         if !Self::is_whitelisted(&env, vault_id, &vault.owner) {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
@@ -1849,6 +1915,11 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Update withdrawal rate tracking - Issue #1084
+        if vault.withdrawal_limit_per_window.is_some() {
+            vault.withdrawn_in_window += amount;
+        }
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -5204,7 +5275,15 @@ impl TtlVaultContract {
     /// # Panics
     /// Panics if the vault does not exist (use `vault_exists` to check first)
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
-        Self::load_vault(&env, vault_id)
+        let vault = Self::load_vault(&env, vault_id);
+        // Extend the vault's persistent TTL only when it has dropped below
+        // VAULT_TTL_THRESHOLD ledgers. This avoids a write (and the associated
+        // fee) on every read when the TTL is already healthy.
+        let key = DataKey::Vault(vault_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        vault
     }
 
     /// Captures the state of a vault at a specific point in time.
@@ -13817,5 +13896,168 @@ impl TtlVaultContract {
             }
             None => false,
         }
+    }
+
+    // --- Issue #1088: Enforce Minimum Balance Guard to Prevent Vault Drainage ---
+
+    pub fn set_min_balance_guard(
+        env: Env,
+        vault_id: u64,
+        min: i128,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+        vault.min_balance_guard = Some(min);
+        Self::save_vault(&env, vault_id, &vault);
+        env.events()
+            .publish((symbol_short!("minbal"), vault_id), (min,));
+        Ok(())
+    }
+
+    pub fn get_min_balance_guard(env: Env, vault_id: u64) -> Option<i128> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.min_balance_guard
+    }
+
+    // --- Issue #1087: Attach Reason Code to Withdrawal Events for Audit Trail ---
+
+    pub fn withdraw_with_reason(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        amount: i128,
+        reason: Option<String>,
+    ) -> Result<(), ContractError> {
+        if let Some(ref r) = reason {
+            if r.len() > 64 {
+                return Err(ContractError::ReasonTooLong);
+            }
+        }
+
+        Self::withdraw(&env, vault_id, caller.clone(), amount)?;
+
+        env.events()
+            .publish((symbol_short!("wd_rsn"), vault_id), (&caller, amount, reason));
+
+        Ok(())
+    }
+
+    // --- Issue #1086: Implement Recurring Withdrawal Schedule for Regular Transfers ---
+
+    pub fn set_recurring_withdrawal(
+        env: Env,
+        vault_id: u64,
+        amount: i128,
+        interval_seconds: u64,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let recurring = RecurringWithdrawal {
+            amount,
+            interval_seconds,
+            destination: destination.clone(),
+            next_at: now + interval_seconds,
+        };
+
+        vault.recurring_withdrawal = Some(recurring);
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("rec_wd"), vault_id), (amount, interval_seconds, &destination));
+
+        Ok(())
+    }
+
+    pub fn execute_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        let recurring = vault.recurring_withdrawal.as_ref()
+            .ok_or(ContractError::RecurringWithdrawalNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < recurring.next_at {
+            return Err(ContractError::RecurringWithdrawalNotReady);
+        }
+
+        if vault.balance < recurring.amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &recurring.destination, &recurring.amount);
+        vault.balance -= recurring.amount;
+
+        if let Some(ref mut rec) = vault.recurring_withdrawal {
+            rec.next_at = now + rec.interval_seconds;
+        }
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("exec_rw"), vault_id), (recurring.amount, now));
+
+        Ok(())
+    }
+
+    pub fn cancel_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        vault.recurring_withdrawal = None;
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("can_rw"), vault_id), ());
+
+        Ok(())
+    }
+
+    pub fn get_recurring_withdrawal(env: Env, vault_id: u64) -> Option<RecurringWithdrawal> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.recurring_withdrawal
+    }
+
+    // --- Issue #1084: Implement Withdrawal Rate Limiting Per Time Window ---
+
+    pub fn set_withdrawal_rate_limit(
+        env: Env,
+        vault_id: u64,
+        limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if limit <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        if window_seconds == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        vault.withdrawal_limit_per_window = Some(limit);
+        vault.withdrawal_window_seconds = window_seconds;
+        vault.window_start = env.ledger().timestamp();
+        vault.withdrawn_in_window = 0;
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("set_rl"), vault_id), (limit, window_seconds));
+
+        Ok(())
+    }
+
+    pub fn get_withdrawal_rate_limit(env: Env, vault_id: u64) -> Option<(i128, u64)> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.withdrawal_limit_per_window.map(|limit| (limit, vault.withdrawal_window_seconds))
     }
 }
