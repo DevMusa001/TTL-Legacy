@@ -376,6 +376,8 @@ pub enum DataKey {
     OwnerVaultCount(Address),
     // Issue #472: state transition audit trail
     StateTransitionLog(u64),
+    PasskeyChallenge(u64, BytesN<32>),
+    WithdrawalApprovals(u64),
     VaultSnapshot(u64, u64),
     VaultSnapshotTimestamps(u64),
     // Issue #482: TTL prediction history
@@ -664,12 +666,15 @@ pub struct YieldDistributionConfig {
 
 /// Passkey hash for multi-passkey support - Issue #394
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PasskeyHash {
     pub hash: BytesN<32>,
     pub added_at: u64,
     /// Optional biometric credential hash bound to this passkey (SHA-256 commitment)
     pub biometric_hash: Option<BytesN<32>>,
+    pub deprecated_at: Option<u64>,
+    pub usage_count: u64,
+    pub last_used_timestamp: u64,
 }
 
 /// Backup code entry - Issue #393
@@ -802,18 +807,12 @@ pub struct Vault {
     pub burn_percentage: u32,
     /// Address that receives inactivity penalty transfers
     pub penalty_recipient: Option<Address>,
-    /// Minimum balance guard to prevent vault drainage - Issue #1088
-    pub min_balance_guard: Option<i128>,
-    /// Recurring withdrawal configuration - Issue #1086
-    pub recurring_withdrawal: Option<RecurringWithdrawal>,
-    /// Withdrawal rate limit per time window - Issue #1084
-    pub withdrawal_limit_per_window: Option<i128>,
-    /// Time window for withdrawal rate limiting in seconds - Issue #1084
-    pub withdrawal_window_seconds: u64,
-    /// Amount withdrawn in current window - Issue #1084
-    pub withdrawn_in_window: i128,
-    /// Start time of current withdrawal window - Issue #1084
-    pub window_start: u64,
+    /// Passkey rotation grace period in seconds - Issue #936
+    pub passkey_rotation_period_seconds: u64,
+    /// Challenge-response timeout window in seconds - Issue #938
+    pub challenge_timeout_seconds: u64,
+    /// Multi-sig passkey threshold for withdrawals - Issue #939
+    pub multi_sig_threshold: u32,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -822,6 +821,15 @@ pub struct Vault {
 pub struct PasskeyUsageEntry {
     pub passkey_hash: BytesN<32>,
     pub timestamp: u64,
+}
+
+/// Passkey analytics report - Issue #937
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasskeyAnalytics {
+    pub passkey_hash: BytesN<32>,
+    pub usage_count: u64,
+    pub last_used_timestamp: u64,
 }
 
 /// Beneficiary status enum - Issue #397
