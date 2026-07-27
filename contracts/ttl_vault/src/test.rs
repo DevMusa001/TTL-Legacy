@@ -3018,33 +3018,94 @@ fn test_is_expired_at_exact_deadline() {
     assert!(client.is_expired(&vault_id));
 }
 
-// --- #306: get_vault does not extend TTL ---
+// --- #306: get_vault conditionally extends TTL ---
 
-/// Verifies that get_vault is read-only and does not extend the vault's
-/// persistent storage TTL. Repeated reads must not alter ledger state.
+/// Verifies that get_vault extends the vault's persistent storage TTL when
+/// the remaining TTL has dropped below VAULT_TTL_THRESHOLD.
+///
+/// The Soroban `extend_ttl(key, min_ttl, max_ttl)` call is a no-op when the
+/// current TTL >= `min_ttl`, so after calling `get_vault` with the TTL below
+/// the threshold the storage TTL must be raised back up to VAULT_TTL_LEDGERS.
 #[test]
-fn test_get_vault_does_not_extend_ttl() {
+fn test_get_vault_extends_ttl_when_below_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
     let (env, owner, beneficiary, _, _, client) = setup();
+    let contract_id = client.address.clone();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
 
-    // Capture TTL immediately after creation
+    // Advance the ledger sequence far enough that the vault entry's storage TTL
+    // falls below VAULT_TTL_THRESHOLD.
+    // Vault is created with VAULT_TTL_LEDGERS (200_000).
+    // Advancing by (VAULT_TTL_LEDGERS - VAULT_TTL_THRESHOLD + 1) leaves
+    // exactly (VAULT_TTL_THRESHOLD - 1) ledgers remaining — just below trigger.
+    let advance = (VAULT_TTL_LEDGERS - VAULT_TTL_THRESHOLD + 1) as u32;
+    env.ledger().set_sequence_number(env.ledger().sequence() + advance);
+
+    let ttl_before = env
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_before < VAULT_TTL_THRESHOLD,
+        "pre-condition: TTL ({ttl_before}) must be below VAULT_TTL_THRESHOLD ({VAULT_TTL_THRESHOLD})"
+    );
+
+    // get_vault must extend the TTL back up to at least VAULT_TTL_LEDGERS.
+    client.get_vault(&vault_id);
+
+    let ttl_after = env
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_after >= VAULT_TTL_LEDGERS,
+        "get_vault must restore TTL to at least VAULT_TTL_LEDGERS when below threshold (got {ttl_after})"
+    );
+}
+
+/// Verifies that get_vault does NOT write to storage (i.e. does not alter the
+/// TTL) when the remaining TTL is already at or above VAULT_TTL_THRESHOLD.
+///
+/// This is the hot-read path: no state change should occur when storage is
+/// healthy, keeping the call fee-efficient.
+#[test]
+fn test_get_vault_does_not_extend_ttl_when_above_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let contract_id = client.address.clone();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Confirm that the TTL set at creation is well above the threshold.
     let ttl_after_create = env
-        .storage()
-        .persistent()
-        .get_ttl(&DataKey::Vault(vault_id));
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert!(
+        ttl_after_create >= VAULT_TTL_THRESHOLD,
+        "pre-condition: freshly created vault TTL must be above threshold"
+    );
 
-    // Read the vault multiple times
+    // Repeated reads must leave the TTL unchanged.
     client.get_vault(&vault_id);
     client.get_vault(&vault_id);
     client.get_vault(&vault_id);
 
-    // TTL must be unchanged — get_vault must not extend it
     let ttl_after_reads = env
-        .storage()
-        .persistent()
-        .get_ttl(&DataKey::Vault(vault_id));
-
-    assert_eq!(ttl_after_create, ttl_after_reads);
+        .as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Vault(vault_id))
+        });
+    assert_eq!(
+        ttl_after_create, ttl_after_reads,
+        "get_vault must not alter TTL when it is already above VAULT_TTL_THRESHOLD"
+    );
 }
 
 

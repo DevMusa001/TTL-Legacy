@@ -5262,7 +5262,15 @@ impl TtlVaultContract {
     /// # Panics
     /// Panics if the vault does not exist (use `vault_exists` to check first)
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
-        Self::load_vault(&env, vault_id)
+        let vault = Self::load_vault(&env, vault_id);
+        // Extend the vault's persistent TTL only when it has dropped below
+        // VAULT_TTL_THRESHOLD ledgers. This avoids a write (and the associated
+        // fee) on every read when the TTL is already healthy.
+        let key = DataKey::Vault(vault_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        vault
     }
 
     /// Captures the state of a vault at a specific point in time.
