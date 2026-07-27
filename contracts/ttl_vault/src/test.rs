@@ -6963,3 +6963,139 @@ fn test_non_owner_cannot_modify_passkey_nickname() {
     let result = client.try_add_passkey_with_nickname(&vault_id, &non_owner, &passkey_hash, &nickname);
     assert!(result.is_err(), "non-owner should not be able to set passkey nickname");
 }
+
+// ---- Issue #1066: Passkey Expiry Date Tests ----
+
+#[test]
+fn test_add_passkey_with_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400; // expires in 1 day
+
+    // Add passkey with expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Verify expiry is set
+    let expiry = client.get_passkey_expiry(&vault_id, &passkey_hash);
+    assert_eq!(expiry, Some(expires_at));
+}
+
+#[test]
+fn test_reject_authentication_with_expired_passkey() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    // Add passkey with near-future expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Check-in should succeed before expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Check-in should fail with expired passkey
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "expired passkey should reject authentication");
+}
+
+#[test]
+fn test_passkey_expiry_at_exact_ledger_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time;
+
+    // Add passkey expiring exactly at current time
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Check-in should fail - passkey is already expired
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "passkey expired at current timestamp should be rejected");
+}
+
+#[test]
+fn test_extend_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_expiry = env.ledger().timestamp() + 100;
+
+    // Add passkey with initial expiry
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &initial_expiry);
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(initial_expiry));
+
+    // Extend expiry
+    let new_expiry = env.ledger().timestamp() + 1000;
+    client.extend_passkey_expiry(&vault_id, &owner, &passkey_hash, &new_expiry);
+
+    // Verify new expiry
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), Some(new_expiry));
+}
+
+#[test]
+fn test_passkey_without_expiry_never_expires() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey without expiry
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Verify no expiry is set
+    assert_eq!(client.get_passkey_expiry(&vault_id, &passkey_hash), None);
+
+    // Advance time significantly
+    env.ledger().with_mut(|l| l.timestamp += 10000000);
+
+    // Check-in should still succeed - no expiry
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_non_owner_cannot_set_passkey_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 86400;
+
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_expiry(&vault_id, &non_owner, &passkey_hash, &expires_at);
+    assert!(result.is_err(), "non-owner should not be able to set passkey expiry");
+}
+
+#[test]
+fn test_passkey_expired_event_emission() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let expires_at = env.ledger().timestamp() + 50;
+
+    client.add_passkey_with_expiry(&vault_id, &owner, &passkey_hash, &expires_at);
+
+    // Advance past expiry
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+    // Attempt check-in and verify PasskeyExpired event is emitted
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err());
+
+    let events = env.events().all();
+    let passkey_expired_event = events.iter().any(|event| {
+        event.topics.get(0).is_some() &&
+        event.topics.get(0).unwrap().to_string().contains("PasskeyExpired")
+    });
+    assert!(passkey_expired_event, "PasskeyExpired event should be emitted");
+}
