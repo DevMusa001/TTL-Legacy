@@ -7,6 +7,7 @@ pub mod notifications;
 pub mod audit;
 pub mod error;
 pub mod routes;
+pub mod otel;
 
 pub use models::*;
 pub use handlers::*;

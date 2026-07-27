@@ -8,7 +8,6 @@ use axum::{
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
-use tracing_subscriber::EnvFilter;
 
 mod consensus;
 mod db;
@@ -16,6 +15,7 @@ mod error;
 mod handlers;
 mod models;
 mod notifications;
+mod otel;
 mod routes;
 mod scheduler;
 mod two_factor;
@@ -104,9 +104,11 @@ async fn consensus_health_handler(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Initialise OpenTelemetry distributed tracing.
+    // Spans are exported to the OTLP endpoint configured via
+    // OTEL_EXPORTER_OTLP_ENDPOINT (default: http://localhost:4317).
+    // Issue #1145: Add OpenTelemetry Distributed Tracing to Backend
+    let _otel_guard = otel::init_tracer("ttl-legacy-backend");
 
     // Check contract version before proceeding with server startup
     let min_contract_version = parse_min_contract_version(std::env::var("MIN_CONTRACT_VERSION").ok());
