@@ -6856,3 +6856,110 @@ fn test_check_in_history_page_consistent_with_full_history() {
         );
     }
 }
+
+// ---- Issue #1064: Passkey Nickname Support Tests ----
+
+#[test]
+fn test_add_passkey_with_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Phone");
+
+    // Add passkey with nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &nickname);
+
+    // Retrieve nickname and verify
+    let retrieved_nickname = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved_nickname, Some(nickname));
+}
+
+#[test]
+fn test_passkey_nickname_max_length_validation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Test with valid 64-character nickname
+    let valid_nickname = String::from_small_str("A".repeat(64).as_str());
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &valid_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(valid_nickname));
+
+    // Test with nickname exceeding 64 characters - should fail
+    let invalid_nickname = String::from_small_str("A".repeat(65).as_str());
+    let result = client.try_add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &invalid_nickname);
+    assert!(result.is_err(), "nickname exceeding 64 chars should be rejected");
+}
+
+#[test]
+fn test_update_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let initial_nickname = String::from_small_str("Device 1");
+
+    // Add passkey with initial nickname
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &initial_nickname);
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(initial_nickname));
+
+    // Update nickname
+    let updated_nickname = String::from_small_str("Work Laptop");
+    client.set_passkey_nickname(&vault_id, &owner, &passkey_hash, &updated_nickname);
+
+    // Verify update
+    assert_eq!(client.get_passkey_nickname(&vault_id, &passkey_hash), Some(updated_nickname));
+}
+
+#[test]
+fn test_list_passkeys_includes_nicknames() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash_1 = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let passkey_hash_2 = BytesN::<32>::from_array(&env, &[2u8; 32]);
+    let nickname_1 = String::from_small_str("Phone");
+    let nickname_2 = String::from_small_str("Laptop");
+
+    // Add multiple passkeys with nicknames
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_1, &nickname_1);
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash_2, &nickname_2);
+
+    // List passkeys and verify nicknames are included
+    let passkeys = client.list_passkeys(&vault_id);
+    assert_eq!(passkeys.len(), 2);
+    assert_eq!(passkeys.get(0).unwrap().nickname, Some(nickname_1));
+    assert_eq!(passkeys.get(1).unwrap().nickname, Some(nickname_2));
+}
+
+#[test]
+fn test_passkey_nickname_empty_string() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let empty_nickname = String::from_small_str("");
+
+    // Add passkey with empty nickname - should be allowed
+    client.add_passkey_with_nickname(&vault_id, &owner, &passkey_hash, &empty_nickname);
+
+    // Retrieve and verify - empty string is valid
+    let retrieved = client.get_passkey_nickname(&vault_id, &passkey_hash);
+    assert_eq!(retrieved, Some(empty_nickname));
+}
+
+#[test]
+fn test_non_owner_cannot_modify_passkey_nickname() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let nickname = String::from_small_str("My Key");
+
+    // Non-owner tries to set nickname - should fail
+    let non_owner = Address::generate(&env);
+    let result = client.try_add_passkey_with_nickname(&vault_id, &non_owner, &passkey_hash, &nickname);
+    assert!(result.is_err(), "non-owner should not be able to set passkey nickname");
+}
