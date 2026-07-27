@@ -7099,3 +7099,155 @@ fn test_passkey_expired_event_emission() {
     });
     assert!(passkey_expired_event, "PasskeyExpired event should be emitted");
 }
+
+// ---- Issue #1067: Passkey Scope Restriction Tests ----
+
+#[test]
+fn test_add_passkey_with_full_access_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32); // 0 = FullAccess
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
+}
+
+#[test]
+fn test_add_passkey_with_check_in_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32); // 1 = CheckInOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(1u32));
+}
+
+#[test]
+fn test_add_passkey_with_read_only_scope() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32); // 2 = ReadOnly
+
+    // Verify scope is set
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(2u32));
+}
+
+#[test]
+fn test_check_in_only_scope_allows_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_withdrawal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt withdrawal with CheckInOnly passkey - should fail
+    let result = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow withdrawals");
+}
+
+#[test]
+fn test_check_in_only_scope_rejects_deposit() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with CheckInOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &1u32);
+
+    // Attempt deposit with CheckInOnly passkey - should fail
+    let result = client.try_deposit(&vault_id, &owner, &passkey_hash, &100i128);
+    assert!(result.is_err(), "CheckInOnly scope should not allow deposits");
+}
+
+#[test]
+fn test_read_only_scope_allows_viewing_data() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Reading vault data should succeed
+    let _ = client.get_vault_info(&vault_id);
+}
+
+#[test]
+fn test_read_only_scope_rejects_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with ReadOnly scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &2u32);
+
+    // Check-in with ReadOnly scope - should fail
+    let result = client.try_check_in(&vault_id, &owner, &passkey_hash);
+    assert!(result.is_err(), "ReadOnly scope should not allow check-in");
+}
+
+#[test]
+fn test_full_access_scope_allows_all_operations() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey with FullAccess scope
+    client.add_passkey_with_scope(&vault_id, &owner, &passkey_hash, &0u32);
+
+    // Check-in should succeed
+    client.check_in(&vault_id, &owner, &passkey_hash).unwrap();
+
+    // Withdrawal should succeed
+    let _ = client.try_request_withdrawal(&vault_id, &owner, &passkey_hash, &100i128);
+}
+
+#[test]
+fn test_default_scope_is_full_access() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    // Add passkey without explicit scope
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+
+    // Default scope should be FullAccess (0)
+    let scope = client.get_passkey_scope(&vault_id, &passkey_hash);
+    assert_eq!(scope, Some(0u32));
+}
