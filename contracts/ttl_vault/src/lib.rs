@@ -90,13 +90,13 @@ mod beneficiary_identity_verification_tests;
 #[cfg(test)]
 mod beneficiary_memo_tests;
 #[cfg(test)]
-mod vault_migration_tests;
+mod vault_notes_tests;
 #[cfg(test)]
-mod vault_tags_tests;
+mod vault_expiry_tests;
 #[cfg(test)]
-mod test_issue_968_tests;
+mod vault_pause_tests;
 #[cfg(test)]
-mod vault_cloning_comprehensive_tests;
+mod passkey_device_type_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
