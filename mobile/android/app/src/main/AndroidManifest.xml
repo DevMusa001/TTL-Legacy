@@ -45,6 +45,19 @@
                     android:host="vault" />
             </intent-filter>
 
+            <!-- App Links: ttl-legacy://vault/{vault_id} and ttl-legacy://vault/{vault_id}/{action}
+                 android:autoVerify="true" causes Android to verify the assetlinks.json fingerprint
+                 at runtime, turning these into verified App Links (no disambiguation dialog).
+                 Issue #1146: Implement Android App Links for Vault Deep Linking -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="ttl-legacy"
+                    android:host="vault" />
+            </intent-filter>
+
         </activity>
 
         <service

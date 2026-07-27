@@ -336,3 +336,83 @@ Times include network latency and ledger confirmation.
 - [Soroban Testing Guide](https://soroban.stellar.org/docs/learn/testing)
 - [Stellar Testnet](https://developers.stellar.org/docs/learn/networks)
 - [Soroban RPC API](https://soroban-rpc.stellar.org/)
+
+---
+
+## Property-Based Test Suite
+
+> Issue #1148: Add Property-Based Tests for TTL Extension Calculation
+
+Property-based tests use [`proptest`](https://github.com/proptest-rs/proptest) to
+generate thousands of random inputs and verify that key invariants hold across the
+entire input space. This catches edge cases — such as overflow near u32/u64
+boundaries — that hand-picked unit tests miss.
+
+### Location
+
+```
+contracts/ttl_vault/tests/property_tests.rs
+```
+
+### Running Property Tests
+
+```bash
+# Run all property tests for ttl-vault
+cargo test --package ttl-vault --test property_tests
+
+# Run a specific property test
+cargo test --package ttl-vault --test property_tests prop_vault_ttl_never_exceeds_max
+
+# Increase the number of test cases (default: 256)
+PROPTEST_CASES=10000 cargo test --package ttl-vault --test property_tests
+```
+
+### Invariants Verified
+
+#### `vault_ttl_ledgers` function
+
+The `vault_ttl_ledgers(check_in_interval)` function converts a check-in interval
+(seconds) to a ledger count. The following invariants are verified across all
+possible `u64` inputs:
+
+| Test | Invariant |
+|---|---|
+| `prop_vault_ttl_never_exceeds_max` | Result never exceeds `MAX_PERSISTENT_TTL` (3,110,400 ledgers) and never overflows `u32::MAX` |
+| `prop_vault_ttl_always_meets_minimum` | Result always ≥ `VAULT_TTL_LEDGERS_MIN` (200,000 ledgers) |
+| `prop_vault_ttl_monotonically_non_decreasing` | Larger interval always produces ≥ ledger count |
+| `prop_vault_ttl_within_one_ledger_of_expected` | Result is within ±1 ledger of analytical value (linear range) |
+| `prop_vault_ttl_zero_interval_returns_floor` | Zero interval returns the minimum floor |
+| `prop_vault_ttl_large_interval_returns_ceiling` | Very large interval returns the maximum ceiling |
+
+#### TTL / check-in invariants
+
+| Test | Invariant |
+|---|---|
+| `prop_ttl_always_increases_on_check_in` | TTL is monotonically non-decreasing after every check-in |
+| `prop_ttl_post_checkin_equals_old_plus_interval` | New TTL equals old + interval (saturating) |
+| `prop_ttl_after_checkin_gte_current_ledger` | Post-check-in TTL is always ≥ current ledger |
+
+#### Balance invariants
+
+| Test | Invariant |
+|---|---|
+| `prop_vault_balance_never_exceeds_deposits` | Balance never exceeds initial + total deposits |
+
+#### Lifecycle / state-machine invariants
+
+| Test | Invariant |
+|---|---|
+| `prop_vault_status_transitions_valid` | Vault always ends in a valid state; active vault TTL never falls below initial |
+| `prop_no_double_release` | Funds are released at most once |
+
+### CI Integration
+
+Property tests run as part of the existing `./scripts/test.sh` and the CI workflow:
+
+```yaml
+- name: Run tests
+  run: cargo test --package ttl-vault
+```
+
+The `proptest` dev-dependency is already declared in
+`contracts/ttl_vault/Cargo.toml` under `[dev-dependencies]`.

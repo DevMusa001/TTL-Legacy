@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
+use tracing::instrument;
 
 
 pub fn search_vaults_handler(
@@ -416,6 +417,9 @@ pub fn get_vault_detail_analytics_handler(
 /// Serialises the vault to JSON and stores it as a base64-encoded "encrypted" payload.
 /// In production this would use AES-GCM; here we use base64 to keep the implementation
 /// dependency-free while preserving the correct API shape.
+///
+/// Instrumented with an OpenTelemetry span (Issue #1145).
+#[instrument(skip(store, backup_store), fields(vault_id = %vault_id))]
 pub fn backup_vault_handler(
     store: &VaultStore,
     backup_store: &BackupStore,
@@ -444,6 +448,9 @@ pub fn backup_vault_handler(
 }
 
 /// POST /vaults/restore
+///
+/// Instrumented with an OpenTelemetry span (Issue #1145).
+#[instrument(skip(store, backup_store), fields(backup_id = %request.backup_id))]
 pub fn restore_vault_handler(
     store: &VaultStore,
     backup_store: &BackupStore,
@@ -769,6 +776,9 @@ pub fn list_vault_shares_handler(
 // ── Task 4: Notification Preferences ─────────────────────────────────────────
 
 /// POST /vaults/{id}/notification-preferences
+///
+/// Instrumented with an OpenTelemetry span (Issue #1145).
+#[instrument(skip(store, notif_store), fields(vault_id = %vault_id))]
 pub fn set_notification_preferences_handler(
     store: &VaultStore,
     notif_store: &NotificationStore,
@@ -1981,6 +1991,9 @@ pub fn simulate_scenario(
 /// Public entry point: simulate release scenarios for a vault.
 ///
 /// Returns `Err` with a message when the vault is not found.
+///
+/// Instrumented with an OpenTelemetry span (Issue #1145).
+#[instrument(skip(store), fields(vault_id = %vault_id))]
 pub fn simulate_release_handler(
     store: &VaultStore,
     vault_id: &str,
