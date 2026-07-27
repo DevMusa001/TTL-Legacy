@@ -65,7 +65,7 @@ use types::{
     WITHDRAWAL_LIMIT_EXCEEDED_TOPIC, WITHDRAWAL_LIMIT_SET_TOPIC, WITHDRAWAL_NOTIF_TOPIC,
     WITHDRAWAL_REVERSED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_VALIDATION_TOPIC,
     WITHDRAW_TOPIC, WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
-    YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
+    YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -81,6 +81,22 @@ mod bps_invariant_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_waitlist_tests;
+#[cfg(test)]
+mod beneficiary_notification_tests;
+#[cfg(test)]
+mod beneficiary_identity_verification_tests;
+#[cfg(test)]
+mod beneficiary_memo_tests;
+#[cfg(test)]
+mod vault_notes_tests;
+#[cfg(test)]
+mod vault_expiry_tests;
+#[cfg(test)]
+mod vault_pause_tests;
+#[cfg(test)]
+mod passkey_device_type_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -1434,6 +1450,9 @@ impl TtlVaultContract {
         if vault.is_paused {
             return Err(ContractError::Paused);
         }
+        if Self::check_vault_frozen(&env, vault_id) {
+            return Err(ContractError::VaultFrozen);
+        }
         let is_delegate = caller != vault.owner && Self::is_check_in_delegate(&env, vault_id, &caller);
         if caller != vault.owner && !is_delegate {
             return Err(ContractError::NotOwner);
@@ -1607,6 +1626,9 @@ impl TtlVaultContract {
         }
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
+        }
+        if Self::check_vault_frozen(&env, vault_id) {
+            panic_with_error!(&env, ContractError::VaultFrozen);
         }
         if vault.status != ReleaseStatus::Locked {
             panic_with_error!(&env, ContractError::AlreadyReleased);
@@ -1788,6 +1810,10 @@ impl TtlVaultContract {
             Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Vault frozen");
             return Err(ContractError::VaultFrozen);
         }
+        if Self::check_vault_frozen(&env, vault_id) {
+            Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Vault admin-frozen");
+            return Err(ContractError::VaultFrozen);
+        }
         if vault.status != ReleaseStatus::Locked {
             Self::record_withdrawal_audit(
                 &env,
@@ -1822,6 +1848,21 @@ impl TtlVaultContract {
             return Err(ContractError::InsufficientBalance);
         }
 
+        // Check minimum balance guard - Issue #1088
+        if let Some(min_guard) = vault.min_balance_guard {
+            if vault.balance - amount < min_guard {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Below minimum balance",
+                );
+                return Err(ContractError::BelowMinimumBalance);
+            }
+        }
+
         // Check withdrawal approval threshold - Issue #404
         if let Some(threshold) = vault.withdrawal_approval_threshold {
             if amount > threshold {
@@ -1840,6 +1881,32 @@ impl TtlVaultContract {
         // Check withdrawal limits - Issue #566
         Self::check_withdrawal_limits(&env, vault_id, amount)?;
 
+        // Check withdrawal rate limiting - Issue #1084
+        if let Some(limit) = vault.withdrawal_limit_per_window {
+            let now = env.ledger().timestamp();
+            let window_elapsed = now - vault.window_start;
+
+            let mut vault_mut = vault.clone();
+            if window_elapsed >= vault_mut.withdrawal_window_seconds {
+                vault_mut.withdrawn_in_window = 0;
+                vault_mut.window_start = now;
+            }
+
+            if vault_mut.withdrawn_in_window + amount > limit {
+                Self::record_withdrawal_audit(
+                    &env,
+                    vault_id,
+                    &caller,
+                    amount,
+                    false,
+                    "Withdrawal rate limit exceeded",
+                );
+                return Err(ContractError::WithdrawalRateLimitExceeded);
+            }
+
+            vault = vault_mut;
+        }
+
         // Check whitelist - Issue #567
         if !Self::is_whitelisted(&env, vault_id, &vault.owner) {
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
@@ -1848,6 +1915,11 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
+
+        // Update withdrawal rate tracking - Issue #1084
+        if vault.withdrawal_limit_per_window.is_some() {
+            vault.withdrawn_in_window += amount;
+        }
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -2406,6 +2478,9 @@ impl TtlVaultContract {
         // Attempt to restore archived vault state before proceeding - Issue #443
         Self::try_restore_archived_vault(&env, vault_id);
         let mut vault = Self::load_vault(&env, vault_id);
+        if Self::check_vault_frozen(&env, vault_id) {
+            panic_with_error!(&env, ContractError::VaultFrozen);
+        }
         if env
             .storage()
             .persistent()
@@ -5200,7 +5275,15 @@ impl TtlVaultContract {
     /// # Panics
     /// Panics if the vault does not exist (use `vault_exists` to check first)
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
-        Self::load_vault(&env, vault_id)
+        let vault = Self::load_vault(&env, vault_id);
+        // Extend the vault's persistent TTL only when it has dropped below
+        // VAULT_TTL_THRESHOLD ledgers. This avoids a write (and the associated
+        // fee) on every read when the TTL is already healthy.
+        let key = DataKey::Vault(vault_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        vault
     }
 
     /// Captures the state of a vault at a specific point in time.
@@ -6922,6 +7005,75 @@ impl TtlVaultContract {
         }
     }
 
+    // --- Per-vault admin freeze (Issue: per-vault freeze) ---
+
+    /// Freezes a specific vault, blocking deposit, withdraw, check_in, and trigger_release.
+    ///
+    /// Unlike the global contract pause or the per-vault owner pause, this is an **admin-only**
+    /// action intended for incident response when a single vault is believed to be compromised.
+    /// The freeze flag is stored as a separate persistent key (`DataKey::VaultFrozen`) so it
+    /// survives vault-struct updates and can be inspected independently.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault to freeze
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin`      - If the caller is not the contract admin
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    pub fn freeze_vault(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        // Verify the vault exists before acting on it
+        Self::load_vault(&env, vault_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VaultFrozen(vault_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VaultFrozen(vault_id),
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((FREEZE_VAULT_TOPIC, vault_id), true);
+        Ok(())
+    }
+
+    /// Unfreezes a previously frozen vault, restoring normal operation.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault to unfreeze
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin`      - If the caller is not the contract admin
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    pub fn unfreeze_vault(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        // Verify the vault exists before acting on it
+        Self::load_vault(&env, vault_id);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VaultFrozen(vault_id));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((UNFREEZE_VAULT_TOPIC, vault_id), false);
+        Ok(())
+    }
+
+    /// Returns `true` if the vault is currently frozen by an admin.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    pub fn is_vault_frozen(env: Env, vault_id: u64) -> bool {
+        Self::check_vault_frozen(&env, vault_id)
+    }
+
     // --- Issue #379: Conditional Release Logic ---
 
     /// Sets the release condition for a vault.
@@ -8082,6 +8234,15 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` when the vault's admin freeze flag is set.
+    /// Used internally by deposit, withdraw, check_in, and trigger_release.
+    fn check_vault_frozen(env: &Env, vault_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::VaultFrozen(vault_id))
             .unwrap_or(false)
     }
 
@@ -11569,14 +11730,28 @@ impl TtlVaultContract {
     }
 
     /// Returns a paginated page of the check-in history for a vault.
+    ///
+    /// History is stored as individual `DataKey::CheckInEntry(vault_id, slot)` keys
+    /// in a ring buffer capped at 50 entries. Each page read fetches only the
+    /// `page_size` entries for that page — no full-Vec deserialization occurs.
+    ///
     /// Entries are returned in chronological order (oldest first).
     /// Returns an empty vec if `page` is beyond the available entries.
+    ///
+    /// # Arguments
+    /// * `vault_id`  - The vault whose history to query
+    /// * `page`      - Zero-based page number
+    /// * `page_size` - Number of entries per page (automatically capped at 50)
     pub fn get_check_in_history_page(
         env: Env,
         vault_id: u64,
         page: u32,
         page_size: u32,
     ) -> Vec<CheckInHistoryEntry> {
+        let page_size = page_size.min(50);
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
         let len: u32 = env
             .storage()
             .persistent()
@@ -11595,6 +11770,9 @@ impl TtlVaultContract {
 
         let mut result: Vec<CheckInHistoryEntry> = Vec::new(&env);
         for i in start..end {
+            // When the buffer has not yet filled (len < 50) head is always 0,
+            // so slot i == i. Once full (len == 50) head points at the oldest
+            // entry and we map logical index i to physical slot (head+i)%50.
             let phys = if len < 50 { i } else { (head + i) % 50 };
             if let Some(entry) = env.storage().persistent().get::<DataKey, CheckInHistoryEntry>(
                 &DataKey::CheckInEntry(vault_id, phys),
@@ -11605,7 +11783,47 @@ impl TtlVaultContract {
         result
     }
 
-    /// Returns the full check-in history for a vault (backward compatible).
+    /// Returns a single check-in history entry by its logical index in O(1).
+    ///
+    /// `index` is zero-based and ordered oldest-first, matching the order returned
+    /// by `get_check_in_history_page`. Only the single `DataKey::CheckInEntry` key
+    /// for that slot is read — no Vec is deserialized.
+    ///
+    /// Returns `None` if `index` is out of bounds or the vault has no history.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault whose history to query
+    /// * `index`    - Zero-based logical index of the entry
+    pub fn get_check_in_history_entry(
+        env: Env,
+        vault_id: u64,
+        index: u32,
+    ) -> Option<CheckInHistoryEntry> {
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInHistoryLen(vault_id))
+            .unwrap_or(0);
+        if index >= len {
+            return None;
+        }
+        let head: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInHistoryHead(vault_id))
+            .unwrap_or(0);
+        let phys = if len < 50 { index } else { (head + index) % 50 };
+        env.storage()
+            .persistent()
+            .get::<DataKey, CheckInHistoryEntry>(&DataKey::CheckInEntry(vault_id, phys))
+    }
+
+    /// Returns the full check-in history for a vault (up to 50 entries).
+    ///
+    /// Reads each of the (up to 50) individual `DataKey::CheckInEntry` keys
+    /// in order — no monolithic Vec is stored or deserialized.
+    /// For large histories prefer `get_check_in_history_page` to limit
+    /// per-call instruction consumption.
     pub fn get_check_in_history(env: Env, vault_id: u64) -> Vec<CheckInHistoryEntry> {
         let len: u32 = env
             .storage()
@@ -11631,51 +11849,6 @@ impl TtlVaultContract {
             }
         }
         result
-    }
-
-    /// Returns a page of check-in history for a vault.
-    ///
-    /// Entries are ordered oldest-first (index 0 is the oldest stored entry).
-    /// `cursor` is the zero-based index of the first entry to return; passing
-    /// `cursor = 0` starts from the oldest entry.  `limit` is capped at 50.
-    ///
-    /// Returns an empty `Vec` when `cursor` is out of bounds or the history is
-    /// empty.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault whose check-in history to page through.
-    /// * `cursor`   - Zero-based index of the first entry to return.
-    /// * `limit`    - Maximum number of entries to return (capped at 50).
-    pub fn get_check_in_history_page(
-        env: Env,
-        vault_id: u64,
-        cursor: u64,
-        limit: u32,
-    ) -> Vec<CheckInHistoryEntry> {
-        const MAX_PAGE_SIZE: u32 = 50;
-        let page_size = limit.min(MAX_PAGE_SIZE);
-
-        let history: Vec<CheckInHistoryEntry> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CheckInHistory(vault_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let total = history.len() as u64;
-
-        // cursor beyond the end of the list → return empty page
-        if cursor >= total || page_size == 0 {
-            return Vec::new(&env);
-        }
-
-        let start = cursor as u32;
-        let end = ((cursor + page_size as u64).min(total)) as u32;
-
-        let mut page = Vec::new(&env);
-        for i in start..end {
-            page.push_back(history.get(i).unwrap());
-        }
-        page
     }
 
     /// Returns the current check-in streak for a vault.
@@ -11894,22 +12067,42 @@ impl TtlVaultContract {
         let mut head: u32 = env.storage().persistent().get(&head_key).unwrap_or(0);
         let entry = CheckInHistoryEntry { timestamp };
 
+        // Ring buffer capped at 50 entries.
+        // While filling (<50): write to slot `len`, then increment len.
+        // Once full (==50): overwrite slot `head` (the oldest), then advance head.
         if len < 50 {
             let entry_key = DataKey::CheckInEntry(vault_id, len);
             env.storage().persistent().set(&entry_key, &entry);
+            env.storage().persistent().extend_ttl(
+                &entry_key,
+                VAULT_TTL_THRESHOLD,
+                VAULT_TTL_LEDGERS,
+            );
             len += 1;
         } else {
             let entry_key = DataKey::CheckInEntry(vault_id, head);
             env.storage().persistent().set(&entry_key, &entry);
+            env.storage().persistent().extend_ttl(
+                &entry_key,
+                VAULT_TTL_THRESHOLD,
+                VAULT_TTL_LEDGERS,
+            );
             head = (head + 1) % 50;
         }
 
-        let vault = Self::load_vault(env, vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Persist updated metadata
+        env.storage().persistent().set(&len_key, &len);
+        env.storage().persistent().extend_ttl(
+            &len_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage().persistent().set(&head_key, &head);
+        env.storage().persistent().extend_ttl(
+            &head_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
     }
 
     fn update_check_in_streak(env: &Env, vault_id: u64, vault: &Vault, now: u64) {
@@ -14014,5 +14207,168 @@ impl TtlVaultContract {
             }
             None => false,
         }
+    }
+
+    // --- Issue #1088: Enforce Minimum Balance Guard to Prevent Vault Drainage ---
+
+    pub fn set_min_balance_guard(
+        env: Env,
+        vault_id: u64,
+        min: i128,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+        vault.min_balance_guard = Some(min);
+        Self::save_vault(&env, vault_id, &vault);
+        env.events()
+            .publish((symbol_short!("minbal"), vault_id), (min,));
+        Ok(())
+    }
+
+    pub fn get_min_balance_guard(env: Env, vault_id: u64) -> Option<i128> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.min_balance_guard
+    }
+
+    // --- Issue #1087: Attach Reason Code to Withdrawal Events for Audit Trail ---
+
+    pub fn withdraw_with_reason(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        amount: i128,
+        reason: Option<String>,
+    ) -> Result<(), ContractError> {
+        if let Some(ref r) = reason {
+            if r.len() > 64 {
+                return Err(ContractError::ReasonTooLong);
+            }
+        }
+
+        Self::withdraw(&env, vault_id, caller.clone(), amount)?;
+
+        env.events()
+            .publish((symbol_short!("wd_rsn"), vault_id), (&caller, amount, reason));
+
+        Ok(())
+    }
+
+    // --- Issue #1086: Implement Recurring Withdrawal Schedule for Regular Transfers ---
+
+    pub fn set_recurring_withdrawal(
+        env: Env,
+        vault_id: u64,
+        amount: i128,
+        interval_seconds: u64,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let recurring = RecurringWithdrawal {
+            amount,
+            interval_seconds,
+            destination: destination.clone(),
+            next_at: now + interval_seconds,
+        };
+
+        vault.recurring_withdrawal = Some(recurring);
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("rec_wd"), vault_id), (amount, interval_seconds, &destination));
+
+        Ok(())
+    }
+
+    pub fn execute_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        let recurring = vault.recurring_withdrawal.as_ref()
+            .ok_or(ContractError::RecurringWithdrawalNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now < recurring.next_at {
+            return Err(ContractError::RecurringWithdrawalNotReady);
+        }
+
+        if vault.balance < recurring.amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &recurring.destination, &recurring.amount);
+        vault.balance -= recurring.amount;
+
+        if let Some(ref mut rec) = vault.recurring_withdrawal {
+            rec.next_at = now + rec.interval_seconds;
+        }
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("exec_rw"), vault_id), (recurring.amount, now));
+
+        Ok(())
+    }
+
+    pub fn cancel_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        vault.recurring_withdrawal = None;
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("can_rw"), vault_id), ());
+
+        Ok(())
+    }
+
+    pub fn get_recurring_withdrawal(env: Env, vault_id: u64) -> Option<RecurringWithdrawal> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.recurring_withdrawal
+    }
+
+    // --- Issue #1084: Implement Withdrawal Rate Limiting Per Time Window ---
+
+    pub fn set_withdrawal_rate_limit(
+        env: Env,
+        vault_id: u64,
+        limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if limit <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        if window_seconds == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        vault.withdrawal_limit_per_window = Some(limit);
+        vault.withdrawal_window_seconds = window_seconds;
+        vault.window_start = env.ledger().timestamp();
+        vault.withdrawn_in_window = 0;
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events()
+            .publish((symbol_short!("set_rl"), vault_id), (limit, window_seconds));
+
+        Ok(())
+    }
+
+    pub fn get_withdrawal_rate_limit(env: Env, vault_id: u64) -> Option<(i128, u64)> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.withdrawal_limit_per_window.map(|limit| (limit, vault.withdrawal_window_seconds))
     }
 }

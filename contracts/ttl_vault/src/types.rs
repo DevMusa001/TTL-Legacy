@@ -240,6 +240,9 @@ pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 // Emergency freeze events
 pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
 pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
+// Per-vault admin freeze/unfreeze events
+pub const FREEZE_VAULT_TOPIC: Symbol = symbol_short!("frz_vlt");
+pub const UNFREEZE_VAULT_TOPIC: Symbol = symbol_short!("ufrz_vlt");
 
 // Beneficiary rotation
 pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
@@ -460,6 +463,9 @@ pub enum DataKey {
     // Issue #965: two-factor authentication
     TwoFactorConfig(u64),
     TwoFactorVerified(u64),
+    /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
+    /// are all rejected with `ContractError::VaultFrozen`.
+    VaultFrozen(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -749,6 +755,16 @@ pub struct WithdrawalRateLimit {
     pub last_withdrawal_time: u64,
     pub withdrawal_count: u32,
     pub cooldown_seconds: u64,
+}
+
+/// Recurring withdrawal configuration - Issue #1086
+#[contracttype]
+#[derive(Clone)]
+pub struct RecurringWithdrawal {
+    pub amount: i128,
+    pub interval_seconds: u64,
+    pub destination: Address,
+    pub next_at: u64,
 }
 
 #[contracttype]

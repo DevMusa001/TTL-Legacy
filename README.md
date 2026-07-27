@@ -48,16 +48,43 @@ This Soroban implementation makes TTL-Legacy:
 - Rust (1.70+)
 - Soroban CLI
 - Stellar CLI
+- [just](https://just.systems/man/en/packages.html) (optional but recommended — centralizes all dev commands)
+
+### Using just
+
+Install `just` once, then run `just --list` to see every available target:
+
+```
+Available recipes:
+    audit               # Run cargo-audit (install with: cargo install cargo-audit)
+    build               # Build both Soroban contracts for wasm32 release
+    ci                  # Run build + test + clippy in one shot (useful before opening a PR)
+    clippy              # Run clippy (warnings treated as errors, matching CI)
+    deploy-mainnet      # Deploy to Stellar mainnet (requires STELLAR_MAINNET_RPC_URL; prompts for confirmation)
+    deploy-mainnet-force# Force-redeploy to mainnet without the existing-contract prompt
+    deploy-testnet      # Deploy to Stellar testnet (prompts if a contract already exists)
+    deploy-testnet-force# Force-redeploy to testnet without confirmation prompt
+    docker-down         # Stop and remove local dev stack containers
+    docker-up           # Start local dev stack (PostgreSQL, backend, Stellar Quickstart)
+    env-setup           # Copy .env.example to .env (skips if .env already exists)
+    fmt                 # Auto-format all code
+    fmt-check           # Check code formatting
+    test                # Run the full ttl_vault test suite
+```
 
 ### Build
 
 ```bash
+just build
+# or without just:
 ./scripts/build.sh
 ```
 
 ### Test
 
 ```bash
+just test
+# or without just:
 ./scripts/test.sh
 ```
 
