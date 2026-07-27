@@ -81,6 +81,14 @@ mod bps_invariant_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_waitlist_tests;
+#[cfg(test)]
+mod beneficiary_notification_tests;
+#[cfg(test)]
+mod beneficiary_identity_verification_tests;
+#[cfg(test)]
+mod beneficiary_memo_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
