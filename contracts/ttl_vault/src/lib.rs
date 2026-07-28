@@ -8,8 +8,8 @@ use soroban_sdk::{
 pub mod ranking;
 mod types;
 use types::{
-    ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
-    BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
+    ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryClaimDelegation, BeneficiaryCommitment,
+    BeneficiaryEntry, BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
     CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, DataKey, DisputeStatus,
     EncryptedBackupCodes, GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry,
     MilestoneEntry, MilestoneVestingSchedule, MultiSigConfig, MultiSigOperation, MultiSigProposal,
@@ -21,13 +21,15 @@ use types::{
     VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim, VestingSchedule,
     WhitelistEntry, WithdrawalLimit, WithdrawalReversal, WithdrawalScheduleEntry,
     WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
-    ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
+    ACCEPTANCE_CONDITIONS_SET_TOPIC, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
+    ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_ENCRYPTED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
     BACKUP_CODE_USED_TOPIC, BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC,
     BENEFICIARY_CAP_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC,
     BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC, BENEFICIARY_IDENTITY_VERIFIED_TOPIC,
     BENEFICIARY_REBALANCED_TOPIC, BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC,
-    BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC,
+    BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_CLAIM_DELEG_TOPIC,
+    BEN_ROTATION_TOPIC, CANCEL_TOPIC,
     CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     DELEGATE_BENEFICIARY_TOPIC, DELEGATE_CHECKIN_TOPIC, DEPOSIT_TOPIC, DISPUTE_FILED_TOPIC,
@@ -44,7 +46,8 @@ use types::{
     PASSKEY_LOCKOUT_TOPIC, PASSKEY_RECOVERED_TOPIC, PASSKEY_RECOVERY_INITIATED_TOPIC,
     PASSKEY_ROTATION_ENFORCED_TOPIC, PASSKEY_ROTATION_REQUIRED_TOPIC, PASSKEY_UNLOCKED_TOPIC,
     PASSKEY_USAGE_TOPIC, PAUSE_TOPIC, PAUSE_VAULT_TOPIC, PING_EXPIRY_TOPIC, POOL_CREATED_TOPIC,
-    PROOF_OF_LIFE_TOPIC, RECOVERY_EXTEND_TOPIC, RELEASE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    PROOF_OF_LIFE_TOPIC, PROXY_CLAIM_TOPIC, RECOVERY_EXTEND_TOPIC, RELEASE_TOPIC,
+    RELEASE_VOTE_PASSED_TOPIC,
     RELEASE_VOTE_TOPIC, REMOVE_PASSKEY_TOPIC, RESTORE_VAULT_TOPIC, RESUME_VAULT_TOPIC,
     REVERSAL_GRACE_EXPIRED_TOPIC, REVOKE_DELEGATE_TOPIC, ROTATE_PASSKEY_TOPIC,
     SET_BENEFICIARIES_TOPIC, SET_DECAY_RATE_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MAX_TTL_TOPIC,
@@ -254,6 +257,9 @@ pub enum ContractError {
     ChallengeNotFound = 86,
     ChallengeExpired = 87,
     DuplicateSignature = 88,
+    // Issue #944: beneficiary delegation to proxy
+    NoDelegation = 89,
+    DelegationExpired = 90,
 }
 
 #[contract]
@@ -5447,8 +5453,6 @@ impl TtlVaultContract {
         env.events().publish((SET_BURN_PERCENTAGE_TOPIC, vault_id), percentage);
     }
 
-    }
-
     /// Checks if a vault exists.
     ///
     /// # Arguments
@@ -10108,6 +10112,97 @@ impl TtlVaultContract {
             })
     }
 
+    // --- Issue #944: Beneficiary Delegation to Proxy ---
+
+    /// Delegates the right to claim a vault's released funds to a trusted proxy
+    /// address until `expiry`. Beneficiary-only.
+    pub fn delegate_beneficiary_claim(
+        env: Env,
+        vault_id: u64,
+        proxy_address: Address,
+        expiry: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if expiry <= env.ledger().timestamp() {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let delegation = BeneficiaryClaimDelegation {
+            proxy: proxy_address.clone(),
+            expiry,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryClaimDelegation(vault_id), &delegation);
+
+        env.events().publish(
+            (BEN_CLAIM_DELEG_TOPIC,),
+            (vault_id, vault.beneficiary.clone(), proxy_address, expiry),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryClaimDelegation(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Claims a vault's released balance as the delegated proxy. Proxy-only,
+    /// and only while a valid (non-expired) delegation exists for the caller.
+    pub fn claim_as_delegated_proxy(env: Env, vault_id: u64) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        let delegation: BeneficiaryClaimDelegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryClaimDelegation(vault_id))
+            .ok_or(ContractError::NoDelegation)?;
+
+        delegation.proxy.require_auth();
+
+        if env.ledger().timestamp() > delegation.expiry {
+            return Err(ContractError::DelegationExpired);
+        }
+
+        if vault.status != ReleaseStatus::Released {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let amount = vault.balance;
+        if amount == 0 {
+            return Err(ContractError::EmptyVault);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &delegation.proxy, &amount);
+        vault.balance = 0;
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.events().publish(
+            (PROXY_CLAIM_TOPIC,),
+            (vault_id, delegation.proxy.clone(), amount),
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(amount)
+    }
+
+    /// Gets the beneficiary claim delegation for a vault, if one exists.
+    pub fn get_beneficiary_claim_delegation(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryClaimDelegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryClaimDelegation(vault_id))
+    }
+
     /// Returns the current active delegate (last in the chain) or None if no delegation.
     fn get_delegated_beneficiary(env: Env, vault_id: u64) -> Option<Address> {
         let chain: Vec<Address> = env
@@ -10376,10 +10471,79 @@ impl TtlVaultContract {
                 &DataKey::BeneficiaryConditionalAcceptance(vault_id),
             )
         {
-            Ok(current_balance >= acceptance.min_balance_threshold)
-        } else {
-            Ok(true)
+            if current_balance < acceptance.min_balance_threshold {
+                return Ok(false);
+            }
         }
+
+        // Issue #945: conditional threshold escalation. The owner may define multiple
+        // (threshold_amount, owner_missing_days) pairs; acceptance succeeds if any one
+        // pair is satisfied (balance >= threshold_amount AND owner has been missing for
+        // at least owner_missing_days since their last check-in).
+        if let Some(conditions) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<(u64, u64)>>(&DataKey::AcceptanceConditions(vault_id))
+        {
+            if !conditions.is_empty() {
+                let vault = Self::load_vault(env, vault_id);
+                let now = env.ledger().timestamp();
+                let owner_missing_days = now.saturating_sub(vault.last_check_in) / 86_400;
+
+                let mut satisfied = false;
+                for (threshold_amount, required_missing_days) in conditions.iter() {
+                    if current_balance >= threshold_amount as i128
+                        && owner_missing_days >= required_missing_days
+                    {
+                        satisfied = true;
+                        break;
+                    }
+                }
+                if !satisfied {
+                    return Ok(false);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Sets escalating acceptance conditions for a vault's beneficiary release.
+    /// Each entry is a `(threshold_amount, owner_missing_days)` pair; the beneficiary
+    /// acceptance check (used by `trigger_release`) succeeds if the vault balance meets
+    /// or exceeds `threshold_amount` AND the owner has been missing (no check-in) for at
+    /// least `owner_missing_days`, for any one of the configured pairs. Owner-only.
+    pub fn set_acceptance_conditions(
+        env: Env,
+        vault_id: u64,
+        conditions: Vec<(u64, u64)>,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AcceptanceConditions(vault_id), &conditions);
+
+        env.events().publish(
+            (ACCEPTANCE_CONDITIONS_SET_TOPIC,),
+            (vault_id, conditions.len()),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::AcceptanceConditions(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Gets the escalating acceptance conditions configured for a vault.
+    pub fn get_acceptance_conditions(env: Env, vault_id: u64) -> Vec<(u64, u64)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AcceptanceConditions(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // --- Issue #399: Dispute Resolution ---
