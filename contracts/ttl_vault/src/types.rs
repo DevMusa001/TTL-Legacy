@@ -92,6 +92,8 @@ pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
 // Issue #480: check-in delegation events
 pub const DELEGATE_CHECKIN_TOPIC: Symbol = symbol_short!("del_ci");
 pub const REVOKE_DELEGATE_TOPIC: Symbol = symbol_short!("rev_del");
+/// Emitted when check-in score is updated - Issue #947
+pub const CHECKIN_SCORE_UPDATED_TOPIC: Symbol = symbol_short!("ci_score");
 // Issue #481: proof-of-work event
 pub const CHECKIN_POW_TOPIC: Symbol = symbol_short!("ci_pow");
 // Issue #482: TTL prediction event
@@ -395,6 +397,8 @@ pub enum DataKey {
     CheckInDelegates(u64),
     // Per-delegation nonce to prevent check-in replay attacks
     DelegateNonce(u64, Address),
+    // Issue #946: expiry timestamp for each check-in delegate
+    CheckInDelegateExpiry(u64, Address),
     // Issue #498: beneficiary proof of life
     ProofOfLife(u64),
     // Issue #499: beneficiary release votes
@@ -813,6 +817,12 @@ pub struct Vault {
     pub challenge_timeout_seconds: u64,
     /// Multi-sig passkey threshold for withdrawals - Issue #939
     pub multi_sig_threshold: u32,
+    /// Check-in score (0-10000) for tracking consistency - Issue #947
+    pub check_in_score: u32,
+    /// Total number of check-ins recorded - Issue #947
+    pub total_check_ins: u32,
+    /// Number of on-time check-ins - Issue #947
+    pub on_time_check_ins: u32,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395

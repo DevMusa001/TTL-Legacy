@@ -66,12 +66,12 @@ use types::{
     WITHDRAWAL_REVERSED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_VALIDATION_TOPIC,
     WITHDRAW_TOPIC, WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
     YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
+    CHECKIN_SCORE_UPDATED_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
 #[cfg(test)]
-mod beneficiary_pooling_tests;
-#[cfg(test)]
+mod beneficiary_pooling_tests;#[cfg(test)]
 mod beneficiary_vesting_auction_tests;
 #[cfg(test)]
 mod beneficiary_vesting_tests;
@@ -97,6 +97,8 @@ mod vault_expiry_tests;
 mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
+#[cfg(test)]
+mod check_in_delegation_score_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -254,6 +256,12 @@ pub enum ContractError {
     ChallengeNotFound = 86,
     ChallengeExpired = 87,
     DuplicateSignature = 88,
+    // Issue #946: delegate expiry
+    DelegateExpired = 89,
+    NotDelegate = 90,
+    // Missing error codes used in the contract
+    AdminCannotOwnVault = 91,
+    UnauthorizedDepositor = 92,
 }
 
 #[contract]
@@ -1366,6 +1374,9 @@ impl TtlVaultContract {
             passkey_rotation_period_seconds: 0,
             challenge_timeout_seconds: 300,
             multi_sig_threshold: 1,
+            check_in_score: 10000,
+            total_check_ins: 0,
+            on_time_check_ins: 0,
         };
         Self::save_vault(&env, vault_id, &vault);
         Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -1566,6 +1577,15 @@ impl TtlVaultContract {
         }
 
         // Attempt to save vault - if this fails, TTL is not extended
+        // Issue #947: update check-in score
+        {
+            let is_on_time = now <= original_last_check_in + vault.check_in_interval;
+            vault.total_check_ins = vault.total_check_ins.saturating_add(1);
+            if is_on_time {
+                vault.on_time_check_ins = vault.on_time_check_ins.saturating_add(1);
+            }
+            vault.check_in_score = Self::compute_check_in_score(vault.on_time_check_ins, vault.total_check_ins);
+        }
         Self::save_vault(&env, vault_id, &vault);
         let owner_ids = Self::load_owner_vault_ids(&env, &vault.owner);
         Self::save_owner_vault_ids(&env, &vault.owner, &owner_ids, vault.check_in_interval);
@@ -1597,6 +1617,8 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((CHECK_IN_TOPIC, vault_id), vault.last_check_in);
+        env.events()
+            .publish((CHECKIN_SCORE_UPDATED_TOPIC, vault_id), vault.check_in_score);
         Ok(())
     }
     ///
@@ -7259,6 +7281,9 @@ impl TtlVaultContract {
             passkey_rotation_period_seconds: 0,
             challenge_timeout_seconds: 300,
             multi_sig_threshold: 1,
+            check_in_score: 10000,
+            total_check_ins: 0,
+            on_time_check_ins: 0,
         };
 
         Self::save_vault(&env, vault_id, &new_vault);
@@ -8882,6 +8907,9 @@ impl TtlVaultContract {
             passkey_rotation_period_seconds: original.passkey_rotation_period_seconds,
             challenge_timeout_seconds: original.challenge_timeout_seconds,
             multi_sig_threshold: original.multi_sig_threshold,
+            check_in_score: 10000,
+            total_check_ins: 0,
+            on_time_check_ins: 0,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, original.check_in_interval);
@@ -9022,6 +9050,9 @@ impl TtlVaultContract {
             passkey_rotation_period_seconds: original.passkey_rotation_period_seconds,
             challenge_timeout_seconds: original.challenge_timeout_seconds,
             multi_sig_threshold: original.multi_sig_threshold,
+            check_in_score: 10000,
+            total_check_ins: 0,
+            on_time_check_ins: 0,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, check_in_interval);
@@ -12032,6 +12063,270 @@ impl TtlVaultContract {
     /// Returns whether `delegate` is a registered check-in delegate for `vault_id`.
     pub fn is_check_in_delegate_pub(env: Env, vault_id: u64, delegate: Address) -> bool {
         Self::is_check_in_delegate(&env, vault_id, &delegate)
+    }
+
+    // ── Issue #946: Check-In Delegation to Service Provider ──────────────────
+
+    /// Registers a delegate who may perform check-ins on behalf of the vault owner,
+    /// with an optional expiry timestamp after which the delegation is invalid.
+    ///
+    /// Only the vault owner may call this. The delegate address is added to the
+    /// existing `CheckInDelegates` list (compatible with `check_in`) and its
+    /// expiry (if any) is recorded separately under `CheckInDelegateExpiry`.
+    ///
+    /// # Arguments
+    /// * `env`              - The Soroban environment
+    /// * `vault_id`         - Vault to authorise the delegate for
+    /// * `delegate_address` - Address of the trusted service provider / delegate
+    /// * `expiry`           - Optional Unix timestamp after which delegation is revoked;
+    ///                        `None` means no expiry (delegate is permanent until removed)
+    ///
+    /// # Errors
+    /// * `NotOwner`            - Caller is not the vault owner
+    /// * `AlreadyReleased`     - Vault has already been released
+    /// * `InvalidBeneficiary`  - Delegate is already registered (error code reused)
+    /// * `Paused`              - Contract or vault is paused
+    pub fn delegate_check_in(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        delegate_address: Address,
+        expiry: Option<u64>,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if vault.is_paused {
+            return Err(ContractError::Paused);
+        }
+
+        // Reuse existing CheckInDelegates storage for compatibility with check_in
+        let key = DataKey::CheckInDelegates(vault_id);
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for d in delegates.iter() {
+            if d == delegate_address {
+                return Err(ContractError::InvalidBeneficiary); // delegate already registered
+            }
+        }
+        delegates.push_back(delegate_address.clone());
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &delegates);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Store the expiry timestamp (if provided)
+        if let Some(exp) = expiry {
+            let expiry_key = DataKey::CheckInDelegateExpiry(vault_id, delegate_address.clone());
+            env.storage().persistent().set(&expiry_key, &exp);
+            env.storage()
+                .persistent()
+                .extend_ttl(&expiry_key, VAULT_TTL_THRESHOLD, ttl);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((DELEGATE_CHECKIN_TOPIC, vault_id), (delegate_address, expiry));
+        Ok(())
+    }
+
+    /// Performs a check-in on behalf of the vault owner by a registered delegate.
+    ///
+    /// Unlike the owner-oriented `check_in`, this entry point:
+    /// - Does **not** require a passkey (service providers typically cannot supply one)
+    /// - Enforces the delegate expiry set via `delegate_check_in`
+    /// - Applies the same rate-limit, TTL extension, and score logic as `check_in`
+    ///
+    /// The delegate's nonce is still incremented to prevent replay attacks.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - Vault to check in on behalf of
+    /// * `caller`   - Address of the delegate (must be registered and not expired)
+    ///
+    /// # Errors
+    /// * `NotDelegate`     - Caller is not a registered delegate
+    /// * `DelegateExpired` - Delegate's authorisation has passed its expiry timestamp
+    /// * `AlreadyReleased` - Vault has already been released
+    /// * `Paused`          - Contract or vault is paused
+    /// * `VaultFrozen`     - Vault is frozen
+    /// * `InvalidInterval` - Check-in rate limit not yet elapsed
+    pub fn check_in_as_delegate(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.is_paused {
+            return Err(ContractError::Paused);
+        }
+        if Self::check_vault_frozen(&env, vault_id) {
+            return Err(ContractError::VaultFrozen);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        // Verify caller is a registered delegate
+        if !Self::is_check_in_delegate(&env, vault_id, &caller) {
+            return Err(ContractError::NotDelegate);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Enforce expiry if one was set for this delegate
+        let expiry_key = DataKey::CheckInDelegateExpiry(vault_id, caller.clone());
+        if let Some(expiry) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&expiry_key)
+        {
+            if now >= expiry {
+                return Err(ContractError::DelegateExpired);
+            }
+        }
+
+        // Enforce per-delegation nonce to prevent replay attacks
+        let nonce_key = DataKey::DelegateNonce(vault_id, caller.clone());
+        let expected: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        if nonce != expected {
+            return Err(ContractError::InvalidNonce);
+        }
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&nonce_key, &(expected + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Rate limiting: enforce minimum cooldown between check-ins
+        let cooldown: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinCheckInCooldown)
+            .unwrap_or(DEFAULT_MIN_CHECKIN_COOLDOWN);
+        if cooldown > 0 {
+            if let Some(last) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u64>(&DataKey::LastCheckInTime(vault_id))
+            {
+                if now < last + cooldown {
+                    return Err(ContractError::InvalidInterval);
+                }
+            }
+        }
+
+        // Cap TTL at max_ttl_seconds
+        let max_ttl = Self::get_max_ttl_seconds(env.clone());
+        let deadline = now + vault.check_in_interval;
+        let max_deadline = now + max_ttl;
+        if deadline > max_deadline {
+            return Err(ContractError::MaxTtlExceeded);
+        }
+
+        // Record the check-in timestamp and update score
+        let original_last_check_in = vault.last_check_in;
+        vault.last_check_in = now;
+
+        // Update score: on-time if within check_in_interval from last check-in
+        let is_on_time = now <= original_last_check_in + vault.check_in_interval;
+        vault.total_check_ins = vault.total_check_ins.saturating_add(1);
+        if is_on_time {
+            vault.on_time_check_ins = vault.on_time_check_ins.saturating_add(1);
+        }
+        vault.check_in_score = Self::compute_check_in_score(vault.on_time_check_ins, vault.total_check_ins);
+
+        Self::save_vault(&env, vault_id, &vault);
+        let owner_ids = Self::load_owner_vault_ids(&env, &vault.owner);
+        Self::save_owner_vault_ids(&env, &vault.owner, &owner_ids, vault.check_in_interval);
+
+        // Persist last check-in time for rate limiting
+        let lci_key = DataKey::LastCheckInTime(vault_id);
+        env.storage().persistent().set(&lci_key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&lci_key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Record check-in history and streak
+        Self::record_check_in_history(&env, vault_id, now);
+        Self::update_check_in_streak(&env, vault_id, &vault, now);
+
+        Self::log_audit_entry(&env, vault_id, "check_in_as_delegate", &caller, "");
+        Self::append_activity_log(&env, vault_id, "check_in_as_delegate", &caller, "");
+
+        // Reset countdown fired flags so thresholds fire again on the new cycle
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CountdownFired(vault_id));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events()
+            .publish((CHECK_IN_TOPIC, vault_id), vault.last_check_in);
+        env.events()
+            .publish((CHECKIN_SCORE_UPDATED_TOPIC, vault_id), vault.check_in_score);
+        Ok(())
+    }
+
+    // ── Issue #947: Check-In Verification Score ───────────────────────────────
+
+    /// Returns the current check-in score for a vault (0-10000).
+    ///
+    /// The score is the ratio of on-time check-ins to total check-ins, scaled to
+    /// the range 0-10000 (i.e. 10000 = 100% on-time, 0 = 0% on-time).
+    /// A freshly created vault starts at 10000.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The vault to query
+    pub fn get_check_in_score(env: Env, vault_id: u64) -> u32 {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.check_in_score
+    }
+
+    /// Returns whether a given delegate's expiry has passed.
+    ///
+    /// Returns `true` if an expiry exists and the current ledger timestamp is
+    /// past it; returns `false` otherwise (no expiry set = never expired).
+    pub fn is_delegate_expired(env: Env, vault_id: u64, delegate: Address) -> bool {
+        let expiry_key = DataKey::CheckInDelegateExpiry(vault_id, delegate);
+        if let Some(expiry) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&expiry_key)
+        {
+            env.ledger().timestamp() >= expiry
+        } else {
+            false
+        }
+    }
+
+    /// Computes the check-in score as a value in 0-10000 from on-time and total counts.
+    fn compute_check_in_score(on_time: u32, total: u32) -> u32 {
+        if total == 0 {
+            return 10000;
+        }
+        ((on_time as u64 * 10000) / total as u64) as u32
     }
 
     // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
