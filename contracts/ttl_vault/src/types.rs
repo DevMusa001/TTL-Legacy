@@ -681,7 +681,7 @@ pub struct PasskeyHash {
 #[contracttype]
 #[derive(Clone)]
 pub struct BackupCode {
-    pub code: String,
+    pub hash: BytesN<32>,
     pub used: bool,
 }
 
