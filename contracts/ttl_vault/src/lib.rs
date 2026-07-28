@@ -101,6 +101,8 @@ mod passkey_device_type_tests;
 mod checkin_email_token_tests;
 #[cfg(test)]
 mod checkin_streak_bonus_tests;
+#[cfg(test)]
+mod beneficiary_confirmation_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
