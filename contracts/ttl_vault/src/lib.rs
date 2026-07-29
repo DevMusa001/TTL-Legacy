@@ -17,7 +17,7 @@ use types::{
     PasskeyUsageStat, PauseRecord, PendingBeneficiaryUpdate, ProofOfLifeEntry, ProposalStatus,
     ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry, StateTransitionEntry,
     TokenCollateral, TokenConversion, TokenHedge, TokenLending, TokenRebalanceConfig, TokenStaking,
-    TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary, VestingBonusConfig,
+    TokenWeight, TtlBorrowRecord, UpgradeProposal, Vault, VaultStatusSummary, VestingBonusConfig,
     VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim, VestingSchedule,
     WhitelistEntry, WithdrawalLimit, WithdrawalReversal, WithdrawalScheduleEntry,
     WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
@@ -69,7 +69,7 @@ use types::{
     WITHDRAWAL_REVERSED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_VALIDATION_TOPIC,
     WITHDRAW_TOPIC, WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
     YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
-    CHECKIN_SCORE_UPDATED_TOPIC,
+    UPGRADE_PROPOSED_TOPIC, UPGRADE_EXECUTED_TOPIC, UPGRADE_CANCELLED_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -149,6 +149,10 @@ const MAX_BATCH_STATUS_SIZE: u32 = 100;
 pub const OWNERSHIP_TRANSFER_TIMELOCK: u64 = 86_400;
 /// 7-day expiry window if transfer is not accepted (in seconds)
 pub const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
+
+/// Contract upgrade timelock - Issue #1120
+/// 72-hour time-lock before upgrade can be executed (in seconds)
+pub const UPGRADE_TIMELOCK: u64 = 259_200; // 72 hours
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -268,6 +272,9 @@ pub enum ContractError {
     CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
     SnapshotNotFound = 90,         // Issue #1123: Vault archiving
     AlreadyOwner = 91,             // Issue #1119: Two-step ownership transfer
+    NoPendingUpgrade = 92,         // Issue #1120: Contract upgrade mechanism
+    UpgradeTimelocked = 93,        // Issue #1120: Upgrade not yet executable
+    UpgradeInvalidWasm = 94,       // Issue #1120: Invalid WASM hash
 }
 
 #[contract]
@@ -15650,5 +15657,165 @@ impl TtlVaultContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // --- Contract upgrade mechanism (Issue #1120) ---
+
+    /// Proposes a contract upgrade with a 72-hour timelock.
+    ///
+    /// Admin-only operation. Stores a pending upgrade proposal that can be executed
+    /// after 72 hours have elapsed. If a pending upgrade already exists, it is replaced.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_wasm_hash` - Bytes hash of the new contract WASM bytecode
+    ///
+    /// # Returns
+    /// `Ok(executable_at)` — the timestamp when the upgrade can be executed
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    /// * `ContractError::UpgradeInvalidWasm` - If new_wasm_hash is empty
+    /// * `ContractError::Paused` - If contract is paused
+    pub fn propose_upgrade(env: Env, new_wasm_hash: Bytes) -> Result<u64, ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        Self::require_admin(&env);
+        
+        if new_wasm_hash.is_empty() {
+            return Err(ContractError::UpgradeInvalidWasm);
+        }
+
+        let admin = Self::load_admin(&env);
+        let now = env.ledger().timestamp();
+        let executable_at = now + UPGRADE_TIMELOCK;
+
+        let proposal = UpgradeProposal {
+            new_wasm_hash: new_wasm_hash.clone(),
+            proposed_by: admin.clone(),
+            proposed_at: now,
+            executable_at,
+        };
+
+        env.storage().instance().set(&DataKey::PendingUpgrade, &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::log_audit_entry(&env, 0, "propose_upgrade", &admin, "");
+        env.events().publish(
+            (UPGRADE_PROPOSED_TOPIC,),
+            (admin, new_wasm_hash, executable_at),
+        );
+
+        Ok(executable_at)
+    }
+
+    /// Executes a pending contract upgrade after the timelock expires.
+    ///
+    /// The upgrade can only be executed 72+ hours after proposal.
+    /// Updates the contract WASM to the proposed version.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    /// * `ContractError::NoPendingUpgrade` - If no upgrade is pending
+    /// * `ContractError::UpgradeTimelocked` - If timelock has not elapsed
+    /// * `ContractError::Paused` - If contract is paused
+    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        Self::require_admin(&env);
+
+        let proposal = env
+            .storage()
+            .instance()
+            .get::<DataKey, UpgradeProposal>(&DataKey::PendingUpgrade)
+            .ok_or(ContractError::NoPendingUpgrade)?;
+
+        let now = env.ledger().timestamp();
+        if now < proposal.executable_at {
+            return Err(ContractError::UpgradeTimelocked);
+        }
+
+        // Deploy the new contract WASM
+        env.deployer().update_current_contract_wasm(proposal.new_wasm_hash.clone());
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        let admin = Self::load_admin(&env);
+        Self::log_audit_entry(&env, 0, "execute_upgrade", &admin, "");
+        env.events().publish(
+            (UPGRADE_EXECUTED_TOPIC,),
+            (admin, proposal.new_wasm_hash),
+        );
+
+        Ok(())
+    }
+
+    /// Cancels a pending contract upgrade.
+    ///
+    /// Admin-only operation. Removes the pending upgrade, preventing it from
+    /// being executed even if the timelock expires.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    /// * `ContractError::NoPendingUpgrade` - If no upgrade is pending
+    /// * `ContractError::Paused` - If contract is paused
+    pub fn cancel_upgrade(env: Env) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        Self::require_admin(&env);
+
+        let proposal = env
+            .storage()
+            .instance()
+            .get::<DataKey, UpgradeProposal>(&DataKey::PendingUpgrade)
+            .ok_or(ContractError::NoPendingUpgrade)?;
+
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        let admin = Self::load_admin(&env);
+        Self::log_audit_entry(&env, 0, "cancel_upgrade", &admin, "");
+        env.events().publish(
+            (UPGRADE_CANCELLED_TOPIC,),
+            (admin, proposal.new_wasm_hash),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieves the pending contract upgrade proposal if any.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// `Some(proposal)` if a pending upgrade exists, `None` otherwise
+    pub fn get_pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        env.storage()
+            .instance()
+            .get::<DataKey, UpgradeProposal>(&DataKey::PendingUpgrade)
     }
 }
