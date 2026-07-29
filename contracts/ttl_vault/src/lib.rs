@@ -28,7 +28,7 @@ use types::{
     BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC, BENEFICIARY_IDENTITY_VERIFIED_TOPIC,
     BENEFICIARY_REBALANCED_TOPIC, BENEFICIARY_TIER_SET_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC,
     BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_WATERFALL_TOPIC, BEN_ROTATION_TOPIC, CANCEL_TOPIC,
-    CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC,
+    CHECKIN_GEO_TOPIC, CHECKIN_POW_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, CHECK_IN_TOPIC, CHECK_IN_RECORDED_TOPIC,
     CLAIM_VEST_TOPIC, CLIFF_REACHED_TOPIC, CONDITIONS_ACCEPTED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     DELEGATE_BENEFICIARY_TOPIC, DELEGATE_CHECKIN_TOPIC, DEPOSIT_TOPIC, DISPUTE_FILED_TOPIC,
     DISPUTE_RESOLVED_TOPIC, DUPLICATE_VAULT_TOPIC, EXPIRY_WARNING_THRESHOLD,
@@ -1612,8 +1612,11 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((CHECK_IN_TOPIC, vault_id), vault.last_check_in);
-        env.events()
-            .publish((CHECKIN_SCORE_UPDATED_TOPIC, vault_id), vault.check_in_score);
+        let new_expiry = vault.last_check_in + vault.check_in_interval;
+        env.events().publish(
+            (CHECK_IN_RECORDED_TOPIC, vault_id),
+            (vault.owner.clone(), new_expiry),
+        );
         Ok(())
     }
     ///
@@ -2464,6 +2467,11 @@ impl TtlVaultContract {
 
             Self::save_vault(&env, vault_id, &vault);
             env.events().publish((CHECK_IN_TOPIC, vault_id), now);
+            let new_expiry = now + vault.check_in_interval;
+            env.events().publish(
+                (CHECK_IN_RECORDED_TOPIC, vault_id),
+                (vault.owner.clone(), new_expiry),
+            );
         }
         env.storage()
             .instance()
@@ -2954,6 +2962,11 @@ impl TtlVaultContract {
             vault.last_check_in = now;
             Self::save_vault(&env, vault_id, &vault);
             env.events().publish((CHECK_IN_TOPIC, vault_id), now);
+            let new_expiry = now + vault.check_in_interval;
+            env.events().publish(
+                (CHECK_IN_RECORDED_TOPIC, vault_id),
+                (vault.owner.clone(), new_expiry),
+            );
         }
 
         env.storage()
@@ -11852,6 +11865,11 @@ impl TtlVaultContract {
             Self::update_check_in_streak(&env, vault_id, &vault, now);
             Self::log_passkey_usage(&env, vault_id, &passkey_hash, now);
             env.events().publish((CHECK_IN_TOPIC, vault_id), now);
+            let new_expiry = now + vault.check_in_interval;
+            env.events().publish(
+                (CHECK_IN_RECORDED_TOPIC, vault_id),
+                (vault.owner.clone(), new_expiry),
+            );
         }
         env.storage()
             .instance()

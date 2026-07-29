@@ -252,6 +252,9 @@ pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
 // Inactivity penalty
 pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
 
+// Issue #1163: CheckInRecorded event emitted on successful check-in
+pub const CHECK_IN_RECORDED_TOPIC: Symbol = symbol_short!("ci_rec");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
