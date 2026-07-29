@@ -7111,3 +7111,172 @@ fn test_multi_sig_passkey_withdrawal_flow() {
 
     assert_eq!(client.get_vault(&vault_id).balance, 900i128);
 }
+
+// ── Issue #1135: AdminTransferred event on accept_admin ─────────────────────
+
+#[test]
+fn test_accept_admin_emits_old_and_new_admin() {
+    let (env, _, _, admin, _, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_new_admin(&new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 86_401);
+    let accepted_at = env.ledger().timestamp();
+    client.accept_admin();
+
+    let event = env.events().all().iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::ADMIN_TRANSFER_COMPLETED_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(event.is_some(), "adm_done event not emitted");
+
+    let data = event.unwrap().2.clone();
+    let (old_admin, new_admin_emitted, ts): (Address, Address, u64) =
+        data.try_into_val(&env).unwrap();
+    assert_eq!(old_admin, admin);
+    assert_eq!(new_admin_emitted, new_admin);
+    assert_eq!(ts, accepted_at);
+}
+
+// ── Issue #1136: get_state_transition_count ──────────────────────────────────
+
+#[test]
+fn test_get_state_transition_count_increments() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let other_vault_id = client.create_vault(&owner, &beneficiary, &200u64, &None);
+
+    assert_eq!(client.get_state_transition_count(&vault_id), 0);
+    assert_eq!(
+        client.get_state_transition_count(&vault_id),
+        client.get_state_transition_log(&vault_id).len() as u64
+    );
+
+    client.cancel_vault(&vault_id, &owner);
+
+    assert_eq!(client.get_state_transition_count(&vault_id), 1);
+    assert_eq!(
+        client.get_state_transition_count(&vault_id),
+        client.get_state_transition_log(&vault_id).len() as u64
+    );
+    // Unrelated vault's count is unaffected
+    assert_eq!(client.get_state_transition_count(&other_vault_id), 0);
+}
+
+// ── Issue #1137: get_multisig_proposal_status ────────────────────────────────
+
+#[test]
+fn test_get_multisig_proposal_status_not_found() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client
+        .try_get_multisig_proposal_status(&vault_id, &999u64)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(44)); // ProposalNotFound
+}
+
+#[test]
+fn test_get_multisig_proposal_status_pending() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Pending);
+}
+
+#[test]
+fn test_get_multisig_proposal_status_approved() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    // threshold 1 -> owner's auto-approval is immediately sufficient
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &1u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Approved);
+}
+
+#[test]
+fn test_get_multisig_proposal_status_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+    client.reject_multisig(&vault_id, &proposal_id, &owner);
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Rejected);
+}
+
+// ── Issue #1138: 2FA-gated withdrawals ───────────────────────────────────────
+
+#[test]
+fn test_withdraw_succeeds_when_2fa_disabled() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.withdraw(&vault_id, &owner, &100i128);
+    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+}
+
+#[test]
+fn test_withdraw_fails_when_2fa_enabled_and_not_verified() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.enable_2fa(&vault_id, &owner, &0u32);
+
+    let err = client
+        .try_withdraw(&vault_id, &owner, &100i128)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(89)); // TwoFactorRequired
+    assert_eq!(client.get_vault(&vault_id).balance, 1000i128);
+}
+
+#[test]
+fn test_withdraw_succeeds_when_2fa_enabled_and_verified() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.enable_2fa(&vault_id, &owner, &0u32);
+    client.confirm_2fa(&vault_id, &owner);
+
+    client.withdraw(&vault_id, &owner, &100i128);
+    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+}
