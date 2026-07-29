@@ -101,7 +101,7 @@ mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
 #[cfg(test)]
-mod deposit_event_tests;
+mod deposit_invalid_amount_tests;
 mod checkin_email_token_tests;
 #[cfg(test)]
 mod checkin_streak_bonus_tests;
