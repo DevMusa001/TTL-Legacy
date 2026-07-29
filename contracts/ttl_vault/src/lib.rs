@@ -98,7 +98,7 @@ mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
 #[cfg(test)]
-mod check_in_delegation_score_tests;
+mod backup_code_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -9378,7 +9378,7 @@ impl TtlVaultContract {
         env: Env,
         vault_id: u64,
         caller: Address,
-    ) -> Result<Vec<String>, ContractError> {
+    ) -> Result<Vec<u64>, ContractError> {
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
@@ -9389,17 +9389,19 @@ impl TtlVaultContract {
         }
 
         let mut codes: Vec<BackupCode> = Vec::new(&env);
-        let mut result: Vec<String> = Vec::new(&env);
-        let timestamp = env.ledger().timestamp();
+        let mut result: Vec<u64> = Vec::new(&env);
 
-        for i in 0..10 {
-            let _hash_input = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
-            let code_str = String::from_str(&env, "code");
+        for _ in 0..10 {
+            let code = env.prng().gen::<u64>();
+            let code_bytes = code.to_be_bytes();
+            let bytes = Bytes::from_array(&env, &code_bytes);
+            let hash = env.crypto().sha256(&bytes);
+
             codes.push_back(BackupCode {
-                code: code_str.clone(),
+                hash,
                 used: false,
             });
-            result.push_back(code_str);
+            result.push_back(code);
         }
 
         let key = DataKey::BackupCodes(vault_id);
@@ -9426,13 +9428,13 @@ impl TtlVaultContract {
     /// * `code` - The backup code to use
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err` on failure
+    /// `Ok(true)` on success, `Err` on failure
     ///
     /// # Errors
     /// * `ContractError::InvalidBackupCode` - If code is invalid or not found
     /// * `ContractError::BackupCodeAlreadyUsed` - If code has already been used
     /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
-    pub fn use_backup_code(env: Env, vault_id: u64, code: String) -> Result<(), ContractError> {
+    pub fn use_backup_code(env: Env, vault_id: u64, code: u64) -> Result<bool, ContractError> {
         let mut vault = Self::load_vault(&env, vault_id);
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
@@ -9445,10 +9447,14 @@ impl TtlVaultContract {
             .get(&key)
             .ok_or(ContractError::InvalidBackupCode)?;
 
+        let code_bytes = code.to_be_bytes();
+        let bytes = Bytes::from_array(&env, &code_bytes);
+        let hash = env.crypto().sha256(&bytes);
+
         let mut found = false;
         for i in 0..codes.len() {
             if let Some(mut backup_code) = codes.get(i) {
-                if backup_code.code == code {
+                if backup_code.hash == hash {
                     if backup_code.used {
                         return Err(ContractError::BackupCodeAlreadyUsed);
                     }
@@ -9466,18 +9472,19 @@ impl TtlVaultContract {
 
         // Extend TTL by 30 days
         vault.last_check_in = env.ledger().timestamp();
-        Self::save_vault(&env, vault_id, &vault);
+        
+        env.storage().persistent().set(&DataKey::Vault(vault_id), &vault);
         env.storage().persistent().set(&key, &codes);
+        
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(&DataKey::Vault(vault_id), VAULT_TTL_THRESHOLD, ttl);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
         env.events()
-            .publish((BACKUP_CODE_USED_TOPIC, vault_id), code);
-        Ok(())
+            .publish((BACKUP_CODE_USED_TOPIC, vault_id), hash);
+
+        Ok(true)
     }
 
     // --- Issue #394: Multi-Passkey Support ---
