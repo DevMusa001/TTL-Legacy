@@ -1603,6 +1603,11 @@ impl TtlVaultContract {
     /// Transfers tokens from the caller to the contract and increases the vault's balance.
     /// The vault must be in Locked status.
     ///
+    /// Deposits remain available while a vault is hibernating (see `enter_hibernation`):
+    /// hibernation only pauses the check-in TTL countdown, it does not freeze the vault's
+    /// balance, so funds deposited during hibernation are immediately usable once the
+    /// vault wakes or releases.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault
@@ -5602,6 +5607,20 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::VaultCount)
             .unwrap_or(0u64)
+    }
+
+    /// Returns the total number of vaults created on the contract.
+    ///
+    /// Alias of `vault_count`, provided for dashboard/metrics callers that
+    /// query the vault count without enumerating individual vault IDs.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// The total vault count
+    pub fn get_vault_count(env: Env) -> u64 {
+        Self::vault_count(env)
     }
 
     /// Returns the address of the XLM token used by this contract.
