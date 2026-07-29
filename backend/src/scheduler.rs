@@ -11,6 +11,7 @@ use crate::{db::Db, models::Frequency};
 ///
 /// In production, replace `fetch_ttl_remaining` with a real Stellar RPC call
 /// and `send_reminder` with actual email/SMS/push dispatch.
+#[tracing::instrument(skip(db))]
 pub async fn run(db: Arc<Db>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
@@ -74,6 +75,7 @@ pub async fn run(db: Arc<Db>) {
     }
 }
 
+#[tracing::instrument(skip(db))]
 async fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
     let policies = match db.all_enabled_insurance_policies() {
         Ok(p) => p,
