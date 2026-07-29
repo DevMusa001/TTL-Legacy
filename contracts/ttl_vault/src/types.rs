@@ -8,6 +8,8 @@ pub const WITHDRAW_TOPIC: Symbol = symbol_short!("withdraw");
 pub const CHECK_IN_TOPIC: Symbol = symbol_short!("check_in");
 pub const CANCEL_TOPIC: Symbol = symbol_short!("cancel");
 pub const OWNERSHIP_TOPIC: Symbol = symbol_short!("own_xfer");
+pub const LOAN_ENABLED_TOPIC: Symbol = symbol_short!("loan_new");
+pub const LOAN_REPAID_TOPIC: Symbol = symbol_short!("loan_rep");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -28,6 +30,8 @@ pub enum DataKey {
     PendingAdmin,
     MinCheckInInterval,
     MaxCheckInInterval,
+    Lending(u64),
+    CountdownConfig(u64),
 }
 
 #[contracttype]
@@ -53,6 +57,29 @@ pub struct ReleaseEvent {
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
+}
+
+/// Loan terms for a token loan advanced into a vault by a lender. The vault
+/// owner must repay `amount` (plus a late penalty if repaid after
+/// `repayment_deadline`) to fully settle the loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub lender: Address,
+    pub amount: i128,
+    pub repayment_deadline: u64, // ledger timestamp
+    pub late_penalty_bps: u32,
+    pub repaid: bool,
+}
+
+/// Point-in-time status snapshot for a single vault, used by batch status lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub ttl_remaining: Option<u64>,
 }
 
 #[contracttype]
