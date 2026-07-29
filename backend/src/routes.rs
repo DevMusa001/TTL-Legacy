@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::{
     audit,
@@ -20,6 +21,7 @@ pub struct RemindersQuery {
     pub include_deleted: Option<bool>,
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn list_vault_reminders(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -37,6 +39,7 @@ pub async fn list_vault_reminders(
     Ok(Json(records))
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn delete_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -45,6 +48,7 @@ pub async fn delete_preferences(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[instrument(skip(state, headers), fields(vault_id = %vault_id))]
 pub async fn set_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -88,6 +92,7 @@ pub async fn set_preferences(
     Ok((StatusCode::OK, Json(prefs)))
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn get_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -106,6 +111,7 @@ pub struct UnsubscribeQuery {
     pub token: String,
 }
 
+#[instrument(skip(state))]
 pub async fn unsubscribe(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UnsubscribeQuery>,
@@ -126,6 +132,7 @@ pub async fn unsubscribe(
 // ── Release Simulator endpoint ────────────────────────────────────────────────
 
 /// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
+#[instrument(skip(db), fields(vault_id = %vault_id))]
 pub async fn simulate_release(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
@@ -147,6 +154,42 @@ pub async fn simulate_release(
         missed_count,
     )
     .map_err(|_| AppError::NotFound)?;
+
+    Ok(Json(result))
+}
+
+
+// ── Sponsored Release endpoints (#1122) ──────────────────────────────────────
+
+use crate::fee_sponsorship::{SponsoredReleaseRequest, SponsoredReleaseResponse};
+use crate::handlers::{sponsored_release_handler, get_sponsored_release_handler, list_sponsored_releases_handler};
+
+/// POST /api/vaults/:vault_id/sponsored-release
+/// Create a sponsored release transaction for a beneficiary.
+pub async fn create_sponsored_release(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Json(req): Json<SponsoredReleaseRequest>,
+) -> Result<(StatusCode, Json<SponsoredReleaseResponse>), AppError> {
+    let result = sponsored_release_handler(
+        &state.db.vault_store,
+        Arc::clone(&state.db),
+        &vault_id,
+        req,
+    )
+    .map_err(|e| AppError::InvalidInput(e))?;
+
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// GET /api/vaults/:vault_id/sponsored-release
+/// List all sponsored releases for a vault.
+pub async fn get_sponsored_releases(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Vec<crate::fee_sponsorship::SponsoredRelease>>, AppError> {
+    let result = list_sponsored_releases_handler(Arc::clone(&state.db), &vault_id)
+        .map_err(|e| AppError::InvalidInput(e))?;
 
     Ok(Json(result))
 }
