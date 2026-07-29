@@ -185,6 +185,10 @@ pub enum DataKey {
     /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
     /// are all rejected with `ContractError::VaultFrozen`.
     VaultFrozen(u64),
+    /// Pending multi-sig operation - Issue #1117
+    PendingMultiSigOp(u64, u64),  // (vault_id, nonce)
+    /// Counter for pending multi-sig operation nonces - Issue #1117
+    PendingMultiSigOpNonce(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -555,6 +559,8 @@ pub struct Vault {
     pub challenge_timeout_seconds: u64,
     /// Multi-sig passkey threshold for withdrawals - Issue #939
     pub multi_sig_threshold: u32,
+    /// Operations that require multi-sig approval (2-of-N) - Issue #1117
+    pub multisig_required_ops: Vec<MultiSigOperation>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -845,6 +851,22 @@ pub struct StateTransitionEntry {
     pub to_status: ReleaseStatus,
     pub actor: Address,
     pub timestamp: u64,
+}
+
+/// Pending multi-signature operation - Issue #1117
+/// Represents an operation awaiting co-signatures from passkeys.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingMultiSigOp {
+    pub nonce: u64,
+    pub vault_id: u64,
+    pub operation: MultiSigOperation,
+    pub signers: Vec<Address>,  // Addresses that have signed
+    pub payload: Bytes,
+    pub address_payload: Option<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub threshold: u32,
 }
 
 /// Ownership proof result - Issue #473
@@ -1176,6 +1198,12 @@ pub const AUCTION_FINALIZED_TOPIC: Symbol = symbol_short!("auc_fin");
 // Issue #809: two-step protocol configuration update
 pub const PROTOCOL_CONFIG_PROPOSED_TOPIC: Symbol = symbol_short!("pc_prop");
 pub const PROTOCOL_CONFIG_APPLIED_TOPIC: Symbol = symbol_short!("pc_apply");
+
+/// Issue #1117: Pending multi-sig operation topics
+pub const PENDING_MULTISIG_OP_CREATED_TOPIC: Symbol = symbol_short!("pm_created");
+pub const PENDING_MULTISIG_OP_COSIGNED_TOPIC: Symbol = symbol_short!("pm_cosign");
+pub const PENDING_MULTISIG_OP_EXECUTED_TOPIC: Symbol = symbol_short!("pm_exec");
+pub const PENDING_MULTISIG_OP_EXPIRED_TOPIC: Symbol = symbol_short!("pm_exp");
 
 /// Aggregated protocol-level configuration — Issue #810.
 /// Returned by `get_protocol_config` so off-chain clients avoid raw storage key coupling.
