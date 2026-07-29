@@ -21,6 +21,10 @@ pub const UPGRADE_PROPOSED_TOPIC: Symbol = symbol_short!("upg_prop");
 pub const UPGRADE_EXECUTED_TOPIC: Symbol = symbol_short!("upg_exec");
 pub const UPGRADE_CANCELLED_TOPIC: Symbol = symbol_short!("upg_canc");
 
+/// Token allowlist event topics - Issue #1118
+pub const TOKEN_ALLOWLIST_ADDED_TOPIC: Symbol = symbol_short!("tok_add");
+pub const TOKEN_ALLOWLIST_REMOVED_TOPIC: Symbol = symbol_short!("tok_rem");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -195,6 +199,8 @@ pub enum DataKey {
     PendingMultiSigOpNonce(u64), // counter per vault
     // Issue #1120: timelock-gated contract upgrade
     PendingUpgrade,
+    // Issue #1118: admin-controlled token allowlist
+    AllowedTokens,
 }
 
 
