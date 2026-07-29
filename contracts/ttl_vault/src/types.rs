@@ -1,8 +1,13 @@
-use soroban_sdk::{contracttype, symbol_short, Address, String, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, String, Symbol, Vec};
+
+/// Maximum number of vesting schedules per vault.
+pub const MAX_VESTING_SCHEDULES: u32 = 20;
 
 pub const RELEASE_TOPIC: Symbol = symbol_short!("release");
 pub const VAULT_CREATED_TOPIC: Symbol = symbol_short!("v_created");
 pub const PING_EXPIRY_TOPIC: Symbol = symbol_short!("ping_exp");
+/// Emitted during check_in when the new TTL (= check_in_interval) is below EXPIRY_WARNING_THRESHOLD.
+pub const TTL_WARNING_TOPIC: Symbol = symbol_short!("ttl_warn");
 pub const DEPOSIT_TOPIC: Symbol = symbol_short!("deposit");
 pub const WITHDRAW_TOPIC: Symbol = symbol_short!("withdraw");
 pub const CHECK_IN_TOPIC: Symbol = symbol_short!("check_in");
@@ -14,14 +19,31 @@ pub const LOAN_REPAID_TOPIC: Symbol = symbol_short!("loan_rep");
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
+/// Recovery extension duration in seconds (30 days)
+#[allow(dead_code)]
+pub const RECOVERY_EXTENSION_DURATION: u64 = 2_592_000;
+
 /// Maximum length for vault metadata string
 pub const MAX_METADATA_LEN: u32 = 256;
 
-#[contracttype]
+/// Maximum length for vault name
+pub const MAX_NAME_LEN: u32 = 64;
+
+/// Maximum length for vault description
+pub const MAX_DESCRIPTION_LEN: u32 = 512;
+
+/// Maximum length for vault notes
+pub const MAX_NOTES_LEN: u32 = 1024;
+
+/// Maximum length for custom metadata bytes (2KB) - Issue #378
+pub const MAX_CUSTOM_METADATA_LEN: u32 = 2048;
+
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub enum DataKey {
     Vault(u64),
     OwnerVaults(Address),
+    MaxVaultsPerOwner,
     BeneficiaryVaults(Address),
     VaultCount,
     TokenAddress,
@@ -40,6 +62,15 @@ pub enum ReleaseStatus {
     Locked,
     Released,
     Cancelled,
+    EmergencyFrozen,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReleaseCondition {
+    TTLExpiry,
+    OwnerInitiated,
+    Oracle(Address),
 }
 
 #[contracttype]
@@ -50,13 +81,172 @@ pub struct ReleaseEvent {
     pub amount: i128,
 }
 
-/// A single beneficiary entry: (address, basis_points).
+/// A single beneficiary entry: (address, basis_points, minimum_threshold).
 /// All entries in a vault's beneficiaries must sum to 10_000 bps (100%).
+/// If a beneficiary's calculated share is below minimum_threshold (in stroops),
+/// they receive nothing and those funds are redistributed to other beneficiaries.
+/// Set to 0 to disable the minimum threshold for this beneficiary.
 #[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
+    /// Minimum amount in stroops. If calculated share < minimum_threshold, beneficiary gets 0.
+    pub minimum_threshold: i128,
+}
+
+/// Bridge configuration for cross-chain support.
+#[contracttype]
+#[derive(Clone)]
+pub struct BridgeConfig {
+    pub chain_id: u32,
+    pub bridge_address: Address,
+    pub is_active: bool,
+}
+
+/// Token conversion configuration for a vault.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenConversion {
+    pub vault_id: u64,
+    pub from_token: Address,
+    pub to_token: Address,
+    pub conversion_rate: i128,
+    pub enabled: bool,
+    pub created_at: u64,
+}
+
+/// Token staking configuration for a vault.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenStaking {
+    pub vault_id: u64,
+    pub staking_pool: Address,
+    pub staked_amount: i128,
+    pub staking_start: u64,
+    pub annual_yield_bps: u32,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDistributionMode {
+    DistributeToBeneficiary,
+    Reinvest,
+    Split(u32),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistributionConfig {
+    pub vault_id: u64,
+    pub mode: YieldDistributionMode,
+    pub last_distribution: u64,
+    pub total_distributed: i128,
+    pub total_reinvested: i128,
+}
+
+/// Passkey hash for multi-passkey support - Issue #394
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasskeyHash {
+    pub hash: BytesN<32>,
+    pub added_at: u64,
+    /// Optional biometric credential hash bound to this passkey (SHA-256 commitment)
+    pub biometric_hash: Option<BytesN<32>>,
+    pub deprecated_at: Option<u64>,
+    pub usage_count: u64,
+    pub last_used_timestamp: u64,
+}
+
+/// Backup code entry - Issue #393
+#[contracttype]
+#[derive(Clone)]
+pub struct BackupCode {
+    pub code: String,
+    pub used: bool,
+}
+
+/// Two-factor authentication configuration - Issue #965
+#[contracttype]
+#[derive(Clone)]
+pub struct TwoFactorConfigData {
+    pub enabled: bool,
+    /// 0 = TOTP, 1 = SMS, 2 = Email
+    pub method: u32,
+}
+
+/// Withdrawal approval request - Issue #404
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalRequest {
+    pub request_id: u64,
+    pub amount: i128,
+    pub requested_at: u64,
+    pub approved: bool,
+}
+
+/// Deposit proof - Issue #405
+#[contracttype]
+#[derive(Clone)]
+pub struct DepositProof {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub proof_hash: BytesN<32>,
+}
+
+/// Withdrawal proof for compliance - Issue #573
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalProof {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub proof_hash: BytesN<32>,
+    pub nonce: u64,
+}
+
+/// Withdrawal escrow entry - Issue #576
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalEscrow {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub beneficiary: Address,
+    pub verified: bool,
+}
+
+/// Withdrawal rollback entry - Issue #574
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalRollback {
+    pub vault_id: u64,
+    pub original_amount: i128,
+    pub rollback_amount: i128,
+    pub timestamp: u64,
+    pub reason: String,
+}
+
+/// Withdrawal rate limit entry - Issue #575
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalRateLimit {
+    pub vault_id: u64,
+    pub last_withdrawal_time: u64,
+    pub withdrawal_count: u32,
+    pub cooldown_seconds: u64,
+}
+
+/// Recurring withdrawal configuration - Issue #1086
+#[contracttype]
+#[derive(Clone)]
+pub struct RecurringWithdrawal {
+    pub amount: i128,
+    pub interval_seconds: u64,
+    pub destination: Address,
+    pub next_at: u64,
 }
 
 /// Loan terms for a token loan advanced into a vault by a lender. The vault
@@ -98,4 +288,671 @@ pub struct Vault {
     pub beneficiaries: Vec<BeneficiaryEntry>,
     /// Optional short metadata string (label or IPFS hash).
     pub metadata: String,
+    /// Token contract address for this vault. Uses default XLM token if not specified.
+    pub token_address: Address,
+    /// Custom metadata as bytes (max 2KB) - Issue #378
+    pub custom_metadata: Bytes,
+    /// Whether the vault is paused - Issue #380
+    pub is_paused: bool,
+    /// Release condition for the vault - Issue #379
+    pub release_condition: ReleaseCondition,
+    /// Parent vault ID for inheritance chain - Issue #381
+    pub parent_vault_id: Option<u64>,
+    /// Primary passkey hash for backwards compatibility - Issue #392, #394
+    pub passkey_hash: Option<Bytes>,
+    /// Maximum deposit amount - Issue #403
+    pub max_deposit_amount: Option<i128>,
+    /// Withdrawal approval threshold - Issue #404
+    pub withdrawal_approval_threshold: Option<i128>,
+    /// Maximum amount releasable per trigger_release call - Issue #382
+    pub spending_limit: Option<i128>,
+    /// Penalty in basis points deducted per missed check-in interval
+    pub inactivity_penalty_bps: Option<u32>,
+    /// Burn percentage in basis points (0-10000). 0 means no burn.
+    pub burn_percentage: u32,
+    /// Address that receives inactivity penalty transfers
+    pub penalty_recipient: Option<Address>,
+    /// Passkey rotation grace period in seconds - Issue #936
+    pub passkey_rotation_period_seconds: u64,
+    /// Challenge-response timeout window in seconds - Issue #938
+    pub challenge_timeout_seconds: u64,
+    /// Multi-sig passkey threshold for withdrawals - Issue #939
+    pub multi_sig_threshold: u32,
 }
+
+/// Passkey usage entry for tracking check-ins - Issue #395
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyUsageEntry {
+    pub passkey_hash: BytesN<32>,
+    pub timestamp: u64,
+}
+
+/// Passkey analytics report - Issue #937
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasskeyAnalytics {
+    pub passkey_hash: BytesN<32>,
+    pub usage_count: u64,
+    pub last_used_timestamp: u64,
+}
+
+/// Beneficiary status enum - Issue #397
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum BeneficiaryStatus {
+    Pending,
+    Accepted,
+    Declined,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReleaseTrigger {
+    Expiry,
+    Manual,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BeneficiaryTriggerSetEvent {
+    pub vault_id: u64,
+    pub beneficiary: Address,
+    pub triggers: Vec<ReleaseTrigger>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BeneficiaryTierSetEvent {
+    pub vault_id: u64,
+    pub beneficiary: Address,
+    pub tier_threshold: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BeneficiaryWaterfallEvent {
+    pub vault_id: u64,
+    pub skipped_beneficiary: Address,
+    pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BeneficiaryRebalancedEvent {
+    pub vault_id: u64,
+    pub remaining_bps: u32,
+}
+
+/// Dispute status enum - Issue #399
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DisputeStatus {
+    None,
+    Filed,
+    Resolved,
+}
+
+/// Withdrawal schedule entry - Issue #402
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalScheduleEntry {
+    pub timestamp: u64,
+    pub amount: i128,
+}
+
+/// Conditional acceptance entry - Issue #400, #503
+#[contracttype]
+#[derive(Clone)]
+pub struct ConditionalAcceptanceEntry {
+    pub conditions: String,
+    pub approved_by_owner: bool,
+    pub acceptance_deadline: Option<u64>,
+    pub min_balance_threshold: Option<i128>,
+}
+
+/// Beneficiary conditional acceptance with threshold - Issue #503
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConditionalAcceptance {
+    pub min_balance_threshold: i128,
+    pub accepted_at: u64,
+}
+
+/// Beneficiary identity verification entry.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryIdentityVerificationEntry {
+    pub beneficiary: Address,
+    pub verifier: Address,
+    pub verified_at: u64,
+}
+
+/// Beneficiary conflict claim - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflictClaim {
+    pub claimant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+}
+
+/// Beneficiary conflict resolution - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub enum ConflictResolution {
+    Pending,
+    Approved(Address),
+    Rejected,
+}
+
+/// Beneficiary conflict entry - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflict {
+    pub vault_id: u64,
+    pub claims: Vec<BeneficiaryConflictClaim>,
+    pub resolution: ConflictResolution,
+    pub resolved_at: Option<u64>,
+}
+
+/// Activity log entry for forensic audit trail
+#[contracttype]
+#[derive(Clone)]
+pub struct ActivityLogEntry {
+    pub action: String,
+    pub caller: Address,
+    pub timestamp: u64,
+    pub details: String,
+}
+
+/// Archived vault info for restoration - Issue #443
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo(pub Vault);
+
+/// A single metadata version snapshot - Issue #468
+#[contracttype]
+#[derive(Clone)]
+pub struct MetadataVersionEntry {
+    pub version: u32,
+    pub metadata: String,
+    pub updated_at: u64,
+    pub updated_by: Address,
+}
+
+/// A single custom metadata history entry (raw bytes + timestamp) - Issue #931
+#[contracttype]
+#[derive(Clone)]
+pub struct CustomMetadataEntry {
+    pub metadata: Bytes,
+    pub timestamp: u64,
+}
+
+/// Ownership transfer request
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipTransferRequest {
+    pub new_owner: Address,
+    pub initiated_at: u64,
+    pub unlocks_at: u64,
+    pub expires_at: u64,
+}
+
+/// Pending beneficiary update request - Issue #490
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingBeneficiaryUpdate {
+    pub new_beneficiary: Address,
+    pub initiated_at: u64,
+    pub unlocks_at: u64,
+}
+
+/// Audit entry for vault operations
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditEntry {
+    pub action: String,
+    pub caller: Address,
+    pub timestamp: u64,
+    pub operation: String,
+    pub actor: Address,
+    pub details: String,
+}
+
+/// Withdrawal audit trail entry - Issue #569
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalAuditEntry {
+    pub vault_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub success: bool,
+    pub error_reason: String,
+}
+
+/// Withdrawal dispute entry - Issue #572
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalDispute {
+    pub vault_id: u64,
+    pub withdrawal_timestamp: u64,
+    pub dispute_filed_at: u64,
+    pub dispute_expires_at: u64,
+    pub status: DisputeStatus,
+    pub reason: String,
+    pub resolved_at: Option<u64>,
+}
+
+/// Multi-signature configuration
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// Multi-signature proposal
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigProposal {
+    pub id: u64,
+    pub operation: MultiSigOperation,
+    pub approvals: Vec<Address>,
+    pub status: ProposalStatus,
+    pub expires_at: u64,
+    pub vault_id: u64,
+    pub payload: Bytes,
+    pub address_payload: Option<Address>,
+    pub created_at: u64,
+}
+
+/// Multi-signature operation types
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MultiSigOperation {
+    Withdraw,
+    UpdateBeneficiary,
+    CancelVault,
+    UpdateCheckInInterval,
+    TransferOwnership,
+}
+
+/// Proposal status
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Executed,
+    Expired,
+    Vetoed,
+}
+
+/// State transition record for vault status changes - Issue #472
+#[contracttype]
+#[derive(Clone)]
+pub struct StateTransitionEntry {
+    pub from_status: ReleaseStatus,
+    pub to_status: ReleaseStatus,
+    pub actor: Address,
+    pub timestamp: u64,
+}
+
+/// Ownership proof result - Issue #473
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipProof {
+    pub vault_id: u64,
+    pub owner_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub is_active: bool,
+}
+
+/// Vault integrity report - Issue #474
+#[contracttype]
+#[derive(Clone)]
+pub struct IntegrityReport {
+    pub vault_id: u64,
+    pub checksum: BytesN<32>,
+    pub is_valid: bool,
+    pub timestamp: u64,
+}
+
+/// Vault status summary for batch queries - Issue #475
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub last_check_in: u64,
+    pub is_expired: bool,
+}
+
+/// A shared TTL pool that multiple vaults can join.
+/// A single `pool_check_in` resets `last_check_in` for all member vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlPool {
+    pub pool_id: u64,
+    pub owner: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub created_at: u64,
+}
+
+/// A biometric credential entry (fingerprint or face template hash).
+/// The raw biometric data never leaves the device — only the SHA-256
+/// hash commitment is stored on-chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct BiometricEntry {
+    pub credential_hash: BytesN<32>,
+    pub added_at: u64,
+}
+
+/// Hibernation entry — records when a vault entered hibernation and for how long.
+/// While hibernating, the vault's expiry deadline is extended by `duration_seconds`,
+/// so no check-ins are required during that period.
+#[contracttype]
+#[derive(Clone)]
+pub struct HibernationEntry {
+    /// Ledger timestamp when hibernation started.
+    pub started_at: u64,
+    /// How many seconds the hibernation lasts.
+    pub duration_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlBorrowRecord {
+    pub borrower_vault_id: u64,
+    pub lender_vault_id: u64,
+    pub borrowed_seconds: u64,
+    pub borrowed_at: u64,
+    pub repaid: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GeoCheckInEntry {
+    pub latitude_micro: i64,
+    pub longitude_micro: i64,
+    pub country_code: String,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ProofOfLifeEntry {
+    pub beneficiary: Address,
+    pub submitted_at: u64,
+    pub valid_until: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseVoteEntry {
+    pub voter: Address,
+    pub approve: bool,
+    pub voted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryRotationEntry {
+    pub effective_timestamp: u64,
+    pub new_beneficiaries: Vec<BeneficiaryEntry>,
+}
+
+/// Configurable countdown notification thresholds for a vault.
+/// Each threshold (in seconds before expiry) triggers a `cd_notif` event
+/// when `check_countdown` is called and the TTL crosses that boundary.
+/// Default thresholds: 7 days (604800), 3 days (259200), 1 day (86400).
+#[contracttype]
+#[derive(Clone)]
+pub struct CountdownConfig {
+    /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
+    pub thresholds: Vec<u64>,
+}
+
+/// Withdrawal limit configuration - Issue #566
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalLimit {
+    pub daily_limit: i128,
+    pub weekly_limit: i128,
+    pub monthly_limit: i128,
+}
+
+/// Withdrawal tracking entry - Issue #566
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalTracker {
+    pub daily_withdrawn: i128,
+    pub daily_reset_at: u64,
+    pub weekly_withdrawn: i128,
+    pub weekly_reset_at: u64,
+    pub monthly_withdrawn: i128,
+    pub monthly_reset_at: u64,
+}
+
+/// Withdrawal destination whitelist entry - Issue #567
+#[contracttype]
+#[derive(Clone)]
+pub struct WhitelistEntry {
+    pub address: Address,
+    pub added_at: u64,
+    pub label: String,
+}
+
+/// Withdrawal reversal entry - Issue #568
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalReversal {
+    pub withdrawal_id: u64,
+    pub amount: i128,
+    pub withdrawn_at: u64,
+    pub grace_period_until: u64,
+    pub reversed: bool,
+}
+
+/// Vesting catch-up configuration - Issue #545.
+/// When enabled, a beneficiary who missed claiming periods can catch up
+/// and claim all accumulated missed installments in a single call.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingCatchUpConfig {
+    /// Whether catch-up claiming is enabled for this vault.
+    pub enabled: bool,
+    /// Maximum number of missed installments that can be caught up in one call.
+    /// 0 means unlimited (all missed installments can be claimed at once).
+    pub max_catchup_installments: u32,
+}
+
+/// Vesting bonus configuration - Issue #546.
+/// Awards a bonus to the beneficiary when they claim on time (within the grace window).
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingBonusConfig {
+    /// Bonus in basis points awarded for on-time claims (e.g., 100 = 1%).
+    pub bonus_bps: u32,
+    /// Seconds after an installment unlocks within which a claim is considered "on time".
+    pub on_time_window_seconds: u64,
+}
+
+/// Token lending record - Issue #585.
+/// Tracks a loan of vault tokens lent out for interest income.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub vault_id: u64,
+    pub borrower: Address,
+    pub amount: i128,
+    /// Annual interest rate in basis points (e.g., 500 = 5%).
+    pub interest_rate_bps: u32,
+    pub lent_at: u64,
+    pub due_at: u64,
+    pub repaid: bool,
+    pub interest_earned: i128,
+}
+
+/// Token collateral configuration - Issue #586.
+/// Vault tokens used as collateral for a loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenCollateral {
+    pub vault_id: u64,
+    pub collateral_amount: i128,
+    pub loan_amount: i128,
+    /// Collateral ratio in basis points (e.g., 15000 = 150%).
+    pub collateral_ratio_bps: u32,
+    pub active: bool,
+    pub created_at: u64,
+}
+
+/// Token hedge configuration - Issue #587.
+/// Hedge vault token price risk using a derivative position.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenHedge {
+    pub vault_id: u64,
+    /// Token used for the hedge (e.g., a stablecoin).
+    pub hedge_token: Address,
+    pub notional_amount: i128,
+    /// Strike price in basis points relative to current price.
+    pub strike_price_bps: u32,
+    /// Unix timestamp when the hedge expires.
+    pub expiry: u64,
+    pub active: bool,
+    pub created_at: u64,
+}
+
+/// A single token weight entry for rebalancing - Issue #588.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenWeight {
+    pub token: Address,
+    /// Target allocation in basis points (all entries must sum to 10000).
+    pub target_bps: u32,
+}
+
+/// Token rebalancing configuration - Issue #588.
+/// Automatically rebalances a multi-token portfolio based on target weights.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenRebalanceConfig {
+    pub vault_id: u64,
+    pub target_weights: Vec<TokenWeight>,
+    pub last_rebalance: u64,
+    /// Drift threshold in basis points that triggers a rebalance (e.g., 500 = 5%).
+    pub rebalance_threshold_bps: u32,
+    pub total_rebalances: u32,
+}
+
+/// A pool of beneficiaries whose BPS allocations are combined - Issue #529.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryPool {
+    pub pool_id: u64,
+    pub members: Vec<Address>,
+    pub total_bps: u32,
+}
+
+/// Beneficiary-specific vesting schedule - Issue #525.
+/// Different beneficiaries can have different vesting timelines.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryVestingSchedule {
+    pub beneficiary: Address,
+    pub vault_id: u64,
+    /// Unix timestamp when this beneficiary's vesting starts.
+    pub start_time: u64,
+    /// Seconds between installments.
+    pub interval: u64,
+    /// Total number of installments.
+    pub num_installments: u32,
+    /// Claimed installments for this beneficiary.
+    pub claimed_installments: u32,
+    /// Total amount allocated to this beneficiary.
+    pub total_amount: i128,
+    /// Cliff duration in seconds from start_time.
+    pub cliff_period: u64,
+}
+
+/// Beneficiary auction bid - Issue #527.
+/// Allow beneficiaries to bid for larger allocations.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryAuctionBid {
+    pub auction_id: u64,
+    pub bidder: Address,
+    pub bid_amount: i128,
+    /// Desired allocation in basis points (e.g., 5000 = 50%).
+    pub desired_allocation_bps: u32,
+    pub bid_timestamp: u64,
+    /// True if bid was accepted.
+    pub accepted: bool,
+}
+
+/// Beneficiary auction configuration - Issue #527.
+/// Auction for determining final beneficiary allocations.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryAuction {
+    pub auction_id: u64,
+    pub vault_id: u64,
+    /// Start of bidding period (Unix timestamp).
+    pub start_time: u64,
+    /// End of bidding period (Unix timestamp).
+    pub end_time: u64,
+    /// Total allocation being auctioned in basis points.
+    pub total_allocation_bps: u32,
+    /// Minimum bid amount in stroops.
+    pub minimum_bid: i128,
+    pub bids: Vec<BeneficiaryAuctionBid>,
+    /// True if auction has concluded.
+    pub finalized: bool,
+    /// Winner address (if finalized).
+    pub winner: Option<Address>,
+}
+
+/// Event topics for vesting and auction - Issue #525, #527
+pub const SET_BENEFICIARY_VESTING_TOPIC: Symbol = symbol_short!("set_bvst");
+pub const CLAIM_BENEFICIARY_VESTING_TOPIC: Symbol = symbol_short!("clm_bvst");
+pub const AUCTION_CREATED_TOPIC: Symbol = symbol_short!("auc_crt");
+pub const AUCTION_BID_TOPIC: Symbol = symbol_short!("auc_bid");
+pub const AUCTION_FINALIZED_TOPIC: Symbol = symbol_short!("auc_fin");
+
+// Issue #809: two-step protocol configuration update
+pub const PROTOCOL_CONFIG_PROPOSED_TOPIC: Symbol = symbol_short!("pc_prop");
+pub const PROTOCOL_CONFIG_APPLIED_TOPIC: Symbol = symbol_short!("pc_apply");
+
+/// Aggregated protocol-level configuration — Issue #810.
+/// Returned by `get_protocol_config` so off-chain clients avoid raw storage key coupling.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolConfig {
+    pub min_check_in_interval: Option<u64>,
+    pub max_check_in_interval: Option<u64>,
+    pub max_ttl_seconds: u64,
+    pub ttl_decay_rate: u32,
+    /// When true, `set_vault_metadata`, `update_metadata`, and `update_metadata_versioned`
+    /// reject metadata bytes that are not valid UTF-8 — Issue #871.
+    pub require_utf8_metadata: bool,
+    /// Maximum number of vaults a single owner may create — Issue #767.
+    pub max_vaults_per_owner: u32,
+}
+
+/// Vault state snapshot at a specific point in time.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultSnapshot {
+    pub vault: Vault,
+    pub timestamp: u64,
+    pub content_hash: BytesN<32>,
+}
+

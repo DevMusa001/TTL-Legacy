@@ -1,0 +1,70 @@
+name: Nightly DR Backup
+
+on:
+  schedule:
+    # Runs every night at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run in dry-run mode (print actions without executing)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  STELLAR_NETWORK: mainnet
+
+jobs:
+  dr-backup:
+    name: Disaster-Recovery Backup
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSfL \
+            "https://github.com/stellar/stellar-cli/releases/latest/download/stellar-cli-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          stellar --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.DR_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DR_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.DR_AWS_REGION || 'us-east-1' }}
+
+      - name: Run dr_backup.sh
+        env:
+          DR_S3_BUCKET: ${{ secrets.DR_S3_BUCKET }}
+          DR_S3_ENDPOINT: ${{ secrets.DR_S3_ENDPOINT }}
+          DR_S3_PREFIX: backups
+          CONTRACT_TTL_VAULT: ${{ secrets.CONTRACT_TTL_VAULT }}
+          STELLAR_NETWORK: ${{ env.STELLAR_NETWORK }}
+          DR_DB_PATH: ${{ secrets.DR_DB_PATH }}
+          AWS_REGION: ${{ secrets.DR_AWS_REGION || 'us-east-1' }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          bash scripts/dr_backup.sh ${DRY_RUN_FLAG}
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[DR] Nightly backup failed — ${new Date().toISOString().slice(0,10)}`,
+              body: `The nightly disaster-recovery backup workflow failed.\n\nRun: ${context.runId}\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['disaster-recovery', 'bug']
+            });
