@@ -101,7 +101,22 @@ mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
 #[cfg(test)]
-mod backup_code_tests;
+mod deposit_event_tests;
+mod checkin_email_token_tests;
+#[cfg(test)]
+mod checkin_streak_bonus_tests;
+#[cfg(test)]
+mod beneficiary_confirmation_tests;
+
+
+#[cfg(test)]
+mod min_checkin_interval_tests;
+
+#[cfg(test)]
+mod vault_archiving_tests;
+
+#[cfg(test)]
+mod beneficiary_owner_check_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -1688,8 +1703,11 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        
+        // Emit comprehensive FundsDeposited event with all required fields
+        // Includes: depositor, amount, new_balance, and timestamp for indexer detection
         env.events()
-            .publish((DEPOSIT_TOPIC, vault_id), (amount, vault.balance));
+            .publish((DEPOSIT_TOPIC, vault_id), (&from, amount, vault.balance, now));
     }
 
     /// Deposits funds into multiple vaults in a single transfer.
@@ -1754,6 +1772,7 @@ impl TtlVaultContract {
         let token_client = token::Client::new(&env, &default_token);
         token_client.transfer(&from, &env.current_contract_address(), &total_amount);
 
+        let now = env.ledger().timestamp();
         for validated_deposit in validated.iter() {
             let (vault_id, mut vault, amount) = validated_deposit;
             // Verify vault uses default token
@@ -1770,6 +1789,12 @@ impl TtlVaultContract {
             env.events().publish(
                 (TOKEN_WHITELIST_VALIDATED_TOPIC, vault_id),
                 (&vault.token_address, amount),
+            );
+            
+            // Emit comprehensive FundsDeposited event for each vault deposit
+            env.events().publish(
+                (DEPOSIT_TOPIC, vault_id),
+                (&from, amount, vault.balance, now),
             );
         }
         env.storage()
