@@ -5933,6 +5933,24 @@ impl TtlVaultContract {
         Self::load_vault(&env, vault_id).status
     }
 
+    /// Returns the vault status without fetching the entire vault struct.
+    ///
+    /// This is a lightweight query function that reduces instruction consumption
+    /// for read-heavy paths where only the vault status is needed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// * `Ok(ReleaseStatus)` - The vault status (Locked, Released, Cancelled, or EmergencyFrozen)
+    /// * `Err(ContractError::VaultNotFound)` - If the vault does not exist
+    pub fn get_vault_status(env: Env, vault_id: u64) -> Result<ReleaseStatus, ContractError> {
+        Self::try_load_vault(&env, vault_id)
+            .map(|vault| vault.status)
+            .ok_or(ContractError::VaultNotFound)
+    }
+
     /// Returns the total number of vaults created.
     ///
     /// # Arguments

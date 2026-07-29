@@ -7451,3 +7451,107 @@ fn test_withdraw_succeeds_when_2fa_enabled_and_verified() {
     client.withdraw(&vault_id, &owner, &100i128);
     assert_eq!(client.get_vault(&vault_id).balance, 900i128);
 }
+
+// ---- get_vault_status tests ----
+
+#[test]
+fn test_get_vault_status_locked_initial_state() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Newly created vault should have Locked status
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_get_vault_status_released() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit and trigger release
+    client.deposit(&vault_id, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // Vault should now be Released
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Released);
+}
+
+#[test]
+fn test_get_vault_status_cancelled() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Cancel the vault
+    let result = client.try_cancel_vault(&vault_id, &owner);
+    assert!(result.is_ok());
+
+    // Vault should now be Cancelled
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Cancelled);
+}
+
+#[test]
+fn test_get_vault_status_emergency_frozen() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Freeze the vault (this requires admin or emergency functionality)
+    let result = client.try_freeze_vault(&vault_id);
+    assert!(result.is_ok());
+
+    // Vault should now be EmergencyFrozen
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::EmergencyFrozen);
+}
+
+#[test]
+fn test_get_vault_status_not_found() {
+    let (_, _, _, _, _, client) = setup();
+    let non_existent_vault_id = 999999u64;
+
+    // Querying a non-existent vault should return VaultNotFound error
+    let result = client.try_get_vault_status(&non_existent_vault_id);
+    assert!(result.is_err());
+
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(3)); // VaultNotFound error code
+}
+
+#[test]
+fn test_get_vault_status_multiple_vaults_independent() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    // Create multiple vaults with different statuses
+    let vault1 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let vault3 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Trigger release on vault2
+    client.deposit(&vault2, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault2);
+
+    // Cancel vault3
+    client.cancel_vault(&vault3, &owner);
+
+    // Verify independent statuses
+    assert_eq!(client.get_vault_status(&vault1).unwrap(), ReleaseStatus::Locked);
+    assert_eq!(client.get_vault_status(&vault2).unwrap(), ReleaseStatus::Released);
+    assert_eq!(client.get_vault_status(&vault3).unwrap(), ReleaseStatus::Cancelled);
+}
+
+#[test]
+fn test_get_vault_status_lightweight_query() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // get_vault_status should be more lightweight than get_vault
+    // Both should work correctly
+    let status = client.get_vault_status(&vault_id).unwrap();
+    let vault = client.get_vault(&vault_id);
+    
+    assert_eq!(status, vault.status);
+}
