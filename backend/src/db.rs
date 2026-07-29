@@ -619,6 +619,31 @@ impl Db {
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_action    ON audit_logs(action);
                 "#,
             ),
+            (
+                "4",
+                r#"
+                CREATE TABLE IF NOT EXISTS sponsored_releases (
+                    tx_id             TEXT PRIMARY KEY,
+                    vault_id          TEXT NOT NULL,
+                    beneficiary       TEXT NOT NULL,
+                    released_amount   INTEGER NOT NULL,
+                    protocol_fee      INTEGER NOT NULL,
+                    net_amount        INTEGER NOT NULL,
+                    fee_bump_tx_hash  TEXT NOT NULL,
+                    sponsor_account   TEXT NOT NULL,
+                    sponsorship_fee   INTEGER NOT NULL,
+                    status            TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    executed_at       TEXT,
+                    ledger_sequence   INTEGER,
+                    error             TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sponsored_releases_vault_id ON sponsored_releases(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_sponsored_releases_beneficiary ON sponsored_releases(beneficiary);
+                CREATE INDEX IF NOT EXISTS idx_sponsored_releases_status ON sponsored_releases(status);
+                CREATE INDEX IF NOT EXISTS idx_sponsored_releases_created_at ON sponsored_releases(created_at);
+                "#,
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1006,6 +1031,221 @@ impl Db {
         )?;
         Ok(count as u64)
     }
+
+    // ── Sponsored Release tracking (#1122) ───────────────────────────────────
+
+    pub fn insert_sponsored_release(&self, release: &crate::fee_sponsorship::SponsoredRelease) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO sponsored_releases (
+                tx_id, vault_id, beneficiary, released_amount, protocol_fee, net_amount,
+                fee_bump_tx_hash, sponsor_account, sponsorship_fee, status, created_at,
+                executed_at, ledger_sequence, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                release.tx_id,
+                release.vault_id,
+                release.beneficiary,
+                release.released_amount,
+                release.protocol_fee,
+                release.net_amount,
+                release.fee_bump_tx_hash,
+                release.sponsor_account,
+                release.sponsorship_fee,
+                release.status.to_string(),
+                release.created_at.to_rfc3339(),
+                release.executed_at.map(|dt| dt.to_rfc3339()),
+                release.ledger_sequence.map(|seq| seq as i64),
+                release.error.as_deref(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sponsored_release(&self, tx_id: &str) -> Result<Option<crate::fee_sponsorship::SponsoredRelease>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"
+            SELECT tx_id, vault_id, beneficiary, released_amount, protocol_fee, net_amount,
+                   fee_bump_tx_hash, sponsor_account, sponsorship_fee, status, created_at,
+                   executed_at, ledger_sequence, error
+            FROM sponsored_releases
+            WHERE tx_id = ?1
+            "#,
+        )?;
+
+        let row = stmt.query_row(params![tx_id], |r| {
+            let status_str: String = r.get(9)?;
+            let status = match status_str.as_str() {
+                "pending" => crate::fee_sponsorship::SponsoredReleaseStatus::Pending,
+                "submitted" => crate::fee_sponsorship::SponsoredReleaseStatus::Submitted,
+                "confirmed" => crate::fee_sponsorship::SponsoredReleaseStatus::Confirmed,
+                "failed" => crate::fee_sponsorship::SponsoredReleaseStatus::Failed,
+                "cancelled" => crate::fee_sponsorship::SponsoredReleaseStatus::Cancelled,
+                _ => crate::fee_sponsorship::SponsoredReleaseStatus::Pending,
+            };
+
+            let created_at_str: String = r.get(10)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))?;
+
+            let executed_at_str: Option<String> = r.get(11)?;
+            let executed_at = executed_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+
+            let ledger_sequence: Option<i64> = r.get(12)?;
+
+            Ok(crate::fee_sponsorship::SponsoredRelease {
+                tx_id: r.get(0)?,
+                vault_id: r.get(1)?,
+                beneficiary: r.get(2)?,
+                released_amount: r.get(3)?,
+                protocol_fee: r.get(4)?,
+                net_amount: r.get(5)?,
+                fee_bump_tx_hash: r.get(6)?,
+                sponsor_account: r.get(7)?,
+                sponsorship_fee: r.get(8)?,
+                status,
+                created_at,
+                executed_at,
+                ledger_sequence: ledger_sequence.map(|s| s as u64),
+                error: r.get(13)?,
+            })
+        });
+
+        match row {
+            Ok(release) => Ok(Some(release)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn list_sponsored_releases_for_vault(&self, vault_id: &str) -> Result<Vec<crate::fee_sponsorship::SponsoredRelease>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"
+            SELECT tx_id, vault_id, beneficiary, released_amount, protocol_fee, net_amount,
+                   fee_bump_tx_hash, sponsor_account, sponsorship_fee, status, created_at,
+                   executed_at, ledger_sequence, error
+            FROM sponsored_releases
+            WHERE vault_id = ?1
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let iter = stmt.query_map(params![vault_id], |r| {
+            let status_str: String = r.get(9)?;
+            let status = match status_str.as_str() {
+                "pending" => crate::fee_sponsorship::SponsoredReleaseStatus::Pending,
+                "submitted" => crate::fee_sponsorship::SponsoredReleaseStatus::Submitted,
+                "confirmed" => crate::fee_sponsorship::SponsoredReleaseStatus::Confirmed,
+                "failed" => crate::fee_sponsorship::SponsoredReleaseStatus::Failed,
+                "cancelled" => crate::fee_sponsorship::SponsoredReleaseStatus::Cancelled,
+                _ => crate::fee_sponsorship::SponsoredReleaseStatus::Pending,
+            };
+
+            let created_at_str: String = r.get(10)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))?;
+
+            let executed_at_str: Option<String> = r.get(11)?;
+            let executed_at = executed_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+
+            let ledger_sequence: Option<i64> = r.get(12)?;
+
+            Ok(crate::fee_sponsorship::SponsoredRelease {
+                tx_id: r.get(0)?,
+                vault_id: r.get(1)?,
+                beneficiary: r.get(2)?,
+                released_amount: r.get(3)?,
+                protocol_fee: r.get(4)?,
+                net_amount: r.get(5)?,
+                fee_bump_tx_hash: r.get(6)?,
+                sponsor_account: r.get(7)?,
+                sponsorship_fee: r.get(8)?,
+                status,
+                created_at,
+                executed_at,
+                ledger_sequence: ledger_sequence.map(|s| s as u64),
+                error: r.get(13)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_sponsored_release_status(
+        &self,
+        tx_id: &str,
+        status: crate::fee_sponsorship::SponsoredReleaseStatus,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            UPDATE sponsored_releases
+            SET status = ?1
+            WHERE tx_id = ?2
+            "#,
+            params![status.to_string(), tx_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn confirm_sponsored_release(
+        &self,
+        tx_id: &str,
+        ledger_sequence: u64,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            UPDATE sponsored_releases
+            SET status = ?, executed_at = ?, ledger_sequence = ?
+            WHERE tx_id = ?
+            "#,
+            params![
+                crate::fee_sponsorship::SponsoredReleaseStatus::Confirmed.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                ledger_sequence as i64,
+                tx_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_sponsored_release(
+        &self,
+        tx_id: &str,
+        error: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            UPDATE sponsored_releases
+            SET status = ?, error = ?, executed_at = ?
+            WHERE tx_id = ?
+            "#,
+            params![
+                crate::fee_sponsorship::SponsoredReleaseStatus::Failed.to_string(),
+                error,
+                chrono::Utc::now().to_rfc3339(),
+                tx_id,
+            ],
+        )?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
