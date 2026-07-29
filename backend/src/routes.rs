@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::{
     audit,
@@ -20,6 +21,7 @@ pub struct RemindersQuery {
     pub include_deleted: Option<bool>,
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn list_vault_reminders(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -37,6 +39,7 @@ pub async fn list_vault_reminders(
     Ok(Json(records))
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn delete_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -45,6 +48,7 @@ pub async fn delete_preferences(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[instrument(skip(state, headers), fields(vault_id = %vault_id))]
 pub async fn set_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -88,6 +92,7 @@ pub async fn set_preferences(
     Ok((StatusCode::OK, Json(prefs)))
 }
 
+#[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn get_preferences(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<u64>,
@@ -106,6 +111,7 @@ pub struct UnsubscribeQuery {
     pub token: String,
 }
 
+#[instrument(skip(state))]
 pub async fn unsubscribe(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UnsubscribeQuery>,
@@ -126,6 +132,7 @@ pub async fn unsubscribe(
 // ── Release Simulator endpoint ────────────────────────────────────────────────
 
 /// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
+#[instrument(skip(db), fields(vault_id = %vault_id))]
 pub async fn simulate_release(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
