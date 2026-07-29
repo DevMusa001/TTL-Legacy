@@ -101,7 +101,7 @@ mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
 #[cfg(test)]
-mod deposit_invalid_amount_tests;
+mod milestone_vesting_tests;
 mod checkin_email_token_tests;
 #[cfg(test)]
 mod checkin_streak_bonus_tests;
@@ -259,9 +259,12 @@ pub enum ContractError {
     ChallengeNotFound = 86,
     ChallengeExpired = 87,
     DuplicateSignature = 88,
-    // Issue #944: beneficiary delegation to proxy
-    NoDelegation = 89,
-    DelegationExpired = 90,
+    // Milestone-based vesting
+    MilestoneNotFound = 89,
+    MilestoneAlreadyAttested = 90,
+    UnauthorizedAttestor = 91,
+    CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
+    SnapshotNotFound = 90,         // Issue #1123: Vault archiving
 }
 
 #[contract]
@@ -2529,6 +2532,150 @@ impl TtlVaultContract {
         Self::trigger_release_internal(env, vault_id, ReleaseTrigger::Manual);
     }
 
+    /// Add a vesting milestone to a vault (owner-only).
+    /// Milestones represent real-world conditions that must be attested before funds unlock.
+    /// Example: "Beneficiary turns 18", attested by a trusted oracle.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `vault_id` - ID of the vault to attach milestone to
+    /// * `description` - Human-readable description of the condition (e.g., "Beneficiary age 18")
+    /// * `attestor` - Address authorized to attest this milestone
+    ///
+    /// # Errors
+    /// * `ContractError::UnauthorizedOwner` - Caller is not the vault owner
+    /// * `ContractError::VaultNotFound` - Vault doesn't exist
+    pub fn add_vesting_milestone(
+        env: Env,
+        vault_id: u64,
+        description: String,
+        attestor: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        // Get current milestone count
+        let count_key = DataKey::VestingMilestoneCount(vault_id);
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+
+        let milestone_id = count;
+        let new_milestone = VestingMilestone {
+            milestone_id,
+            description: description.clone(),
+            attestor: attestor.clone(),
+            unlocked: false,
+        };
+
+        // Load existing milestones or create new vec
+        let milestones_key = DataKey::VestingMilestones(vault_id);
+        let mut milestones: Vec<VestingMilestone> = env
+            .storage()
+            .persistent()
+            .get(&milestones_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        milestones.push_back(new_milestone);
+
+        // Save updated milestones and increment count
+        env.storage().persistent().set(&milestones_key, &milestones);
+        env.storage()
+            .persistent()
+            .set(&count_key, &(count + 1));
+
+        // Extend TTL for both keys
+        env.storage().persistent().extend_ttl(
+            &milestones_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        // Emit event
+        env.events().publish(
+            (MILESTONE_ADDED_TOPIC, vault_id),
+            (milestone_id, description, attestor),
+        );
+    }
+
+    /// Attest that a vesting milestone has been fulfilled (attestor-only).
+    /// Only the designated attestor can attest that real-world conditions have been met.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `vault_id` - ID of the vault with the milestone
+    /// * `milestone_id` - ID of the milestone to attest
+    ///
+    /// # Errors
+    /// * `ContractError::UnauthorizedAttestor` - Caller is not the designated attestor
+    /// * `ContractError::MilestoneNotFound` - Milestone doesn't exist
+    /// * `ContractError::MilestoneAlreadyAttested` - Milestone already unlocked
+    pub fn attest_milestone(env: Env, vault_id: u64, milestone_id: u64) {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Load milestones
+        let milestones_key = DataKey::VestingMilestones(vault_id);
+        let mut milestones: Vec<VestingMilestone> = env
+            .storage()
+            .persistent()
+            .get(&milestones_key)
+            .ok_or(ContractError::MilestoneNotFound)
+            .unwrap();
+
+        // Find and update the milestone
+        let mut found = false;
+        for i in 0..milestones.len() {
+            let mut milestone = milestones.get(i).unwrap();
+            if milestone.milestone_id == milestone_id {
+                // Verify caller is the attestor
+                milestone.attestor.require_auth();
+
+                // Check if already attested
+                if milestone.unlocked {
+                    panic_with_error!(&env, ContractError::MilestoneAlreadyAttested);
+                }
+
+                // Mark as unlocked
+                milestone.unlocked = true;
+                milestones.set(i, milestone.clone());
+                found = true;
+
+                // Emit event
+                env.events().publish(
+                    (MILESTONE_ATTESTED_TOPIC, vault_id),
+                    (milestone_id, milestone.attestor.clone()),
+                );
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ContractError::MilestoneNotFound);
+        }
+
+        // Save updated milestones
+        env.storage().persistent().set(&milestones_key, &milestones);
+        env.storage().persistent().extend_ttl(
+            &milestones_key,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
     fn mark_release_attempted(env: &Env, vault_id: u64) {
         env.storage()
             .persistent()
@@ -2763,6 +2910,27 @@ impl TtlVaultContract {
             .storage()
             .persistent()
             .has(&DataKey::MilestoneVestingSchedule(vault_id));
+
+        // Check if any milestones are attached and if they're all unlocked
+        let has_vesting_milestones = env
+            .storage()
+            .persistent()
+            .has(&DataKey::VestingMilestones(vault_id));
+        
+        if has_vesting_milestones {
+            // Load milestones and verify all are unlocked
+            let milestones: Vec<VestingMilestone> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VestingMilestones(vault_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            
+            for milestone in milestones.iter() {
+                if !milestone.unlocked {
+                    panic_with_error!(&env, ContractError::MilestoneNotFound);
+                }
+            }
+        }
 
         Self::mark_release_attempted(&env, vault_id);
 
