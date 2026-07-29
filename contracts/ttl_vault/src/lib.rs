@@ -2110,6 +2110,27 @@ impl TtlVaultContract {
         Self::load_vault(&env, vault_id).owner
     }
 
+    /// Returns the primary beneficiary address of a vault.
+    ///
+    /// This is a cheap, focused query — it avoids fetching the full `Vault` struct
+    /// in contexts where only the beneficiary address is needed (e.g., release logic,
+    /// dashboard components).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The beneficiary `Address`.
+    ///
+    /// # Errors
+    /// Panics with `ContractError::VaultNotFound` if the vault does not exist.
+    pub fn get_beneficiary(env: Env, vault_id: u64) -> Result<Address, ContractError> {
+        Self::try_load_vault(&env, vault_id)
+            .map(|v| v.beneficiary)
+            .ok_or(ContractError::VaultNotFound)
+    }
+
     /// Returns the creation timestamp of a vault.
     ///
     /// # Arguments
