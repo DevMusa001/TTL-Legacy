@@ -16,6 +16,11 @@ pub const OWNERSHIP_TOPIC: Symbol = symbol_short!("own_xfer");
 pub const LOAN_ENABLED_TOPIC: Symbol = symbol_short!("loan_new");
 pub const LOAN_REPAID_TOPIC: Symbol = symbol_short!("loan_rep");
 
+/// Contract upgrade event topics - Issue #1120
+pub const UPGRADE_PROPOSED_TOPIC: Symbol = symbol_short!("upg_prop");
+pub const UPGRADE_EXECUTED_TOPIC: Symbol = symbol_short!("upg_exec");
+pub const UPGRADE_CANCELLED_TOPIC: Symbol = symbol_short!("upg_canc");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -188,6 +193,8 @@ pub enum DataKey {
     // Issue #1117: pending multi-sig operations with nonce
     PendingMultiSigOp(u64, u64), // (vault_id, nonce)
     PendingMultiSigOpNonce(u64), // counter per vault
+    // Issue #1120: timelock-gated contract upgrade
+    PendingUpgrade,
 }
 
 
@@ -795,6 +802,20 @@ pub struct WithdrawalDispute {
     pub status: DisputeStatus,
     pub reason: String,
     pub resolved_at: Option<u64>,
+}
+
+/// Contract upgrade proposal with timelock - Issue #1120
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    /// Hash of the new WASM bytecode
+    pub new_wasm_hash: Bytes,
+    /// Address of the admin who proposed the upgrade
+    pub proposed_by: Address,
+    /// Timestamp when the upgrade was proposed
+    pub proposed_at: u64,
+    /// Timestamp when the upgrade can be executed (proposed_at + 72 hours)
+    pub executable_at: u64,
 }
 
 /// Multi-signature configuration
