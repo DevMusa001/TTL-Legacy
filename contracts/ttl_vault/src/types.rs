@@ -23,6 +23,8 @@ pub const UPDATE_INTERVAL_TOPIC: Symbol = symbol_short!("upd_intv");
 pub const UPDATE_METADATA_TOPIC: Symbol = symbol_short!("upd_meta");
 pub const SET_MIN_INTERVAL_TOPIC: Symbol = symbol_short!("set_min");
 pub const SET_MAX_INTERVAL_TOPIC: Symbol = symbol_short!("set_max");
+/// Emitted when adaptive interval is enabled/disabled or a new suggestion is computed - Issue #2
+pub const ADAPTIVE_INTERVAL_TOPIC: Symbol = symbol_short!("adap_int");
 pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
@@ -407,6 +409,8 @@ pub enum DataKey {
     CheckInHistoryHead(u64),
     // Issue #873: number of check-in history entries
     CheckInHistoryLen(u64),
+    /// Stores the most recently computed adaptive interval suggestion (seconds) - Issue #2
+    AdaptiveIntervalSuggestion(u64),
     CheckInStreak(u64),
     // Issue #481: proof-of-work nonce
     CheckInNonce(u64),
@@ -871,6 +875,8 @@ pub struct Vault {
     pub multi_sig_threshold: u32,
     /// Operations that require multi-sig approval (2-of-N) - Issue #1117
     pub multisig_required_ops: Vec<MultiSigOperation>,
+    /// Whether adaptive interval adjustment is enabled for this vault - Issue #2
+    pub adaptive_interval_enabled: bool,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -1549,6 +1555,7 @@ pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rem");
 #[contracttype]
 #[derive(Clone)]
 pub struct ProtocolConfig {
+    /// Minimum check-in interval in seconds. Defaults to MIN_CHECK_IN_INTERVAL (3600s = 1 hour) if None.
     pub min_check_in_interval: Option<u64>,
     pub max_check_in_interval: Option<u64>,
     pub max_ttl_seconds: u64,
