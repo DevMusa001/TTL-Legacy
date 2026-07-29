@@ -86,6 +86,21 @@ fn test_vault_count_view() {
     assert_eq!(client.vault_count(), 2);
 }
 
+// ---- Issue #1092: get_vault_count dashboard metrics alias ----
+
+#[test]
+fn test_get_vault_count_increments_across_creates() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    assert_eq!(client.get_vault_count(), 0);
+    client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(client.get_vault_count(), 1);
+    client.create_vault(&owner, &beneficiary, &200u64, &None);
+    assert_eq!(client.get_vault_count(), 2);
+    // Stays consistent with the existing vault_count view
+    assert_eq!(client.get_vault_count(), client.vault_count());
+}
+
 #[test]
 fn test_vault_count_not_incremented_on_failed_create() {
     let (env, owner, _beneficiary, _, _, client) = setup();
@@ -121,6 +136,45 @@ fn test_vault_exists_for_existing_and_missing_ids() {
 
     assert!(client.vault_exists(&vault_id));
     assert!(!client.vault_exists(&(vault_id + 1)));
+}
+
+#[test]
+fn test_get_owner_returns_correct_owner() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(client.get_owner(&vault_id), owner);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_get_owner_panics_for_nonexistent_vault() {
+    let (_, _, _, _, _, client) = setup();
+    client.get_owner(&9999u64);
+}
+
+#[test]
+fn test_create_vault_emits_vault_created_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let events = env.events().all();
+    let created_event = events.iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::VAULT_CREATED_TOPIC)
+            .unwrap_or(false)
+    });
+
+    assert!(created_event.is_some(), "VaultCreated event not emitted");
+    let data: (u64, Address, Address, u64, u64) = created_event.unwrap().2.into_val(&env);
+    assert_eq!(data.0, vault_id);
+    assert_eq!(data.1, owner);
+    assert_eq!(data.2, beneficiary);
+    assert_eq!(data.3, 100u64);
 }
 
 #[test]
@@ -1890,6 +1944,22 @@ fn test_withdraw_rejected_on_released_vault() {
     // Any withdraw attempt on a Released vault must return AlreadyReleased (#7)
     let err = client
         .try_withdraw(&vault_id, &owner, &1i128)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AlreadyReleased);
+}
+
+#[test]
+fn test_check_in_rejected_on_cancelled_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    // cancel_vault refunds and marks status = Cancelled
+    client.cancel_vault(&vault_id, &owner);
+
+    // check_in on a Cancelled vault must not extend its TTL; it must return AlreadyReleased (#7)
+    let err = client
+        .try_check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::AlreadyReleased);
@@ -3900,6 +3970,23 @@ fn test_update_beneficiary_owner_only() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_update_beneficiary_fails_after_vault_released() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    let new_beneficiary = Address::generate(&env);
+    let err = client
+        .try_update_beneficiary(&vault_id, &owner, &new_beneficiary)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}
+
 
 // ---- Issue #402: Withdrawal Scheduling Tests ----
 
@@ -5652,6 +5739,36 @@ fn test_get_hibernation_returns_none_when_not_hibernating() {
     assert!(client.get_hibernation(&id).is_none());
 }
 
+#[test]
+fn test_is_hibernating_true_while_active() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+
+    assert!(client.is_hibernating(&id));
+}
+
+#[test]
+fn test_is_hibernating_false_once_expired() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 7200);
+
+    assert!(!client.is_hibernating(&id));
+}
+
+#[test]
+fn test_is_hibernating_false_when_never_hibernated() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    assert!(!client.is_hibernating(&id));
+}
+
 // ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
 
 fn make_beneficiary_entry(env: &Env, addr: Address, bps: u32) -> BeneficiaryEntry {
@@ -7140,5 +7257,174 @@ fn test_multi_sig_passkey_withdrawal_flow() {
     let sigs_two = soroban_sdk::vec![&env, passkey1.clone(), passkey2.clone()];
     client.withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_two);
 
+    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+}
+
+// ── Issue #1135: AdminTransferred event on accept_admin ─────────────────────
+
+#[test]
+fn test_accept_admin_emits_old_and_new_admin() {
+    let (env, _, _, admin, _, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_new_admin(&new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 86_401);
+    let accepted_at = env.ledger().timestamp();
+    client.accept_admin();
+
+    let event = env.events().all().iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::ADMIN_TRANSFER_COMPLETED_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(event.is_some(), "adm_done event not emitted");
+
+    let data = event.unwrap().2.clone();
+    let (old_admin, new_admin_emitted, ts): (Address, Address, u64) =
+        data.try_into_val(&env).unwrap();
+    assert_eq!(old_admin, admin);
+    assert_eq!(new_admin_emitted, new_admin);
+    assert_eq!(ts, accepted_at);
+}
+
+// ── Issue #1136: get_state_transition_count ──────────────────────────────────
+
+#[test]
+fn test_get_state_transition_count_increments() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let other_vault_id = client.create_vault(&owner, &beneficiary, &200u64, &None);
+
+    assert_eq!(client.get_state_transition_count(&vault_id), 0);
+    assert_eq!(
+        client.get_state_transition_count(&vault_id),
+        client.get_state_transition_log(&vault_id).len() as u64
+    );
+
+    client.cancel_vault(&vault_id, &owner);
+
+    assert_eq!(client.get_state_transition_count(&vault_id), 1);
+    assert_eq!(
+        client.get_state_transition_count(&vault_id),
+        client.get_state_transition_log(&vault_id).len() as u64
+    );
+    // Unrelated vault's count is unaffected
+    assert_eq!(client.get_state_transition_count(&other_vault_id), 0);
+}
+
+// ── Issue #1137: get_multisig_proposal_status ────────────────────────────────
+
+#[test]
+fn test_get_multisig_proposal_status_not_found() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client
+        .try_get_multisig_proposal_status(&vault_id, &999u64)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(44)); // ProposalNotFound
+}
+
+#[test]
+fn test_get_multisig_proposal_status_pending() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Pending);
+}
+
+#[test]
+fn test_get_multisig_proposal_status_approved() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    // threshold 1 -> owner's auto-approval is immediately sufficient
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &1u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Approved);
+}
+
+#[test]
+fn test_get_multisig_proposal_status_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
+
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+    client.reject_multisig(&vault_id, &proposal_id, &owner);
+
+    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
+    assert_eq!(status, ProposalStatus::Rejected);
+}
+
+// ── Issue #1138: 2FA-gated withdrawals ───────────────────────────────────────
+
+#[test]
+fn test_withdraw_succeeds_when_2fa_disabled() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.withdraw(&vault_id, &owner, &100i128);
+    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+}
+
+#[test]
+fn test_withdraw_fails_when_2fa_enabled_and_not_verified() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.enable_2fa(&vault_id, &owner, &0u32);
+
+    let err = client
+        .try_withdraw(&vault_id, &owner, &100i128)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(89)); // TwoFactorRequired
+    assert_eq!(client.get_vault(&vault_id).balance, 1000i128);
+}
+
+#[test]
+fn test_withdraw_succeeds_when_2fa_enabled_and_verified() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+
+    client.enable_2fa(&vault_id, &owner, &0u32);
+    client.confirm_2fa(&vault_id, &owner);
+
+    client.withdraw(&vault_id, &owner, &100i128);
     assert_eq!(client.get_vault(&vault_id).balance, 900i128);
 }
