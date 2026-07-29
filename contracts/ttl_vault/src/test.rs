@@ -86,6 +86,21 @@ fn test_vault_count_view() {
     assert_eq!(client.vault_count(), 2);
 }
 
+// ---- Issue #1092: get_vault_count dashboard metrics alias ----
+
+#[test]
+fn test_get_vault_count_increments_across_creates() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    assert_eq!(client.get_vault_count(), 0);
+    client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(client.get_vault_count(), 1);
+    client.create_vault(&owner, &beneficiary, &200u64, &None);
+    assert_eq!(client.get_vault_count(), 2);
+    // Stays consistent with the existing vault_count view
+    assert_eq!(client.get_vault_count(), client.vault_count());
+}
+
 #[test]
 fn test_vault_count_not_incremented_on_failed_create() {
     let (env, owner, _beneficiary, _, _, client) = setup();
@@ -1898,6 +1913,22 @@ fn test_withdraw_rejected_on_released_vault() {
     // Any withdraw attempt on a Released vault must return AlreadyReleased (#7)
     let err = client
         .try_withdraw(&vault_id, &owner, &1i128)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AlreadyReleased);
+}
+
+#[test]
+fn test_check_in_rejected_on_cancelled_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    // cancel_vault refunds and marks status = Cancelled
+    client.cancel_vault(&vault_id, &owner);
+
+    // check_in on a Cancelled vault must not extend its TTL; it must return AlreadyReleased (#7)
+    let err = client
+        .try_check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::AlreadyReleased);
