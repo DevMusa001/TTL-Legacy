@@ -5286,6 +5286,24 @@ impl TtlVaultContract {
         vault
     }
 
+    /// Returns the owner address of a vault.
+    ///
+    /// This is a lightweight alternative to `get_vault` for callers that only
+    /// need to check ownership and want to avoid deserializing the full vault.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The `Address` of the vault owner
+    ///
+    /// # Panics
+    /// Panics with `ContractError::VaultNotFound` if the vault does not exist
+    pub fn get_owner(env: Env, vault_id: u64) -> Address {
+        Self::load_vault(&env, vault_id).owner
+    }
+
     /// Captures the state of a vault at a specific point in time.
     /// Anyone can call this function.
     pub fn create_vault_snapshot(env: Env, vault_id: u64) -> Bytes {
@@ -12485,6 +12503,33 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::Hibernation(vault_id))
+    }
+
+    /// Returns whether a vault is currently hibernating.
+    ///
+    /// A vault counts as hibernating only while its hibernation window is
+    /// still open; once the elapsed time reaches `duration_seconds` the
+    /// vault is treated as no longer hibernating even if `exit_hibernation`
+    /// has not yet been called.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// `true` if the vault has an active (non-expired) hibernation entry
+    pub fn is_hibernating(env: Env, vault_id: u64) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id))
+        {
+            Some(entry) => {
+                let now = env.ledger().timestamp();
+                now.saturating_sub(entry.started_at) < entry.duration_seconds
+            }
+            None => false,
+        }
     }
 
     fn get_delegated_beneficiary(env: &Env, vault_id: u64) -> Option<Address> {
