@@ -419,6 +419,10 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #572: Withdrawal Dispute
+    WithdrawalDisputes(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time
