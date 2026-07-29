@@ -13,293 +13,8 @@ pub const WITHDRAW_TOPIC: Symbol = symbol_short!("withdraw");
 pub const CHECK_IN_TOPIC: Symbol = symbol_short!("check_in");
 pub const CANCEL_TOPIC: Symbol = symbol_short!("cancel");
 pub const OWNERSHIP_TOPIC: Symbol = symbol_short!("own_xfer");
-pub const OWNERSHIP_INITIATED_TOPIC: Symbol = symbol_short!("own_init");
-pub const OWNERSHIP_ACCEPTED_TOPIC: Symbol = symbol_short!("own_acc");
-pub const OWNERSHIP_CANCELLED_TOPIC: Symbol = symbol_short!("own_can");
-pub const OWNERSHIP_TRANSFER_EXPIRED_TOPIC: Symbol = symbol_short!("own_exp");
-pub const BENEFICIARY_UPDATED_TOPIC: Symbol = symbol_short!("ben_upd");
-pub const SET_BENEFICIARIES_TOPIC: Symbol = symbol_short!("set_bens");
-pub const UPDATE_INTERVAL_TOPIC: Symbol = symbol_short!("upd_intv");
-pub const UPDATE_METADATA_TOPIC: Symbol = symbol_short!("upd_meta");
-pub const SET_MIN_INTERVAL_TOPIC: Symbol = symbol_short!("set_min");
-pub const SET_MAX_INTERVAL_TOPIC: Symbol = symbol_short!("set_max");
-pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
-pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
-pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
-pub const CLAIM_VEST_TOPIC: Symbol = symbol_short!("clm_vest");
-pub const VESTING_CANCELLED_TOPIC: Symbol = symbol_short!("vest_can");
-// Issue #534: vesting cliff period reached
-pub const CLIFF_REACHED_TOPIC: Symbol = symbol_short!("clif_rch");
-pub const PAUSE_VAULT_TOPIC: Symbol = symbol_short!("v_pause");
-pub const RESUME_VAULT_TOPIC: Symbol = symbol_short!("v_resume");
-pub const SET_METADATA_TOPIC: Symbol = symbol_short!("set_meta");
-pub const INHERITANCE_TOPIC: Symbol = symbol_short!("inherit");
-pub const ADD_PASSKEY_TOPIC: Symbol = symbol_short!("add_pk");
-pub const REMOVE_PASSKEY_TOPIC: Symbol = symbol_short!("rm_pk");
-pub const ROTATE_PASSKEY_TOPIC: Symbol = symbol_short!("rot_pk");
-pub const BACKUP_CODE_USED_TOPIC: Symbol = symbol_short!("bk_used");
-pub const BACKUP_CODES_GENERATED_TOPIC: Symbol = symbol_short!("bk_gen");
-pub const DELEGATE_BENEFICIARY_TOPIC: Symbol = symbol_short!("del_ben");
-pub const DISPUTE_FILED_TOPIC: Symbol = symbol_short!("disp_fil");
-pub const DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("disp_res");
-pub const WITHDRAWAL_SCHEDULED_TOPIC: Symbol = symbol_short!("wd_sch");
-pub const WITHDRAWAL_EXECUTED_TOPIC: Symbol = symbol_short!("wd_exec");
-pub const CONDITIONS_ACCEPTED_TOPIC: Symbol = symbol_short!("cond_acc");
-pub const SET_SPENDING_LIMIT_TOPIC: Symbol = symbol_short!("set_slmt");
-pub const SET_MAX_TTL_TOPIC: Symbol = symbol_short!("set_ttl");
-pub const SET_DECAY_RATE_TOPIC: Symbol = symbol_short!("set_dec");
-pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
-pub const TTL_DECAY_TOPIC: Symbol = symbol_short!("ttl_dec");
-pub const SET_BURN_PERCENTAGE_TOPIC: Symbol = symbol_short!("set_burn_pct");
-pub const BURN_EVENT_TOPIC: Symbol = symbol_short!("burn_evt");
-pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
-pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
-pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
-pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
-pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
-pub const BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC: Symbol = symbol_short!("ben_id_or");
-pub const BENEFICIARY_IDENTITY_VERIFIED_TOPIC: Symbol = symbol_short!("ben_id_vf");
-pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
-pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
-pub const CONFLICT_EXPIRED_TOPIC: Symbol = symbol_short!("conf_exp");
-pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
-pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
-// Issue #934: emergency vault recovery code
-pub const EMERGENCY_RECOVERY_GENERATED_TOPIC: Symbol = symbol_short!("erc_gen");
-pub const EMERGENCY_RECOVERY_USED_TOPIC: Symbol = symbol_short!("erc_used");
-pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
-pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
-// Biometric binding events
-pub const BIND_PASSKEY_BIOMETRIC_TOPIC: Symbol = symbol_short!("bind_pk");
-pub const UNBIND_PASSKEY_BIOMETRIC_TOPIC: Symbol = symbol_short!("ubind_pk");
-pub const BIO_CHECKIN_TOPIC: Symbol = symbol_short!("bio_ci");
-pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
-pub const VAULT_CLONED_OVERRIDE_TOPIC: Symbol = symbol_short!("v_clo_ov");
-pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
-pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
-pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
-pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
-pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
-pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
-pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
-pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
-pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
-
-pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
-pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
-pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
-pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
-// Issue #480: check-in delegation events
-pub const DELEGATE_CHECKIN_TOPIC: Symbol = symbol_short!("del_ci");
-pub const REVOKE_DELEGATE_TOPIC: Symbol = symbol_short!("rev_del");
-// Issue #481: proof-of-work event
-pub const CHECKIN_POW_TOPIC: Symbol = symbol_short!("ci_pow");
-// Issue #482: TTL prediction event
-pub const TTL_PREDICTED_TOPIC: Symbol = symbol_short!("ttl_pred");
-// Issue #483: batch check-in event
-pub const BATCH_CHECKIN_TOPIC: Symbol = symbol_short!("b_ci");
-// Issue #472: state transition audit
-pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
-// Issue #473: ownership proof
-pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
-// Issue #474: integrity check
-pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
-// Issue #475: batch status query
-pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
-// Issue #498: beneficiary proof of life
-pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
-// Issue #499: beneficiary voting
-pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
-pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
-// Hibernation events
-pub const HIBERNATION_ENTERED_TOPIC: Symbol = symbol_short!("hib_ent");
-pub const HIBERNATION_EXITED_TOPIC: Symbol = symbol_short!("hib_ext");
-
-pub const DUPLICATE_VAULT_TOPIC: Symbol = symbol_short!("dup_vault");
-pub const MIN_THRESHOLD_SET_TOPIC: Symbol = symbol_short!("min_thr");
-pub const MIN_THRESHOLD_SKIP_TOPIC: Symbol = symbol_short!("min_skip");
-pub const MIN_THRESHOLD_REDISTRIBUTE_TOPIC: Symbol = symbol_short!("min_rdst");
-// Issue #565: withdrawal scheduling validation
-pub const WITHDRAWAL_VALIDATION_TOPIC: Symbol = symbol_short!("wd_val");
-// Issue #566: withdrawal limits by time
-pub const WITHDRAWAL_LIMIT_SET_TOPIC: Symbol = symbol_short!("wd_lim");
-pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
-// Issue #567: withdrawal destination whitelist
-pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
-pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
-pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
-pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
-pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
-pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
-pub const TOKEN_UNSTAKING_TOPIC: Symbol = symbol_short!("tok_ust");
-pub const YIELD_DISTRIBUTED_TOPIC: Symbol = symbol_short!("yld_dst");
-pub const YIELD_REINVESTED_TOPIC: Symbol = symbol_short!("yld_rin");
-// Wrapped token registration for cross-chain compatibility
-pub const WRAPPED_TOKEN_REGISTERED_TOPIC: Symbol = symbol_short!("wrp_reg");
-pub const WRAPPED_TOKEN_UNREGISTERED_TOPIC: Symbol = symbol_short!("wrp_unr");
-// Issue #568: withdrawal reversal
-pub const WITHDRAWAL_REVERSED_TOPIC: Symbol = symbol_short!("wd_rev");
-pub const REVERSAL_GRACE_EXPIRED_TOPIC: Symbol = symbol_short!("rev_exp");
-// Issue #547: vesting penalty applied
-pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
-// Issue #548: vesting claim reversed / finalized
-pub const VESTING_REVERSED_TOPIC: Symbol = symbol_short!("vest_rev");
-pub const VESTING_FINALIZED_TOPIC: Symbol = symbol_short!("vest_fin");
-// Milestone vesting topic symbols
-pub const MILESTONE_VEST_TOPIC: Symbol = symbol_short!("ms_vest");
-pub const MILESTONE_PAUSE_TOPIC: Symbol = symbol_short!("ms_paus");
-pub const MILESTONE_RESUME_TOPIC: Symbol = symbol_short!("ms_resm");
-pub const MILESTONE_ADJUST_TOPIC: Symbol = symbol_short!("ms_adj");
-pub const MILESTONE_EMERGENCY_TOPIC: Symbol = symbol_short!("ms_emer");
-pub const MILESTONE_PROGRESS_TOPIC: Symbol = symbol_short!("ms_prog");
-pub const MILESTONE_CLAIM_TOPIC: Symbol = symbol_short!("ms_clam");
-// Multi-vesting-schedule topic
-pub const VESTING_SCHEDULE_ADDED_TOPIC: Symbol = symbol_short!("vs_add");
-pub const VESTING_SCHEDULE_REMOVED_TOPIC: Symbol = symbol_short!("vs_rem");
-// Clawback of unvested funds
-pub const CLAWBACK_UNVESTED_TOPIC: Symbol = symbol_short!("clawback");
-// Issue #549: passkey expired during check-in
-pub const PASSKEY_EXPIRED_TOPIC: Symbol = symbol_short!("pk_expd");
-// Issue #550: passkey compromise detected or reported
-pub const PASSKEY_COMPROMISED_TOPIC: Symbol = symbol_short!("pk_comp");
-// Issue #564: withdrawal approval workflow
-pub const WITHDRAWAL_APPROVAL_REQUESTED_TOPIC: Symbol = symbol_short!("wd_req");
-pub const WITHDRAWAL_APPROVAL_GRANTED_TOPIC: Symbol = symbol_short!("wd_grant");
-pub const WITHDRAWAL_APPROVAL_DENIED_TOPIC: Symbol = symbol_short!("wd_deny");
-// Issue #563: passkey recovery
-pub const PASSKEY_RECOVERY_INITIATED_TOPIC: Symbol = symbol_short!("pk_rec");
-pub const PASSKEY_RECOVERED_TOPIC: Symbol = symbol_short!("pk_rcvd");
-// Issue #562: passkey compromise response
-pub const PASSKEY_LOCKOUT_TOPIC: Symbol = symbol_short!("pk_lock");
-pub const PASSKEY_UNLOCKED_TOPIC: Symbol = symbol_short!("pk_unlk");
-// Issue #561: passkey rotation enforcement
-pub const PASSKEY_ROTATION_REQUIRED_TOPIC: Symbol = symbol_short!("pk_rot_r");
-pub const PASSKEY_ROTATION_ENFORCED_TOPIC: Symbol = symbol_short!("pk_rot_e");
-
-// Issue: TTL Borrowing
-pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
-pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
-
-// Issue #541: Vesting Rollover
-pub const VESTING_ROLLOVER_TOPIC: Symbol = symbol_short!("vest_rol");
-// Issue #542: Vesting Forfeiture
-pub const VESTING_FORFEITURE_TOPIC: Symbol = symbol_short!("vest_frf");
-// Issue #543: Vesting Acceleration on Death
-pub const VESTING_ACCELERATED_TOPIC: Symbol = symbol_short!("vest_acc");
-// Issue #544: Vesting Staggering
-pub const VESTING_STAGGER_TOPIC: Symbol = symbol_short!("vest_stg");
-
-// Issue #545: Vesting Catch-Up
-pub const VESTING_CATCHUP_SET_TOPIC: Symbol = symbol_short!("vest_cu");
-pub const VESTING_CATCHUP_CLAIMED_TOPIC: Symbol = symbol_short!("vest_cuc");
-
-// Issue #546: Vesting Bonus
-pub const VESTING_BONUS_SET_TOPIC: Symbol = symbol_short!("vest_bon");
-pub const VESTING_BONUS_CLAIMED_TOPIC: Symbol = symbol_short!("vest_bonc");
-
-// Issue #585: Token Lending
-pub const TOKEN_LENDING_TOPIC: Symbol = symbol_short!("tok_lend");
-pub const TOKEN_LEND_REPAY_TOPIC: Symbol = symbol_short!("tok_lrep");
-// Issue #586: Token Collateral
-pub const TOKEN_COLLATERAL_TOPIC: Symbol = symbol_short!("tok_coll");
-pub const TOKEN_COLLAT_RLSD_TOPIC: Symbol = symbol_short!("tok_crls");
-// Issue #587: Token Hedging
-pub const TOKEN_HEDGE_TOPIC: Symbol = symbol_short!("tok_hedg");
-pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
-// Issue #588: Token Rebalancing
-pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
-pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
-
-// Issue #529: beneficiary pooling
-pub const POOL_CREATED_TOPIC: Symbol = symbol_short!("pool_crt");
-
-// Issue #813: admin transfer timelock
-pub const ADMIN_TRANSFER_PROPOSED_TOPIC: Symbol = symbol_short!("adm_prop");
-pub const ADMIN_TRANSFER_COMPLETED_TOPIC: Symbol = symbol_short!("adm_done");
-
-// Issue #814: pause reason tracking
-pub const PAUSE_REASON_TOPIC: Symbol = symbol_short!("pau_rsn");
-
-// Vault state snapshots
-pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
-pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
-
-// Configurable countdown notifications
-pub const COUNTDOWN_NOTIF_TOPIC: Symbol = symbol_short!("cd_notif");
-pub const SET_COUNTDOWN_TOPIC: Symbol = symbol_short!("set_cd");
-
-// Issue: Check-in Rate Limiting
-pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
-
-// Beneficiary capacity limit
-pub const BENEFICIARY_CAP_TOPIC: Symbol = symbol_short!("ben_cap");
-
-// Issue: Accelerated TTL Decay
-pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
-
-// Emergency freeze events
-pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
-pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
-// Per-vault admin freeze/unfreeze events
-pub const FREEZE_VAULT_TOPIC: Symbol = symbol_short!("frz_vlt");
-pub const UNFREEZE_VAULT_TOPIC: Symbol = symbol_short!("ufrz_vlt");
-
-// Beneficiary rotation
-pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
-
-// Inactivity penalty
-pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
-
-// Issue: Geographic Check-in Tracking
-pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
-
-// Issue #494: Beneficiary Succession Planning
-pub const SUCCESSION_SET_TOPIC: Symbol = symbol_short!("suc_set");
-pub const SUCCESSION_ACTIVATED_TOPIC: Symbol = symbol_short!("suc_act");
-
-// Issue #495: Beneficiary Escrow
-pub const ESCROW_CREATED_TOPIC: Symbol = symbol_short!("esc_cre");
-pub const ESCROW_ACCEPTED_TOPIC: Symbol = symbol_short!("esc_acc");
-pub const ESCROW_REJECTED_TOPIC: Symbol = symbol_short!("esc_rej");
-pub const ESCROW_EXPIRED_TOPIC: Symbol = symbol_short!("esc_exp");
-
-// Issue #496: Dispute Arbitration
-pub const ARBITRATOR_SET_TOPIC: Symbol = symbol_short!("arb_set");
-pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
-
-// Issue #497: Beneficiary Notification
-pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
-
-// Issue #569: Withdrawal Audit Trail
-pub const WITHDRAWAL_AUDIT_TOPIC: Symbol = symbol_short!("wd_audit");
-pub const WITHDRAWAL_FAILED_TOPIC: Symbol = symbol_short!("wd_fail");
-
-// Issue #571: Withdrawal Notifications
-pub const WITHDRAWAL_NOTIF_TOPIC: Symbol = symbol_short!("wd_notif");
-
-// Issue #572: Withdrawal Dispute
-pub const WITHDRAWAL_DISPUTE_FILED_TOPIC: Symbol = symbol_short!("wd_disp");
-pub const WITHDRAWAL_DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("wd_disp_r");
-
-pub const BENEFICIARY_TRIGGER_SET_TOPIC: Symbol = symbol_short!("ben_trg");
-pub const BENEFICIARY_TIER_SET_TOPIC: Symbol = symbol_short!("ben_tier");
-pub const BENEFICIARY_WATERFALL_TOPIC: Symbol = symbol_short!("ben_wfl");
-pub const BENEFICIARY_REBALANCED_TOPIC: Symbol = symbol_short!("ben_reb");
-
-// Issue #573: Withdrawal Proof
-pub const WITHDRAWAL_PROOF_TOPIC: Symbol = symbol_short!("wd_prf");
-// Issue #574: Withdrawal Rollback
-pub const WITHDRAWAL_ROLLBACK_TOPIC: Symbol = symbol_short!("wd_rbk");
-// Issue #575: Withdrawal Rate Limiting
-pub const WITHDRAWAL_RATE_LIMITED_TOPIC: Symbol = symbol_short!("wd_rl");
-// Issue #576: Withdrawal Escrow
-pub const WITHDRAWAL_ESCROW_CREATED_TOPIC: Symbol = symbol_short!("wd_esc");
-pub const WITHDRAWAL_ESCROW_VERIFIED_TOPIC: Symbol = symbol_short!("wd_ver");
-
-// Vault Partial Liquidation Before Release (TTL-Legacy);
-// Emits (vault_id, amount, ttl_remaining_before). The TTL is intentionally
-// not extended on liquidation so the countdown keeps running.
-pub const PARTIAL_LIQUIDATE_TOPIC: Symbol = symbol_short!("part_lq");
+pub const LOAN_ENABLED_TOPIC: Symbol = symbol_short!("loan_new");
+pub const LOAN_REPAID_TOPIC: Symbol = symbol_short!("loan_rep");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -419,6 +134,10 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #572: Withdrawal Dispute
+    WithdrawalDisputes(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time
@@ -767,6 +486,29 @@ pub struct RecurringWithdrawal {
     pub next_at: u64,
 }
 
+/// Loan terms for a token loan advanced into a vault by a lender. The vault
+/// owner must repay `amount` (plus a late penalty if repaid after
+/// `repayment_deadline`) to fully settle the loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub lender: Address,
+    pub amount: i128,
+    pub repayment_deadline: u64, // ledger timestamp
+    pub late_penalty_bps: u32,
+    pub repaid: bool,
+}
+
+/// Point-in-time status snapshot for a single vault, used by batch status lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub ttl_remaining: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Vault {
@@ -830,6 +572,15 @@ pub struct PasskeyAnalytics {
     pub passkey_hash: BytesN<32>,
     pub usage_count: u64,
     pub last_used_timestamp: u64,
+}
+
+/// Archived vault metadata - Issue #1123
+/// Stores information about archived vaults in cheaper persistent storage
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo {
+    pub vault: Vault,
+    pub archived_at: u64,  // Ledger timestamp when archived
 }
 
 /// Beneficiary status enum - Issue #397

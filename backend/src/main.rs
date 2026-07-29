@@ -186,6 +186,11 @@ async fn main() {
             "/api/vaults/:vault_id/simulate-release",
             get(routes::simulate_release),
         )
+        .route(
+            "/api/vaults/:vault_id/sponsored-release",
+            post(routes::create_sponsored_release)
+                .get(routes::get_sponsored_releases),
+        )
         .layer(build_cors_layer())
         .with_state(state);
 
