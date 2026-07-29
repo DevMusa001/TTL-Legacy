@@ -335,3 +335,52 @@ pub struct NotificationPreferencesRequest {
     pub channels: Vec<NotificationChannel>,
     pub frequency: NotificationFrequency,
 }
+
+// ── Issue #1099: Vault Health Score ──────────────────────────────────────────
+
+/// Per-factor breakdown used in the health score response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthFactors {
+    /// 0-30: how much TTL buffer remains relative to check-in interval (30% weight)
+    pub ttl_buffer: u8,
+    /// 0-20: check-in streak contribution (20% weight)
+    pub streak: u8,
+    /// 0-30: balance relative to a 1000-unit healthy threshold (30% weight)
+    pub balance: u8,
+    /// 0-20: passkey diversity contribution (20% weight)
+    pub passkey_diversity: u8,
+}
+
+/// Response body for `GET /api/vaults/{id}/health`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultHealthResponse {
+    pub score: u8,
+    pub factors: HealthFactors,
+    /// RFC-3339 timestamp when this score was computed.
+    pub computed_at: DateTime<Utc>,
+}
+
+// ── Issue #1100: Bulk Vault Summary ──────────────────────────────────────────
+
+/// Request body for `POST /api/vaults/bulk-summary`.
+#[derive(Debug, Deserialize)]
+pub struct BulkSummaryRequest {
+    pub vault_ids: Vec<String>,
+}
+
+/// A single vault summary entry in the bulk response.
+/// `None` fields indicate the vault was not found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSummaryEntry {
+    pub vault_id: String,
+    pub status: Option<VaultStatus>,
+    pub ttl_remaining: Option<u64>,
+    pub balance: Option<i128>,
+    pub last_check_in: Option<DateTime<Utc>>,
+}
+
+/// Response body for `POST /api/vaults/bulk-summary`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BulkSummaryResponse {
+    pub summaries: Vec<VaultSummaryEntry>,
+}
