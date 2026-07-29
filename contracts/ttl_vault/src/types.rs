@@ -68,6 +68,11 @@ pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const EMERGENCY_RECOVERY_GENERATED_TOPIC: Symbol = symbol_short!("erc_gen");
 pub const EMERGENCY_RECOVERY_USED_TOPIC: Symbol = symbol_short!("erc_used");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
+// Issue #944: beneficiary delegation to proxy
+pub const BEN_CLAIM_DELEG_TOPIC: Symbol = symbol_short!("cl_deleg");
+pub const PROXY_CLAIM_TOPIC: Symbol = symbol_short!("prxy_clm");
+// Issue #945: beneficiary conditional threshold escalation
+pub const ACCEPTANCE_CONDITIONS_SET_TOPIC: Symbol = symbol_short!("acc_cnds");
 pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
 // Biometric binding events
 pub const BIND_PASSKEY_BIOMETRIC_TOPIC: Symbol = symbol_short!("bind_pk");
@@ -477,6 +482,10 @@ pub enum DataKey {
     /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
     /// are all rejected with `ContractError::VaultFrozen`.
     VaultFrozen(u64),
+    // Issue #944: beneficiary delegation of claim rights to a proxy address
+    BeneficiaryClaimDelegation(u64),
+    // Issue #945: beneficiary conditional threshold escalation conditions
+    AcceptanceConditions(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -961,6 +970,14 @@ pub struct ConditionalAcceptanceEntry {
 pub struct BeneficiaryConditionalAcceptance {
     pub min_balance_threshold: i128,
     pub accepted_at: u64,
+}
+
+/// Beneficiary delegation of claim rights to a trusted proxy address - Issue #944
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryClaimDelegation {
+    pub proxy: Address,
+    pub expiry: u64,
 }
 
 /// Beneficiary identity verification entry.
