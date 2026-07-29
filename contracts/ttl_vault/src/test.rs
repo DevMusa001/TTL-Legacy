@@ -7451,3 +7451,108 @@ fn test_withdraw_succeeds_when_2fa_enabled_and_verified() {
     client.withdraw(&vault_id, &owner, &100i128);
     assert_eq!(client.get_vault(&vault_id).balance, 900i128);
 }
+
+
+// ---- beneficiary contract validation tests ----
+
+#[test]
+fn test_create_vault_rejects_contract_as_beneficiary() {
+    let (env, owner, _, _, _, client) = setup();
+    
+    // Register a contract as beneficiary
+    let contract_beneficiary = env.register_contract(None, TtlVaultContract);
+    
+    // Attempt to create vault with contract as beneficiary should fail
+    let result = client.try_create_vault(&owner, &contract_beneficiary, &100u64, &None);
+    assert!(result.is_err());
+    
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(96)); // BeneficiaryMustBeAccount
+}
+
+#[test]
+fn test_create_vault_accepts_account_as_beneficiary() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    
+    // Create vault with regular account as beneficiary should succeed
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Verify vault was created
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.beneficiary, beneficiary);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_update_beneficiary_rejects_contract_as_new_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    // Create a vault first
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Register a contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    
+    // Wait for timelock to expire (24 hours)
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    
+    // Attempt to update beneficiary to contract should fail
+    let result = client.try_update_beneficiary(&vault_id, &owner, &contract_address);
+    assert!(result.is_err());
+    
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(96)); // BeneficiaryMustBeAccount
+}
+
+#[test]
+fn test_update_beneficiary_accepts_account_as_new_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    // Create a vault first
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Generate a new account as beneficiary
+    let new_beneficiary = Address::generate(&env);
+    
+    // Update beneficiary should succeed
+    let result = client.try_update_beneficiary(&vault_id, &owner, &new_beneficiary);
+    assert!(result.is_ok());
+    
+    // Verify the pending update was initiated
+    let pending = client.get_pending_beneficiary_update(&vault_id);
+    assert!(pending.is_some());
+}
+
+#[test]
+fn test_create_vault_with_generated_account_succeeds() {
+    let (env, owner, _, _, _, client) = setup();
+    
+    // Generate a random account address
+    let beneficiary = Address::generate(&env);
+    
+    // Create vault with generated account as beneficiary should succeed
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Verify vault was created
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.beneficiary, beneficiary);
+}
+
+#[test]
+fn test_contract_vs_account_addresses_are_distinct() {
+    let (env, owner, account_beneficiary, _, _, client) = setup();
+    
+    // Register a contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    
+    // Contract address and account address should be different
+    assert_ne!(contract_address, account_beneficiary);
+    
+    // Creating vault with account should succeed
+    let vault_id1 = client.create_vault(&owner, &account_beneficiary, &100u64, &None);
+    assert!(vault_id1 > 0);
+    
+    // Creating vault with contract should fail
+    let result = client.try_create_vault(&owner, &contract_address, &100u64, &None);
+    assert!(result.is_err());
+}
