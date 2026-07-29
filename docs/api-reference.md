@@ -161,3 +161,33 @@ pub struct CountdownConfig {
 ### Integration example
 
 An off-chain keeper calls `check_countdown` on a schedule (e.g. every hour). When the vault TTL drops below a threshold, the contract emits a `cd_notif` event. The keeper reads the event and dispatches email/SMS/push reminders via the backend reminder service.
+
+---
+
+## Vault Lifecycle Metrics
+
+### `get_state_transition_count`
+
+```rust
+get_state_transition_count(vault_id: u64) -> u64
+```
+
+Returns the number of recorded entries in the vault's state transition audit trail (see `get_state_transition_log`), without deserializing the full log. Useful for dashboards that only need to gauge activity level.
+
+---
+
+## Multi-Sig Queries
+
+### `get_multisig_proposal_status`
+
+```rust
+get_multisig_proposal_status(vault_id: u64, proposal_id: u64) -> ProposalStatus
+```
+
+Returns just the `status` field of a multi-sig proposal, without deserializing the full `MultiSigProposal` struct. Intended for lightweight polling of proposal state.
+
+**Errors**
+
+| Error               | Code | Condition                          |
+|----------------------|------|-------------------------------------|
+| `ProposalNotFound`   | 44   | No proposal exists with that ID    |

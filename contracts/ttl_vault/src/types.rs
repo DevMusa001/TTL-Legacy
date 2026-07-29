@@ -52,8 +52,245 @@ pub enum DataKey {
     PendingAdmin,
     MinCheckInInterval,
     MaxCheckInInterval,
-    Lending(u64),
-    CountdownConfig(u64),
+    Version,
+    VestingSchedule(u64, u32),
+    VestingPenalty(u64, u32),
+    VestingPendingClaim(u64, u32),
+    VestingScheduleCount(u64),
+    MilestoneVestingSchedule(u64),
+    CountdownFired(u64),
+    TokenWhitelist(Address),
+    WrappedToken(Address),
+    VaultMetadata(u64),
+    ParentVault(u64),
+    VaultPasskeys(u64),
+    BackupCodes(u64),
+    BeneficiaryDelegate(u64),
+    BeneficiaryDelegationChain(u64),
+    WithdrawalSchedule(u64),
+    DisputeStatus(u64),
+    ConditionalAcceptance(u64),
+    ArchivedVault(u64),
+    MaxTtlSeconds,
+    TtlDecayRate,
+    ReleaseGracePeriodSeconds,
+    BridgeConfig(u32),
+    TokenConversion(u64),
+    TokenStaking(u64),
+    PasskeyUsage(u64),
+    BeneficiaryStatus(u64),
+    PasskeyExpiry(u64, BytesN<32>),
+    PendingOwnership(u64),
+    PendingBeneficiaryUpdate(u64),
+    VaultAuditLog(u64),
+    MultiSigConfig(u64),
+    MultiSigProposal(u64, u64),
+    MultiSigProposalCount(u64),
+    MetadataHistory(u64),
+    CustomMetadataHistory(u64),
+    OwnerVaultCount(Address),
+    // Issue #472: state transition audit trail
+    StateTransitionLog(u64),
+    PasskeyChallenge(u64, BytesN<32>),
+    WithdrawalApprovals(u64),
+    VaultSnapshot(u64, u64),
+    VaultSnapshotTimestamps(u64),
+    // Issue #482: TTL prediction history
+    CheckInHistory(u64),
+    // Issue #873: individual check-in history entry for paginated access
+    CheckInEntry(u64, u32),
+    // Issue #873: ring buffer head pointer for check-in history
+    CheckInHistoryHead(u64),
+    // Issue #873: number of check-in history entries
+    CheckInHistoryLen(u64),
+    CheckInStreak(u64),
+    // Issue #481: proof-of-work nonce
+    CheckInNonce(u64),
+    // Issue #480: check-in delegates
+    CheckInDelegates(u64),
+    // Per-delegation nonce to prevent check-in replay attacks
+    DelegateNonce(u64, Address),
+    // Issue #498: beneficiary proof of life
+    ProofOfLife(u64),
+    // Issue #499: beneficiary release votes
+    ReleaseVotes(u64),
+    ReleaseVoteThreshold(u64),
+    BeneficiaryIdentityOracle(u64),
+    BeneficiaryIdentityVerification(u64),
+    BeneficiaryReleaseTriggers(u64),
+    BeneficiaryTierThreshold(u64, Address),
+    BeneficiaryStatusEntry(u64, Address),
+    // Issue: beneficiary veto of owner-defined release conditions before expiry
+    BeneficiaryReleaseConditionVeto(u64),
+    // Track whether a vault has already been released once to prevent replayed releases
+    ReleaseAttempted(u64),
+    // Hibernation: temporary suspension of check-in requirement
+    Hibernation(u64),
+    LastCheckInTime(u64),
+    MinCheckInCooldown,
+    VaultDuplicate(Address, Address, u64),
+    BeneficiaryRotationSchedule(u64),
+    CheckInGeoLog(u64),
+    TtlBorrow(u64),
+    // Issue #553: encrypted backup codes
+    EncryptedBackupCodes(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #572: Withdrawal Dispute
+    WithdrawalDisputes(u64),
+    // Issue #565: withdrawal scheduling validation
+    WithdrawalScheduleValidation(u64),
+    // Issue #566: withdrawal limits by time
+    WithdrawalLimit(u64),
+    WithdrawalTracker(u64),
+    // Issue #567: withdrawal destination whitelist
+    WithdrawalWhitelist(u64),
+    // Issue #568: withdrawal reversal
+    WithdrawalReversal(u64, u64), // (vault_id, withdrawal_id)
+    WithdrawalReversalCounter(u64),
+    // Issue #545: vesting catch-up
+    VestingCatchUp(u64),
+    // Issue #546: vesting bonus
+    VestingBonus(u64),
+    // Issue #584: yield distribution config
+    YieldDistributionConfig(u64),
+    // Issue #585: token lending
+    TokenLending(u64),
+    // Issue #586: token collateral
+    TokenCollateral(u64),
+    // Issue #587: token hedging
+    TokenHedge(u64),
+    // Issue #588: token rebalancing
+    TokenRebalance(u64),
+    // Issue #529: beneficiary pooling
+    BeneficiaryPool(u64),
+    BeneficiaryPoolAlloc(u64),
+    // Issue #525: beneficiary vesting schedules
+    BeneficiaryVestingSchedule(u64, Address),
+    BeneficiaryVestingCount(u64),
+    // Issue #527: beneficiary auctions
+    BeneficiaryAuction(u64),
+    BeneficiaryAuctionBid(u64, Address),
+    BeneficiaryAuctionCount,
+    // Issue #809: two-step protocol configuration
+    PendingProtocolConfig,
+    ProtocolConfigProposedAt,
+    // Issue #871: metadata UTF-8 enforcement
+    RequireUtf8Metadata,
+    // Issue #796: open proposals tracking
+    OpenProposals(u64),
+    // Issue #965: two-factor authentication
+    TwoFactorConfig(u64),
+    TwoFactorVerified(u64),
+    /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
+    /// are all rejected with `ContractError::VaultFrozen`.
+    VaultFrozen(u64),
+}
+
+/// Check-in history entry for TTL prediction - Issue #482
+#[contracttype]
+#[derive(Clone)]
+pub struct CheckInHistoryEntry {
+    pub timestamp: u64,
+}
+
+/// Check-in streak tracking - Issue #482
+#[contracttype]
+#[derive(Clone)]
+pub struct CheckInStreak {
+    pub current: u32,
+    pub best: u32,
+    pub last_timestamp: u64,
+}
+
+/// A vesting schedule attached to a vault.
+/// Funds are released in `num_installments` equal tranches, each separated by `interval` seconds.
+/// The first installment becomes claimable at `start_time`.
+/// If `cliff_period` > 0, no installments can be claimed until `start_time + cliff_period` has elapsed.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingSchedule {
+    /// Unix timestamp when the first installment becomes claimable.
+    pub start_time: u64,
+    /// Seconds between consecutive installments.
+    pub interval: u64,
+    /// Total number of installments.
+    pub num_installments: u32,
+    /// Number of installments already claimed.
+    pub claimed_installments: u32,
+    /// Total amount to vest (in stroops). Each installment = total_amount / num_installments,
+    /// with the last installment absorbing any remainder.
+    pub total_amount: i128,
+    /// Cliff duration in seconds from `start_time`. No funds are claimable until
+    /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
+    pub cliff_period: u64,
+}
+
+/// Penalty configuration for late-claim vesting installments.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingPenaltyConfig {
+    /// Penalty in basis points (e.g., 500 = 5%).
+    pub penalty_bps: u32,
+    /// Seconds after an installment unlocks before the penalty applies.
+    pub grace_period_seconds: u64,
+}
+
+/// A pending vesting claim awaiting finalization (Issue #548).
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingPendingClaim {
+    /// Amount escrowed for the beneficiary.
+    pub amount: i128,
+    /// Address that will receive the funds once finalized.
+    pub beneficiary: Address,
+    /// Timestamp when the pending claim was initiated.
+    pub initiated_at: u64,
+    /// Timestamp after which the reversal window closes.
+    pub reversal_deadline: u64,
+    /// Updated claimed_installments value (used for rollback on reversal).
+    pub new_installments_claimed: u32,
+    /// Previous claimed_installments value before initiation.
+    pub prev_installments_claimed: u32,
+}
+
+/// A single milestone entry in a milestone-based vesting schedule.
+/// Each milestone represents a condition (e.g., company revenue target) that,
+/// when fulfilled, unlocks a portion of the vault's funds.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneEntry {
+    /// Human-readable label for the milestone (e.g., "Revenue reaches $1M")
+    pub label: String,
+    /// The target value that must be reached to fulfill this milestone
+    pub target_value: i128,
+    /// The current reported progress toward the target
+    pub current_value: i128,
+    /// Basis points of total_amount allocated to this milestone (must sum to 10_000 across all milestones)
+    pub bps: u32,
+    /// Whether this milestone has been marked as fulfilled (current_value >= target_value)
+    pub is_fulfilled: bool,
+    /// Whether funds for this milestone have been claimed
+    pub claimed: bool,
+}
+
+/// Milestone-based vesting schedule attached to a vault.
+/// Instead of releasing funds on a time-based schedule, funds are released
+/// when external milestones (e.g., company revenue targets) are met,
+/// as reported by a designated oracle address.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneVestingSchedule {
+    /// Total amount to vest across all milestones
+    pub total_amount: i128,
+    /// The list of milestones with their targets and current progress
+    pub milestones: Vec<MilestoneEntry>,
+    /// Total amount already claimed from fulfilled milestones
+    pub claimed_amount: i128,
+    /// Address authorized to report milestone progress
+    pub oracle: Address,
+    /// Whether vesting is paused (progress reporting and claiming blocked)
+    pub paused: bool,
 }
 
 #[contracttype]
