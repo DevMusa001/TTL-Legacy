@@ -680,3 +680,135 @@ pub struct SimulateReleaseResponse {
     pub simulated_at: DateTime<Utc>,
 }
 
+
+// ── #1101: Reminder Escalation ───────────────────────────────────────────────
+
+/// Escalation tier for unresponsive vault owners.
+/// T1: 7 days before expiry  → email
+/// T2: 3 days before expiry  → email + SMS
+/// T3: 24 h  before expiry   → all channels + emergency contact
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationTier {
+    T1,
+    T2,
+    T3,
+}
+
+impl EscalationTier {
+    /// Hours before TTL expiry at which this tier fires.
+    pub fn hours_before_expiry(self) -> u32 {
+        match self {
+            EscalationTier::T1 => 168, // 7 days
+            EscalationTier::T2 => 72,  // 3 days
+            EscalationTier::T3 => 24,  // 24 hours
+        }
+    }
+}
+
+/// Persisted escalation state for a single vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationState {
+    pub vault_id: u64,
+    /// Highest tier already dispatched (None = no escalation yet).
+    pub last_escalation_tier: Option<EscalationTier>,
+    /// When the last escalation was dispatched.
+    pub escalated_at: Option<DateTime<Utc>>,
+}
+
+/// A single escalation audit event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationEvent {
+    pub id: String,
+    pub vault_id: u64,
+    pub tier: EscalationTier,
+    pub dispatched_at: DateTime<Utc>,
+    /// Channels actually used for this escalation.
+    pub channels: Vec<String>,
+}
+
+// ── #1102: Webhook Delivery Retry ────────────────────────────────────────────
+
+/// Delivery status of a single webhook event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDeliveryStatus {
+    Pending,
+    Delivered,
+    Retrying,
+    DeliveryFailed,
+}
+
+/// A single webhook delivery attempt log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookAttempt {
+    pub attempted_at: DateTime<Utc>,
+    pub http_status: Option<u16>,
+    pub response_body: String,
+    pub error: Option<String>,
+}
+
+/// Persisted webhook delivery job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub vault_id: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub endpoint_url: String,
+    pub status: WebhookDeliveryStatus,
+    pub attempt_count: u32,
+    /// When the next retry should fire.
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub attempts: Vec<WebhookAttempt>,
+}
+
+/// Request to register a webhook endpoint for a vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterWebhookRequest {
+    pub vault_id: String,
+    pub endpoint_url: String,
+    pub event_types: Vec<String>,
+}
+
+/// Registered webhook subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSubscription {
+    pub id: String,
+    pub vault_id: String,
+    pub endpoint_url: String,
+    pub event_types: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── #1104: Vault Timeline event types ────────────────────────────────────────
+
+/// Timeline event displayed in the vault status history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineEventKind {
+    Created,
+    Deposited,
+    CheckedIn,
+    Hibernated,
+    Released,
+    EscalationSent,
+    WebhookDelivered,
+    WebhookFailed,
+}
+
+/// A single vault timeline entry returned by GET /api/vaults/{id}/events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub id: String,
+    pub vault_id: String,
+    pub kind: TimelineEventKind,
+    pub timestamp: DateTime<Utc>,
+    /// Human-readable description.
+    pub description: String,
+    /// Optional amount (deposits, withdrawals).
+    pub amount: Option<i128>,
+    /// Any extra metadata.
+    pub metadata: serde_json::Value,
+}
