@@ -97,6 +97,8 @@ pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
 // Issue #480: check-in delegation events
 pub const DELEGATE_CHECKIN_TOPIC: Symbol = symbol_short!("del_ci");
 pub const REVOKE_DELEGATE_TOPIC: Symbol = symbol_short!("rev_del");
+/// Emitted when check-in score is updated - Issue #947
+pub const CHECKIN_SCORE_UPDATED_TOPIC: Symbol = symbol_short!("ci_score");
 // Issue #481: proof-of-work event
 pub const CHECKIN_POW_TOPIC: Symbol = symbol_short!("ci_pow");
 // Issue #482: TTL prediction event
@@ -255,6 +257,9 @@ pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
 // Inactivity penalty
 pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
 
+// Issue #1163: CheckInRecorded event emitted on successful check-in
+pub const CHECK_IN_RECORDED_TOPIC: Symbol = symbol_short!("ci_rec");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
@@ -400,6 +405,8 @@ pub enum DataKey {
     CheckInDelegates(u64),
     // Per-delegation nonce to prevent check-in replay attacks
     DelegateNonce(u64, Address),
+    // Issue #946: expiry timestamp for each check-in delegate
+    CheckInDelegateExpiry(u64, Address),
     // Issue #498: beneficiary proof of life
     ProofOfLife(u64),
     // Issue #499: beneficiary release votes
@@ -424,6 +431,10 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #572: Withdrawal Dispute
+    WithdrawalDisputes(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time
@@ -690,7 +701,7 @@ pub struct PasskeyHash {
 #[contracttype]
 #[derive(Clone)]
 pub struct BackupCode {
-    pub code: String,
+    pub hash: BytesN<32>,
     pub used: bool,
 }
 
@@ -776,6 +787,29 @@ pub struct RecurringWithdrawal {
     pub next_at: u64,
 }
 
+/// Loan terms for a token loan advanced into a vault by a lender. The vault
+/// owner must repay `amount` (plus a late penalty if repaid after
+/// `repayment_deadline`) to fully settle the loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub lender: Address,
+    pub amount: i128,
+    pub repayment_deadline: u64, // ledger timestamp
+    pub late_penalty_bps: u32,
+    pub repaid: bool,
+}
+
+/// Point-in-time status snapshot for a single vault, used by batch status lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub ttl_remaining: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Vault {
@@ -822,6 +856,12 @@ pub struct Vault {
     pub challenge_timeout_seconds: u64,
     /// Multi-sig passkey threshold for withdrawals - Issue #939
     pub multi_sig_threshold: u32,
+    /// Check-in score (0-10000) for tracking consistency - Issue #947
+    pub check_in_score: u32,
+    /// Total number of check-ins recorded - Issue #947
+    pub total_check_ins: u32,
+    /// Number of on-time check-ins - Issue #947
+    pub on_time_check_ins: u32,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -839,6 +879,15 @@ pub struct PasskeyAnalytics {
     pub passkey_hash: BytesN<32>,
     pub usage_count: u64,
     pub last_used_timestamp: u64,
+}
+
+/// Archived vault metadata - Issue #1123
+/// Stores information about archived vaults in cheaper persistent storage
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo {
+    pub vault: Vault,
+    pub archived_at: u64,  // Ledger timestamp when archived
 }
 
 /// Beneficiary status enum - Issue #397
