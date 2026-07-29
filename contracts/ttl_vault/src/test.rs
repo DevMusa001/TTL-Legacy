@@ -322,6 +322,37 @@ fn test_check_in_emits_event_with_correct_topic() {
     assert!(check_in_event.is_some(), "check_in event not emitted");
 }
 
+// ---- Issue #1163: CheckInRecorded event emission test ----
+
+#[test]
+fn test_check_in_emits_check_in_recorded_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    env.mock_all_auths();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Capture the timestamp at creation
+    let creation_timestamp = env.ledger().timestamp();
+
+    // Advance time slightly
+    env.ledger().with_mut(|l| l.timestamp += 10);
+    let check_in_timestamp = env.ledger().timestamp();
+
+    client.check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64);
+
+    let events = env.events().all();
+    let recorded_event = events.iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        if topics.len() < 2 {
+            return false;
+        }
+        let topic0: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        topic0.map(|s| s == types::CHECK_IN_RECORDED_TOPIC).unwrap_or(false)
+    });
+
+    assert!(recorded_event.is_some(), "CheckInRecorded event not emitted");
+}
+
 // ---- TTL warning event boundary tests ----
 
 /// Helper: returns true when a TTL_WARNING_TOPIC event ("ttl_warn") was emitted for `vault_id`.
