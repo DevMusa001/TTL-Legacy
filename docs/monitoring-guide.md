@@ -224,6 +224,18 @@ Tags: error=true
 | `backup_vault_handler` | `vault_id` | Vault state backup |
 | `restore_vault_handler` | `backup_id` | Vault state restore |
 | `set_notification_preferences_handler` | `vault_id` | Notification preference update |
+| `list_vault_reminders` | `vault_id` | List reminder preferences for a vault |
+| `set_preferences` | `vault_id` | Set reminder preferences |
+| `get_preferences` | `vault_id` | Get reminder preferences |
+| `delete_preferences` | `vault_id` | Delete reminder preferences |
+| `unsubscribe` | — | Process unsubscribe request |
+| `schedule_expiry_warning` | `vault_id` | Schedule expiry warning notification |
+| `schedule_immediate` | `vault_id`, `notification_type` | Schedule immediate notification |
+| `flush_pending` | — | Dispatch all due notifications |
+| `flush_retries` | — | Retry failed notifications |
+| `deliver_with_retry` | `vault_id`, `notification_type`, `attempt` | Single notification delivery with retry |
+| `run` | — | Scheduler main loop (reminder + TTL insurance) |
+| `extend_ttl_for_inactive_owners` | — | TTL extension for inactive vault owners |
 | `stellar.rpc` | `stellar.contract_id`, `db.operation` | Outbound Soroban RPC call |
 
 ### Propagating Trace Context
