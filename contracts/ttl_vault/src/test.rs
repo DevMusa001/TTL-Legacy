@@ -124,6 +124,45 @@ fn test_vault_exists_for_existing_and_missing_ids() {
 }
 
 #[test]
+fn test_get_owner_returns_correct_owner() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(client.get_owner(&vault_id), owner);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_get_owner_panics_for_nonexistent_vault() {
+    let (_, _, _, _, _, client) = setup();
+    client.get_owner(&9999u64);
+}
+
+#[test]
+fn test_create_vault_emits_vault_created_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let events = env.events().all();
+    let created_event = events.iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::VAULT_CREATED_TOPIC)
+            .unwrap_or(false)
+    });
+
+    assert!(created_event.is_some(), "VaultCreated event not emitted");
+    let data: (u64, Address, Address, u64, u64) = created_event.unwrap().2.into_val(&env);
+    assert_eq!(data.0, vault_id);
+    assert_eq!(data.1, owner);
+    assert_eq!(data.2, beneficiary);
+    assert_eq!(data.3, 100u64);
+}
+
+#[test]
 fn test_get_release_status_view() {
     let (env, owner, beneficiary, _, token_address, client) = setup();
 
@@ -3869,6 +3908,23 @@ fn test_update_beneficiary_owner_only() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_update_beneficiary_fails_after_vault_released() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    let new_beneficiary = Address::generate(&env);
+    let err = client
+        .try_update_beneficiary(&vault_id, &owner, &new_beneficiary)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}
+
 
 // ---- Issue #402: Withdrawal Scheduling Tests ----
 
@@ -5619,6 +5675,36 @@ fn test_get_hibernation_returns_none_when_not_hibernating() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert!(client.get_hibernation(&id).is_none());
+}
+
+#[test]
+fn test_is_hibernating_true_while_active() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+
+    assert!(client.is_hibernating(&id));
+}
+
+#[test]
+fn test_is_hibernating_false_once_expired() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 7200);
+
+    assert!(!client.is_hibernating(&id));
+}
+
+#[test]
+fn test_is_hibernating_false_when_never_hibernated() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    assert!(!client.is_hibernating(&id));
 }
 
 // ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
