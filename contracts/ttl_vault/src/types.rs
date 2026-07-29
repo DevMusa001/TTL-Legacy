@@ -423,6 +423,10 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
+    // Issue #569: Withdrawal Audit Trail
+    WithdrawalAuditLog(u64),
+    // Issue #572: Withdrawal Dispute
+    WithdrawalDisputes(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time
@@ -771,6 +775,29 @@ pub struct RecurringWithdrawal {
     pub next_at: u64,
 }
 
+/// Loan terms for a token loan advanced into a vault by a lender. The vault
+/// owner must repay `amount` (plus a late penalty if repaid after
+/// `repayment_deadline`) to fully settle the loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub lender: Address,
+    pub amount: i128,
+    pub repayment_deadline: u64, // ledger timestamp
+    pub late_penalty_bps: u32,
+    pub repaid: bool,
+}
+
+/// Point-in-time status snapshot for a single vault, used by batch status lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub ttl_remaining: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Vault {
@@ -840,6 +867,15 @@ pub struct PasskeyAnalytics {
     pub passkey_hash: BytesN<32>,
     pub usage_count: u64,
     pub last_used_timestamp: u64,
+}
+
+/// Archived vault metadata - Issue #1123
+/// Stores information about archived vaults in cheaper persistent storage
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo {
+    pub vault: Vault,
+    pub archived_at: u64,  // Ledger timestamp when archived
 }
 
 /// Beneficiary status enum - Issue #397
