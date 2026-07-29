@@ -19,8 +19,8 @@ use types::{
     TokenCollateral, TokenConversion, TokenHedge, TokenLending, TokenRebalanceConfig, TokenStaking,
     TokenWeight, TtlBorrowRecord, Vault, VaultStatusSummary, VestingBonusConfig,
     VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim, VestingSchedule,
-    WhitelistEntry, WithdrawalLimit, WithdrawalReversal, WithdrawalScheduleEntry,
-    WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
+    WhitelistEntry, WithdrawalAuditEntry, WithdrawalDispute, WithdrawalLimit, WithdrawalReversal,
+    WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC, BACKUP_CODES_ENCRYPTED_TOPIC, BACKUP_CODES_GENERATED_TOPIC,
     BACKUP_CODE_USED_TOPIC, BATCH_CHECKIN_TOPIC, BATCH_STATUS_TOPIC, BENEFICIARY_ACCEPTED_TOPIC,
@@ -97,6 +97,12 @@ mod vault_expiry_tests;
 mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
+#[cfg(test)]
+mod checkin_email_token_tests;
+#[cfg(test)]
+mod checkin_streak_bonus_tests;
+#[cfg(test)]
+mod beneficiary_confirmation_tests;
 
 
 #[cfg(test)]
@@ -1258,6 +1264,7 @@ impl TtlVaultContract {
         if env.ledger().timestamp() < proposed_at + ADMIN_TRANSFER_TIMELOCK {
             panic_with_error!(&env, ContractError::AdminTransferTimeLocked);
         }
+        let old_admin = Self::load_admin(&env);
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage()
@@ -1266,8 +1273,12 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events()
-            .publish((ADMIN_TRANSFER_COMPLETED_TOPIC,), pending);
+        let accepted_at = env.ledger().timestamp();
+        // Issue #1135: emit old_admin/new_admin/accepted_at for monitoring
+        env.events().publish(
+            (ADMIN_TRANSFER_COMPLETED_TOPIC,),
+            (old_admin, pending, accepted_at),
+        );
     }
 
     // --- vault lifecycle ---
@@ -1823,6 +1834,18 @@ impl TtlVaultContract {
         if caller != vault.owner {
             Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Not owner");
             return Err(ContractError::NotOwner);
+        }
+        // Issue #1138: require a live 2FA verification before withdrawal when enabled
+        if Self::is_2fa_enabled(&env, vault_id) && !Self::is_2fa_verified(&env, vault_id) {
+            Self::record_withdrawal_audit(
+                &env,
+                vault_id,
+                &caller,
+                amount,
+                false,
+                "2FA verification required",
+            );
+            return Err(ContractError::TwoFactorRequired);
         }
         if vault.status == ReleaseStatus::EmergencyFrozen {
             Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, "Vault frozen");
@@ -5556,8 +5579,6 @@ impl TtlVaultContract {
         Self::save_vault(&env, vault_id, &vault);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((SET_BURN_PERCENTAGE_TOPIC, vault_id), percentage);
-    }
-
     }
 
     /// Checks if a vault exists.
@@ -11273,6 +11294,21 @@ impl TtlVaultContract {
             .get::<DataKey, MultiSigProposal>(&DataKey::MultiSigProposal(vault_id, proposal_id))
     }
 
+    /// Returns just the status of a proposal, without deserializing the full
+    /// struct (Issue #1137). Returns `ContractError::ProposalNotFound` for
+    /// unknown proposal IDs.
+    pub fn get_multisig_proposal_status(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, ContractError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&DataKey::MultiSigProposal(vault_id, proposal_id))
+            .map(|proposal| proposal.status)
+            .ok_or(ContractError::ProposalNotFound)
+    }
+
     /// Returns the current proposal count for a vault.
     pub fn get_multisig_proposal_count(env: Env, vault_id: u64) -> u64 {
         env.storage()
@@ -11366,6 +11402,17 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::StateTransitionLog(vault_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the number of recorded state transitions for a vault, without
+    /// deserializing the full log (Issue #1136).
+    pub fn get_state_transition_count(env: Env, vault_id: u64) -> u64 {
+        let log: Vec<StateTransitionEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StateTransitionLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        log.len() as u64
     }
 
     // ── Issue #473: Vault Ownership Proof ────────────────────────────────────
@@ -12596,6 +12643,33 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::Hibernation(vault_id))
+    }
+
+    /// Returns whether a vault is currently hibernating.
+    ///
+    /// A vault counts as hibernating only while its hibernation window is
+    /// still open; once the elapsed time reaches `duration_seconds` the
+    /// vault is treated as no longer hibernating even if `exit_hibernation`
+    /// has not yet been called.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// `true` if the vault has an active (non-expired) hibernation entry
+    pub fn is_hibernating(env: Env, vault_id: u64) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id))
+        {
+            Some(entry) => {
+                let now = env.ledger().timestamp();
+                now.saturating_sub(entry.started_at) < entry.duration_seconds
+            }
+            None => false,
+        }
     }
 
     fn get_delegated_beneficiary(env: &Env, vault_id: u64) -> Option<Address> {
@@ -14481,5 +14555,177 @@ impl TtlVaultContract {
     pub fn get_withdrawal_rate_limit(env: Env, vault_id: u64) -> Option<(i128, u64)> {
         let vault = Self::load_vault(&env, vault_id);
         vault.withdrawal_limit_per_window.map(|limit| (limit, vault.withdrawal_window_seconds))
+    }
+
+    // --- Issue #569: Withdrawal Audit Trail ---
+
+    /// Records a withdrawal attempt (successful or failed) in the audit trail.
+    fn record_withdrawal_audit(
+        env: &Env,
+        vault_id: u64,
+        caller: &Address,
+        amount: i128,
+        success: bool,
+        error_reason: &str,
+    ) {
+        let timestamp = env.ledger().timestamp();
+        let audit_entry = WithdrawalAuditEntry {
+            vault_id,
+            caller: caller.clone(),
+            amount,
+            timestamp,
+            success,
+            error_reason: String::from_str(env, error_reason),
+        };
+
+        let key = DataKey::WithdrawalAuditLog(vault_id);
+        let mut audit_log: Vec<WithdrawalAuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        audit_log.push_back(audit_entry);
+
+        let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
+        env.storage().persistent().set(&key, &audit_log);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.events().publish(
+            (WITHDRAWAL_AUDIT_TOPIC, vault_id),
+            (caller, amount, success, timestamp),
+        );
+
+        if !success {
+            env.events().publish(
+                (WITHDRAWAL_FAILED_TOPIC, vault_id),
+                (caller, amount, String::from_str(env, error_reason)),
+            );
+        }
+    }
+
+    /// Retrieves the withdrawal audit trail for a vault.
+    pub fn get_withdrawal_audit_log(env: Env, vault_id: u64) -> Vec<WithdrawalAuditEntry> {
+        let key = DataKey::WithdrawalAuditLog(vault_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // --- Issue #572: Withdrawal Dispute ---
+
+    /// Files a dispute for a withdrawal within the grace period (24 hours).
+    pub fn file_withdrawal_dispute(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let timestamp = env.ledger().timestamp();
+        let grace_period = 86_400u64; // 24 hours
+        let dispute_expires_at = timestamp + grace_period;
+
+        let dispute = WithdrawalDispute {
+            vault_id,
+            withdrawal_timestamp: timestamp,
+            dispute_filed_at: timestamp,
+            dispute_expires_at,
+            status: DisputeStatus::Filed,
+            reason: reason.clone(),
+            resolved_at: None,
+        };
+
+        let key = DataKey::WithdrawalDisputes(vault_id);
+        let mut disputes: Vec<WithdrawalDispute> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        disputes.push_back(dispute);
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &disputes);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_DISPUTE_FILED_TOPIC, vault_id),
+            (&caller, timestamp, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Resolves a withdrawal dispute.
+    pub fn resolve_withdrawal_dispute(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        dispute_index: u32,
+        approved: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::WithdrawalDisputes(vault_id);
+        let mut disputes: Vec<WithdrawalDispute> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::DisputeFiled)?;
+
+        if dispute_index >= disputes.len() {
+            return Err(ContractError::DisputeFiled);
+        }
+
+        let mut dispute = disputes.get(dispute_index).unwrap();
+        dispute.status = if approved {
+            DisputeStatus::Resolved
+        } else {
+            DisputeStatus::None
+        };
+        dispute.resolved_at = Some(env.ledger().timestamp());
+
+        disputes.set(dispute_index, dispute.clone());
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &disputes);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_DISPUTE_RESOLVED_TOPIC, vault_id),
+            (&caller, dispute_index, approved),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieves all withdrawal disputes for a vault.
+    pub fn get_withdrawal_disputes(env: Env, vault_id: u64) -> Vec<WithdrawalDispute> {
+        let key = DataKey::WithdrawalDisputes(vault_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
