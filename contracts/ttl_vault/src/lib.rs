@@ -97,6 +97,8 @@ mod vault_expiry_tests;
 mod vault_pause_tests;
 #[cfg(test)]
 mod passkey_device_type_tests;
+#[cfg(test)]
+mod deposit_invalid_amount_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
