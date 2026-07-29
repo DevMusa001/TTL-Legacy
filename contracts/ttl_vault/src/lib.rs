@@ -70,6 +70,7 @@ use types::{
     WITHDRAW_TOPIC, WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
     YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
     UPGRADE_PROPOSED_TOPIC, UPGRADE_EXECUTED_TOPIC, UPGRADE_CANCELLED_TOPIC,
+    TOKEN_ALLOWLIST_ADDED_TOPIC, TOKEN_ALLOWLIST_REMOVED_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -275,6 +276,7 @@ pub enum ContractError {
     NoPendingUpgrade = 92,         // Issue #1120: Contract upgrade mechanism
     UpgradeTimelocked = 93,        // Issue #1120: Upgrade not yet executable
     UpgradeInvalidWasm = 94,       // Issue #1120: Invalid WASM hash
+    TokenNotAllowed = 95,          // Issue #1118: Token not in allowlist
 }
 
 #[contract]
@@ -15817,5 +15819,162 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .get::<DataKey, UpgradeProposal>(&DataKey::PendingUpgrade)
+    }
+
+    // --- Token Allowlist Management (Issue #1118) ---
+
+    /// Adds a token to the admin-controlled allowlist.
+    ///
+    /// Admin-only operation. Only tokens in the allowlist can be deposited into vaults.
+    /// Adding a token that is already allowed is a no-op.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `token` - Address of the token contract to allow
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    /// * `ContractError::Paused` - If contract is paused
+    pub fn add_allowed_token(env: Env, token: Address) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        Self::require_admin(&env);
+
+        let mut allowed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if token already exists to avoid duplicates
+        for existing_token in allowed.iter() {
+            if existing_token == token {
+                return Ok(());
+            }
+        }
+
+        allowed.push_back(token.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedTokens, &allowed);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AllowedTokens,
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+
+        let admin = Self::load_admin(&env);
+        Self::log_audit_entry(&env, 0, "add_allowed_token", &admin, "");
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TOKEN_ALLOWLIST_ADDED_TOPIC,),
+            (admin, token),
+        );
+
+        Ok(())
+    }
+
+    /// Removes a token from the admin-controlled allowlist.
+    ///
+    /// Admin-only operation. Removing a non-existent token is a no-op.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `token` - Address of the token contract to disallow
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    /// * `ContractError::Paused` - If contract is paused
+    pub fn remove_allowed_token(env: Env, token: Address) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        Self::require_admin(&env);
+
+        let mut allowed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Find and remove the token
+        let mut found = false;
+        let mut new_allowed = Vec::new(&env);
+        for existing_token in allowed.iter() {
+            if existing_token != token {
+                new_allowed.push_back(existing_token);
+            } else {
+                found = true;
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllowedTokens, &new_allowed);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AllowedTokens,
+                VAULT_TTL_THRESHOLD,
+                VAULT_TTL_LEDGERS,
+            );
+
+            let admin = Self::load_admin(&env);
+            Self::log_audit_entry(&env, 0, "remove_allowed_token", &admin, "");
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+            env.events().publish(
+                (TOKEN_ALLOWLIST_REMOVED_TOPIC,),
+                (admin, token),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Retrieves the current list of allowed tokens.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// `Vec<Address>` containing all allowed token addresses, or empty Vec if none
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Checks if a token is in the allowlist.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `token` - Address of the token to check
+    ///
+    /// # Returns
+    /// `true` if token is allowed, `false` otherwise
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        let allowed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for existing_token in allowed.iter() {
+            if existing_token == token {
+                return true;
+            }
+        }
+        false
     }
 }
