@@ -83,6 +83,11 @@ const DEFAULT_MIN_CHECKIN_COOLDOWN: u64 = 60;
 /// Maximum seconds an owner can accelerate TTL decay per call (30 days).
 const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 
+/// Maximum hibernation duration in seconds.
+/// Soroban's maximum persistent entry TTL is 3_110_400 ledgers at ~5 s/ledger ≈ 180 days.
+/// We cap hibernation at that ceiling so storage extension can never fail.
+pub const MAX_HIBERNATION_SECONDS: u64 = 15_552_000; // 180 days
+
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
 /// interval, capped at the Soroban maximum.
@@ -153,6 +158,7 @@ pub enum ContractError {
     VotingNotEnabled = 54,
     AlreadyHibernating = 55,
     NotHibernating = 56,
+    HibernationDurationTooLong = 57,
 }
 
 #[contract]
@@ -5885,6 +5891,9 @@ impl TtlVaultContract {
         caller.require_auth();
         if duration_seconds == 0 {
             return Err(ContractError::InvalidInterval);
+        }
+        if duration_seconds > MAX_HIBERNATION_SECONDS {
+            return Err(ContractError::HibernationDurationTooLong);
         }
         let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {

@@ -4258,3 +4258,43 @@ fn test_get_hibernation_returns_none_when_not_hibernating() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert!(client.get_hibernation(&id).is_none());
 }
+
+// ── Issue #1097: Hibernate duration validation tests ─────────────────────────
+
+#[test]
+fn test_hibernation_duration_over_max_returns_error() {
+    use crate::MAX_HIBERNATION_SECONDS;
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let over_limit = MAX_HIBERNATION_SECONDS + 1;
+    let result = client.try_enter_hibernation(&id, &owner, &over_limit);
+    assert!(
+        result.is_err(),
+        "expected error for duration > MAX_HIBERNATION_SECONDS"
+    );
+    // Verify the specific error code (57 = HibernationDurationTooLong)
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(57));
+}
+
+#[test]
+fn test_hibernation_duration_exact_max_succeeds() {
+    use crate::MAX_HIBERNATION_SECONDS;
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let result = client.try_enter_hibernation(&id, &owner, &MAX_HIBERNATION_SECONDS);
+    assert!(
+        result.is_ok(),
+        "duration == MAX_HIBERNATION_SECONDS should succeed"
+    );
+}
+
+#[test]
+fn test_hibernation_duration_zero_still_errors() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let result = client.try_enter_hibernation(&id, &owner, &0u64);
+    assert!(result.is_err(), "zero duration should still be rejected");
+}
