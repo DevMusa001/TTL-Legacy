@@ -967,6 +967,29 @@ fn test_partial_release_emits_partial_event() {
 }
 
 #[test]
+fn test_partial_release_rejects_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let attacker = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    // Replace blanket mock_all_auths with specific auth only for the attacker.
+    // Because attacker != vault.owner, vault.owner.require_auth() will fail.
+    env.set_auth(soroban_sdk::testutils::MockAuth::new(vec![
+        &env,
+        soroban_sdk::testutils::MockAuthorizationEntry {
+            contract: &client.address,
+            fn_name: soroban_sdk::symbol_short!("partial_release"),
+            args: (vault_id, 300i128).into_val(&env),
+            invoke_contract: true,
+        },
+    ]));
+
+    let result = client.try_partial_release(&vault_id, &300i128);
+    assert!(result.is_err(), "expected non-owner partial release to be rejected");
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #17)")]
 fn test_update_beneficiary_rejects_owner_as_beneficiary() {
     let (_, owner, beneficiary, _, _, client) = setup();
