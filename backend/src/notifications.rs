@@ -14,6 +14,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tracing::instrument;
 use uuid::Uuid;
 
 // ── Shared store types ───────────────────────────────────────────────────────
@@ -286,6 +287,7 @@ impl NotificationService {
 
     /// Schedule an expiry-warning notification for a vault.
     /// Fires `warning_hours_before` hours before the vault expires.
+    #[instrument(skip(self), fields(vault_id = %vault.id))]
     pub fn schedule_expiry_warning(&self, vault: &Vault) {
         let prefs = self.get_preferences(&vault.owner);
         if !prefs.expiry_warning_enabled {
@@ -324,6 +326,7 @@ impl NotificationService {
     }
 
     /// Schedule an immediate notification (fires now).
+    #[instrument(skip(self), fields(vault_id = %vault_id, notification_type = ?notification_type))]
     pub fn schedule_immediate(
         &self,
         vault_id: &str,
@@ -394,6 +397,7 @@ impl NotificationService {
     // ── Delivery ─────────────────────────────────────────────────────────────
 
     /// Send all due pending notifications. Called by the background scheduler loop.
+    #[instrument(skip(self))]
     pub async fn flush_pending(&self) {
         let due = self.get_pending_notifications();
         for notif in due {
@@ -410,6 +414,7 @@ impl NotificationService {
     }
 
     /// Retry any Retrying notifications whose next_retry_at has passed.
+    #[instrument(skip(self))]
     pub async fn flush_retries(&self) {
         let now = Utc::now();
         let due: Vec<ReminderDeliveryLog> = self
@@ -440,6 +445,7 @@ impl NotificationService {
         self.deliver_with_retry(notif, 0).await;
     }
 
+    #[instrument(skip(self), fields(vault_id = %notif.vault_id, notification_type = ?notif.notification_type, attempt))]
     async fn deliver_with_retry(&self, notif: &ScheduledNotification, attempt: u32) {
         let tokens = self.get_tokens(&notif.owner);
         if tokens.is_empty() {

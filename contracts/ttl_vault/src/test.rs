@@ -376,6 +376,37 @@ fn test_check_in_emits_event_with_correct_topic() {
     assert!(check_in_event.is_some(), "check_in event not emitted");
 }
 
+// ---- Issue #1163: CheckInRecorded event emission test ----
+
+#[test]
+fn test_check_in_emits_check_in_recorded_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    env.mock_all_auths();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Capture the timestamp at creation
+    let creation_timestamp = env.ledger().timestamp();
+
+    // Advance time slightly
+    env.ledger().with_mut(|l| l.timestamp += 10);
+    let check_in_timestamp = env.ledger().timestamp();
+
+    client.check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64);
+
+    let events = env.events().all();
+    let recorded_event = events.iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        if topics.len() < 2 {
+            return false;
+        }
+        let topic0: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        topic0.map(|s| s == types::CHECK_IN_RECORDED_TOPIC).unwrap_or(false)
+    });
+
+    assert!(recorded_event.is_some(), "CheckInRecorded event not emitted");
+}
+
 // ---- TTL warning event boundary tests ----
 
 /// Helper: returns true when a TTL_WARNING_TOPIC event ("ttl_warn") was emitted for `vault_id`.
@@ -1018,6 +1049,29 @@ fn test_partial_release_emits_partial_event() {
         topic0.map(|s| s == soroban_sdk::symbol_short!("partial")).unwrap_or(false)
     });
     assert!(partial_event.is_some(), "partial event not emitted");
+}
+
+#[test]
+fn test_partial_release_rejects_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let attacker = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    // Replace blanket mock_all_auths with specific auth only for the attacker.
+    // Because attacker != vault.owner, vault.owner.require_auth() will fail.
+    env.set_auth(soroban_sdk::testutils::MockAuth::new(vec![
+        &env,
+        soroban_sdk::testutils::MockAuthorizationEntry {
+            contract: &client.address,
+            fn_name: soroban_sdk::symbol_short!("partial_release"),
+            args: (vault_id, 300i128).into_val(&env),
+            invoke_contract: true,
+        },
+    ]));
+
+    let result = client.try_partial_release(&vault_id, &300i128);
+    assert!(result.is_err(), "expected non-owner partial release to be rejected");
 }
 
 #[test]
