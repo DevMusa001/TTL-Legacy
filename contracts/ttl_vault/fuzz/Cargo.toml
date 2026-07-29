@@ -15,3 +15,27 @@ name = "fuzz_vesting"
 path = "src/fuzz_vesting.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_create_vault"
+path = "src/fuzz_create_vault.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_deposit"
+path = "src/fuzz_deposit.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_withdraw"
+path = "src/fuzz_withdraw.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_check_in"
+path = "src/fuzz_check_in.rs"
+test = false
+doc = false
