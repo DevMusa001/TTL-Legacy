@@ -104,7 +104,9 @@ mod checkin_streak_bonus_tests;
 #[cfg(test)]
 mod beneficiary_confirmation_tests;
 
-/// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
+
+#[cfg(test)]
+mod min_checkin_interval_tests;/// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
 pub const VAULT_TTL_THRESHOLD: u32 = 1000;
 
@@ -139,6 +141,10 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
         .saturating_div(LEDGER_SECOND);
     ledgers.clamp(VAULT_TTL_LEDGERS, MAX_PERSISTENT_TTL)
 }
+
+/// Minimum check-in interval: 1 hour (3600 seconds)
+/// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
+pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
 
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -1285,6 +1291,11 @@ impl TtlVaultContract {
         }
         if check_in_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidInterval);
+        }
+        
+        // Issue #1121: Enforce minimum check-in interval (1 hour)
+        if check_in_interval < MIN_CHECK_IN_INTERVAL {
+            panic_with_error!(&env, ContractError::CheckInIntervalTooShort);
         }
 
         Self::assert_interval_in_bounds(&env, check_in_interval);
