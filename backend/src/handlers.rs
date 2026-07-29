@@ -2045,3 +2045,126 @@ pub fn simulate_release_handler(
         simulated_at: now,
     })
 }
+
+// ── Sponsored Release (#1122) ────────────────────────────────────────────────
+
+use crate::fee_sponsorship::*;
+
+/// Handler for POST /api/vaults/{id}/sponsored-release.
+///
+/// Creates a fee-sponsored release transaction for a beneficiary without XLM.
+/// Deducts 0.1% protocol fee and constructs a fee bump transaction.
+///
+/// Instrumented with an OpenTelemetry span (Issue #1145).
+#[instrument(skip(store, db), fields(vault_id = %vault_id))]
+pub fn sponsored_release_handler(
+    store: &VaultStore,
+    db: Arc<Db>,
+    vault_id: &str,
+    req: SponsoredReleaseRequest,
+) -> Result<SponsoredReleaseResponse, String> {
+    let vaults = store.lock().unwrap();
+    let vault = vaults
+        .get(vault_id)
+        .cloned()
+        .ok_or_else(|| format!("Vault '{}' not found", vault_id))?;
+    drop(vaults);
+
+    // Validate beneficiary account
+    if req.beneficiary_account.is_empty() {
+        return Err("Beneficiary account required".to_string());
+    }
+
+    // Get the released amount from vault balance
+    let released_amount = vault.balance;
+    if released_amount <= 0 {
+        return Err("Vault has no funds to release".to_string());
+    }
+
+    // Calculate protocol fee (0.1% of released amount)
+    let protocol_fee = calculate_protocol_fee(released_amount);
+    let net_amount = released_amount - protocol_fee;
+
+    if net_amount <= 0 {
+        return Err("Net amount after protocol fee is zero or negative".to_string());
+    }
+
+    // Construct fee bump transaction
+    let sponsor_account = std::env::var("SPONSOR_ACCOUNT")
+        .unwrap_or_else(|_| "GCCZWCG4ACXC5TIWC7XAUCJLX4I7AKTDAUF5AQ6MNJ5UKXVWNPGU7XT".to_string());
+
+    let memo = req.memo.as_deref();
+    let fee_bump_tx_hash = construct_fee_bump_transaction(
+        &req.beneficiary_account,
+        &sponsor_account,
+        net_amount,
+        memo,
+    )
+    .map_err(|e| format!("Failed to construct fee bump transaction: {}", e))?;
+
+    // Create sponsored release record
+    let tx_id = uuid::Uuid::new_v4().to_string();
+    let stellar_base_fee = 100i128; // stroops
+    let fee_bump_premium = 50i128; // stroops for priority
+    let sponsorship_fee = stellar_base_fee + fee_bump_premium;
+
+    let sponsored_release = SponsoredRelease {
+        tx_id: tx_id.clone(),
+        vault_id: vault_id.to_string(),
+        beneficiary: req.beneficiary_account.clone(),
+        released_amount,
+        protocol_fee,
+        net_amount,
+        fee_bump_tx_hash,
+        sponsor_account: sponsor_account.clone(),
+        sponsorship_fee,
+        status: SponsoredReleaseStatus::Pending,
+        created_at: Utc::now(),
+        executed_at: None,
+        ledger_sequence: None,
+        error: None,
+    };
+
+    // Persist to database
+    db.insert_sponsored_release(&sponsored_release)
+        .map_err(|e| format!("Failed to store sponsored release: {}", e))?;
+
+    // Log the transaction
+    tracing::info!(
+        vault_id = %vault_id,
+        beneficiary = %req.beneficiary_account,
+        released_amount = released_amount,
+        protocol_fee = protocol_fee,
+        net_amount = net_amount,
+        tx_id = %tx_id,
+        "sponsored release created"
+    );
+
+    let fee_breakdown = FeeBreakdown::new(released_amount, stellar_base_fee, fee_bump_premium);
+
+    Ok(SponsoredReleaseResponse {
+        transaction: sponsored_release,
+        fee_breakdown,
+    })
+}
+
+/// Retrieve a previously created sponsored release transaction.
+#[instrument(skip(db), fields(tx_id = %tx_id))]
+pub fn get_sponsored_release_handler(
+    db: Arc<Db>,
+    tx_id: &str,
+) -> Result<SponsoredRelease, String> {
+    db.get_sponsored_release(tx_id)
+        .map_err(|e| format!("Database error: {}", e))?
+        .ok_or_else(|| format!("Sponsored release transaction '{}' not found", tx_id))
+}
+
+/// List all sponsored releases for a vault.
+#[instrument(skip(db), fields(vault_id = %vault_id))]
+pub fn list_sponsored_releases_handler(
+    db: Arc<Db>,
+    vault_id: &str,
+) -> Result<Vec<SponsoredRelease>, String> {
+    db.list_sponsored_releases_for_vault(vault_id)
+        .map_err(|e| format!("Database error: {}", e))
+}
