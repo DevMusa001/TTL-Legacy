@@ -144,6 +144,12 @@ const MAX_PERSISTENT_TTL: u32 = 3_110_400;
 /// Maximum number of vault IDs accepted by `get_vault_batch_status` in a single call.
 const MAX_BATCH_STATUS_SIZE: u32 = 100;
 
+/// Two-step ownership transfer constants - Issue #1119
+/// 24-hour time-lock before new owner can accept the transfer (in seconds)
+pub const OWNERSHIP_TRANSFER_TIMELOCK: u64 = 86_400;
+/// 7-day expiry window if transfer is not accepted (in seconds)
+pub const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
+
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
 /// interval, capped at the Soroban maximum.
@@ -259,12 +265,9 @@ pub enum ContractError {
     ChallengeNotFound = 86,
     ChallengeExpired = 87,
     DuplicateSignature = 88,
-    // Milestone-based vesting
-    MilestoneNotFound = 89,
-    MilestoneAlreadyAttested = 90,
-    UnauthorizedAttestor = 91,
     CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
     SnapshotNotFound = 90,         // Issue #1123: Vault archiving
+    AlreadyOwner = 91,             // Issue #1119: Two-step ownership transfer
 }
 
 #[contract]
@@ -14819,6 +14822,10 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
+        
+        // TODO: Implement token rebalance logic
+        Ok(())
+    }
 
     // --- token lending ---
 
