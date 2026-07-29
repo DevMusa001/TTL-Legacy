@@ -574,6 +574,15 @@ pub struct PasskeyAnalytics {
     pub last_used_timestamp: u64,
 }
 
+/// Archived vault metadata - Issue #1123
+/// Stores information about archived vaults in cheaper persistent storage
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo {
+    pub vault: Vault,
+    pub archived_at: u64,  // Ledger timestamp when archived
+}
+
 /// Beneficiary status enum - Issue #397
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]

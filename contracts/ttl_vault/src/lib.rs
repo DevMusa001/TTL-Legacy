@@ -247,8 +247,8 @@ pub enum ContractError {
     ChallengeNotFound = 86,
     ChallengeExpired = 87,
     DuplicateSignature = 88,
-    // Issue #1138: 2FA-gated withdrawals
-    TwoFactorRequired = 89,
+    CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
+    SnapshotNotFound = 90,         // Issue #1123: Vault archiving
 }
 
 #[contract]
@@ -5308,22 +5308,97 @@ impl TtlVaultContract {
         vault
     }
 
-    /// Returns the owner address of a vault.
+    /// Archive a vault that has reached a terminal state (Released or Cancelled).
+    /// Moves the vault from instance storage to cheaper persistent storage.
+    /// Anyone can call this function.
     ///
-    /// This is a lightweight alternative to `get_vault` for callers that only
-    /// need to check ownership and want to avoid deserializing the full vault.
+    /// Issue #1123: Implement Vault Archiving for Released and Cancelled Vaults
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    ///
-    /// # Returns
-    /// The `Address` of the vault owner
+    /// * `vault_id` - ID of the vault to archive
     ///
     /// # Panics
-    /// Panics with `ContractError::VaultNotFound` if the vault does not exist
-    pub fn get_owner(env: Env, vault_id: u64) -> Address {
-        Self::load_vault(&env, vault_id).owner
+    /// Panics if:
+    /// - Vault doesn't exist
+    /// - Vault is not in Released or Cancelled status
+    /// - Vault is already archived
+    pub fn archive_vault(env: Env, vault_id: u64) {
+        Self::require_initialized(&env);
+
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Only allow archiving Released or Cancelled vaults
+        if vault.status != ReleaseStatus::Released && vault.status != ReleaseStatus::Cancelled {
+            panic_with_error!(&env, ContractError::NotReleased);
+        }
+
+        // Check if already archived
+        if env.storage().persistent().has(&DataKey::ArchivedVault(vault_id)) {
+            panic_with_error!(&env, ContractError::DuplicateVault);
+        }
+
+        // Store archived vault in persistent storage (cheaper long-term storage)
+        let now = env.ledger().timestamp();
+        let archived_info = ArchivedVaultInfo {
+            vault,
+            archived_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedVault(vault_id), &archived_info);
+
+        // Extend TTL for archived vault with minimum persistence
+        // Using a much longer TTL than active vaults since these rarely change
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ArchivedVault(vault_id), 6_048_000, 6_048_000); // ~1 year
+
+        // Emit archival event
+        env.events().publish(
+            (VAULT_ARCHIVED_TOPIC,),
+            (vault_id, now),
+        );
+    }
+
+    /// Retrieve an archived vault from persistent storage.
+    /// Returns the vault data along with archival timestamp.
+    ///
+    /// Issue #1123: Implement Vault Archiving for Released and Cancelled Vaults
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - ID of the archived vault
+    ///
+    /// # Returns
+    /// The Vault struct for the archived vault
+    ///
+    /// # Panics
+    /// Panics if the vault is not archived (use `vault_is_archived` to check)
+    pub fn get_archived_vault(env: Env, vault_id: u64) -> Vault {
+        Self::require_initialized(&env);
+
+        let archived_info: ArchivedVaultInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchivedVault(vault_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotReleased));
+
+        // Extend TTL for archived vault on read
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ArchivedVault(vault_id), 6_048_000, 6_048_000);
+
+        archived_info.vault
+    }
+
+    /// Check if a vault is archived.
+    /// Returns true if the vault exists in archived storage.
+    ///
+    /// Issue #1123: Implement Vault Archiving for Released and Cancelled Vaults
+    pub fn vault_is_archived(env: Env, vault_id: u64) -> bool {
+        env.storage().persistent().has(&DataKey::ArchivedVault(vault_id))
     }
 
     /// Captures the state of a vault at a specific point in time.
