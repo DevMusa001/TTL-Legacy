@@ -1,5 +1,6 @@
 use crate::models::*;
 use crate::db::*;
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::io::Write;
@@ -2167,4 +2168,82 @@ pub fn list_sponsored_releases_handler(
 ) -> Result<Vec<SponsoredRelease>, String> {
     db.list_sponsored_releases_for_vault(vault_id)
         .map_err(|e| format!("Database error: {}", e))
+}
+
+// --- Issue #1143: Vesting Bonus Backend API ---
+
+/// Claim vesting bonus for a vault.
+///
+/// Validates that the caller is the beneficiary, records an audit log entry,
+/// and returns a mock transaction hash for the claim.
+#[instrument(skip(db, headers), fields(vault_id = %vault_id))]
+pub fn claim_vesting_bonus_handler(
+    db: Arc<Db>,
+    headers: HeaderMap,
+    vault_id: &str,
+    req: crate::models::ClaimBonusRequest,
+) -> Result<crate::models::ClaimBonusResponse, String> {
+    let vault = db
+        .get_vault(vault_id)
+        .ok_or_else(|| format!("Vault {} not found", vault_id))?;
+
+    if vault.beneficiary != req.beneficiary {
+        return Err("Caller is not the beneficiary for this vault".to_string());
+    }
+
+    let bonus_config = db
+        .get_vesting_bonus(vault_id)
+        .map_err(|e| format!("Database error: {}", e))?
+        .ok_or_else(|| "No vesting bonus configured for this vault".to_string())?;
+
+    let base_amount = vault.balance / 2;
+    let bonus_amount = (base_amount * bonus_config.bonus_bps as i128) / 10_000;
+    let claimed_amount = base_amount + bonus_amount;
+
+    let tx_hash = uuid::Uuid::new_v4().to_string();
+
+    crate::audit::log_state_modification(
+        &db,
+        "vesting_bonus_claim",
+        &format!("/api/vaults/{}/vesting/claim-bonus", vault_id),
+        "success",
+        &headers,
+        Some(serde_json::json!({
+            "vault_id": vault_id,
+            "beneficiary": req.beneficiary,
+            "bonus_bps": bonus_config.bonus_bps,
+            "claimed_amount": claimed_amount,
+            "bonus_amount": bonus_amount,
+            "transaction_hash": tx_hash,
+        })),
+    );
+
+    Ok(crate::models::ClaimBonusResponse {
+        vault_id: vault_id.to_string(),
+        claimed_amount,
+        bonus_amount,
+        transaction_hash: tx_hash,
+        claimed_at: Utc::now(),
+    })
+}
+
+/// Retrieve the vesting bonus configuration for a vault.
+pub fn get_vesting_bonus_handler(
+    db: Arc<Db>,
+    vault_id: &str,
+) -> Result<crate::models::VestingBonusResponse, String> {
+    let _vault = db
+        .get_vault(vault_id)
+        .ok_or_else(|| format!("Vault {} not found", vault_id))?;
+
+    let bonus_config = db
+        .get_vesting_bonus(vault_id)
+        .map_err(|e| format!("Database error: {}", e))?;
+
+    Ok(crate::models::VestingBonusResponse {
+        vault_id: vault_id.to_string(),
+        configured: bonus_config.is_some(),
+        bonus_bps: bonus_config.as_ref().map(|c| c.bonus_bps),
+        on_time_window_seconds: bonus_config.as_ref().map(|c| c.on_time_window_seconds),
+    })
 }

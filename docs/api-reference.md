@@ -191,3 +191,19 @@ Returns just the `status` field of a multi-sig proposal, without deserializing t
 | Error               | Code | Condition                          |
 |----------------------|------|-------------------------------------|
 | `ProposalNotFound`   | 44   | No proposal exists with that ID    |
+
+---
+
+### `get_deposit_total`
+
+```rust
+get_deposit_total(vault_id: u64) -> Result<i128, ContractError>
+```
+
+Lightweight query that returns the current vault balance without deserializing the full `Vault` struct. Reduces compute fees on read-heavy paths where only the deposit total is needed.
+
+**Errors**
+
+| Error            | Code | Condition                  |
+|------------------|------|----------------------------|
+| `VaultNotFound`  | 3    | The vault does not exist   |

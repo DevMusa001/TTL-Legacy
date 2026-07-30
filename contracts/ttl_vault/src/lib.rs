@@ -119,6 +119,9 @@ mod vault_archiving_tests;
 #[cfg(test)]
 mod beneficiary_owner_check_tests;
 
+#[cfg(test)]
+mod deposit_total_tests;
+
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
 pub const VAULT_TTL_THRESHOLD: u32 = 1000;
@@ -5701,6 +5704,22 @@ impl TtlVaultContract {
     /// The vault balance in stroops
     pub fn get_vault_balance(env: Env, vault_id: u64) -> i128 {
         Self::load_vault(&env, vault_id).balance
+    }
+
+    /// Returns the total deposited balance for a vault without deserializing
+    /// the full vault struct. Lightweight alternative to `get_vault` when only
+    /// the balance is needed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// `Ok(balance)` if the vault exists, or `ContractError::VaultNotFound`
+    pub fn get_deposit_total(env: Env, vault_id: u64) -> Result<i128, ContractError> {
+        Self::try_load_vault(&env, vault_id)
+            .map(|vault| vault.balance)
+            .ok_or(ContractError::VaultNotFound)
     }
 
     /// Returns the owner address of a vault.

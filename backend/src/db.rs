@@ -644,6 +644,16 @@ impl Db {
                 CREATE INDEX IF NOT EXISTS idx_sponsored_releases_created_at ON sponsored_releases(created_at);
                 "#,
             ),
+            (
+                "5",
+                r#"
+                CREATE TABLE IF NOT EXISTS vesting_bonus_config (
+                    vault_id              TEXT PRIMARY KEY,
+                    bonus_bps             INTEGER NOT NULL,
+                    on_time_window_seconds INTEGER NOT NULL
+                );
+                "#,
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1246,6 +1256,44 @@ impl Db {
         Ok(())
     }
 
+    pub fn get_vesting_bonus(&self, vault_id: &str) -> Result<Option<crate::models::VestingBonusConfig>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT vault_id, bonus_bps, on_time_window_seconds
+               FROM vesting_bonus_config
+               WHERE vault_id = ?1"#,
+        )?;
+        let result = stmt.query_row(params![vault_id], |r| {
+            Ok(crate::models::VestingBonusConfig {
+                vault_id: r.get(0)?,
+                bonus_bps: r.get(1)?,
+                on_time_window_seconds: r.get(2)?,
+            })
+        });
+        match result {
+            Ok(config) => Ok(Some(config)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn upsert_vesting_bonus(&self, config: &crate::models::VestingBonusConfig) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO vesting_bonus_config (vault_id, bonus_bps, on_time_window_seconds)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              bonus_bps = excluded.bonus_bps,
+              on_time_window_seconds = excluded.on_time_window_seconds
+            "#,
+            params![
+                config.vault_id,
+                config.bonus_bps as i64,
+                config.on_time_window_seconds as i64,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

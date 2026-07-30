@@ -191,6 +191,14 @@ async fn main() {
             post(routes::create_sponsored_release)
                 .get(routes::get_sponsored_releases),
         )
+        .route(
+            "/api/vaults/:vault_id/vesting/claim-bonus",
+            post(routes::claim_vesting_bonus),
+        )
+        .route(
+            "/api/vaults/:vault_id/vesting/bonus",
+            get(routes::get_vesting_bonus),
+        )
         .layer(build_cors_layer())
         .with_state(state);
 
