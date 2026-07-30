@@ -592,6 +592,98 @@ pub fn get_vault_health_handler(
     Ok(response)
 }
 
+// ── Issue #1100: Bulk Vault Summary ──────────────────────────────────────────
+
+/// Maximum vault IDs accepted per bulk request.
+pub const BULK_SUMMARY_MAX_IDS: usize = 20;
+
+/// Rate-limit window in seconds.
+const BULK_RATE_WINDOW_SECS: i64 = 60;
+
+/// Maximum bulk requests per user per window.
+const BULK_RATE_LIMIT: u32 = 10;
+
+/// Per-user rate-limit state.
+#[derive(Clone)]
+struct BulkRateEntry {
+    count: u32,
+    window_start: chrono::DateTime<Utc>,
+}
+
+/// Shared rate-limit state for bulk summary requests.
+pub type BulkRateStore = Arc<Mutex<HashMap<String, BulkRateEntry>>>;
+
+pub fn create_bulk_rate_store() -> BulkRateStore {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Returns `true` if `user_id` is within their rate limit, recording the call.
+/// Returns `false` if the limit is exceeded.
+fn check_bulk_rate_limit(rate_store: &BulkRateStore, user_id: &str) -> bool {
+    let mut store = rate_store.lock().unwrap();
+    let now = Utc::now();
+    let entry = store.entry(user_id.to_string()).or_insert(BulkRateEntry {
+        count: 0,
+        window_start: now,
+    });
+    // Reset window if expired
+    if (now - entry.window_start).num_seconds() >= BULK_RATE_WINDOW_SECS {
+        entry.count = 0;
+        entry.window_start = now;
+    }
+    if entry.count >= BULK_RATE_LIMIT {
+        return false;
+    }
+    entry.count += 1;
+    true
+}
+
+/// `POST /api/vaults/bulk-summary`
+///
+/// Accepts up to `BULK_SUMMARY_MAX_IDS` vault IDs and returns a summary for each.
+/// Missing vaults produce a null-field entry rather than failing the entire request.
+/// Rate-limited to `BULK_RATE_LIMIT` requests per `user_id` per minute.
+pub fn bulk_vault_summary_handler(
+    store: &VaultStore,
+    rate_store: &BulkRateStore,
+    request: &BulkSummaryRequest,
+    user_id: &str,
+) -> Result<BulkSummaryResponse, String> {
+    if !check_bulk_rate_limit(rate_store, user_id) {
+        return Err("Rate limit exceeded: max 10 bulk requests per minute".to_string());
+    }
+    if request.vault_ids.len() > BULK_SUMMARY_MAX_IDS {
+        return Err(format!(
+            "Too many vault IDs: max {} allowed",
+            BULK_SUMMARY_MAX_IDS
+        ));
+    }
+
+    let vaults = store.lock().unwrap();
+    let summaries = request
+        .vault_ids
+        .iter()
+        .map(|id| match vaults.get(id) {
+            Some(v) => VaultSummaryEntry {
+                vault_id: id.clone(),
+                status: Some(v.status.clone()),
+                ttl_remaining: v.ttl_remaining,
+                balance: Some(v.balance),
+                last_check_in: Some(v.last_check_in),
+            },
+            None => VaultSummaryEntry {
+                vault_id: id.clone(),
+                status: None,
+                ttl_remaining: None,
+                balance: None,
+                last_check_in: None,
+            },
+        })
+        .collect();
+
+    Ok(BulkSummaryResponse { summaries })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1290,100 @@ mod tests {
         store.lock().unwrap().get_mut("v1").unwrap().balance = 0;
         let r2 = get_vault_health_handler(&store, &cache, "v1", 5, 3).unwrap();
         assert!(r2.score < r1.score, "score must drop after balance zeroed and cache cleared");
+    }
+
+    // ── Issue #1100: Bulk Vault Summary tests ─────────────────────────────────
+
+    fn insert_vault(store: &VaultStore, id: &str, balance: i128, ttl: Option<u64>) {
+        store.lock().unwrap().insert(
+            id.to_string(),
+            Vault {
+                id: id.to_string(),
+                owner: "owner".to_string(),
+                beneficiary: "ben".to_string(),
+                balance,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: ttl,
+            },
+        );
+    }
+
+    #[test]
+    fn test_bulk_summary_full_success() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        insert_vault(&store, "v1", 100, Some(86400));
+        insert_vault(&store, "v2", 200, Some(43200));
+
+        let req = BulkSummaryRequest { vault_ids: vec!["v1".to_string(), "v2".to_string()] };
+        let resp = bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
+        assert_eq!(resp.summaries.len(), 2);
+        assert!(resp.summaries[0].status.is_some());
+        assert_eq!(resp.summaries[0].balance, Some(100));
+        assert!(resp.summaries[1].status.is_some());
+        assert_eq!(resp.summaries[1].balance, Some(200));
+    }
+
+    #[test]
+    fn test_bulk_summary_partial_missing_vault() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        insert_vault(&store, "v1", 500, Some(86400));
+
+        let req = BulkSummaryRequest {
+            vault_ids: vec!["v1".to_string(), "missing".to_string()],
+        };
+        let resp = bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
+        assert_eq!(resp.summaries.len(), 2);
+        // Known vault
+        assert!(resp.summaries[0].status.is_some());
+        // Missing vault — all fields null
+        assert_eq!(resp.summaries[1].vault_id, "missing");
+        assert!(resp.summaries[1].status.is_none());
+        assert!(resp.summaries[1].balance.is_none());
+    }
+
+    #[test]
+    fn test_bulk_summary_over_limit_rejected() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        let ids: Vec<String> = (0..=BULK_SUMMARY_MAX_IDS).map(|i| format!("v{}", i)).collect();
+        let req = BulkSummaryRequest { vault_ids: ids };
+        let result = bulk_vault_summary_handler(&store, &rate, &req, "user1");
+        assert!(result.is_err(), "should reject > {} vault IDs", BULK_SUMMARY_MAX_IDS);
+    }
+
+    #[test]
+    fn test_bulk_summary_rate_limit_enforced() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        let req = BulkSummaryRequest { vault_ids: vec![] };
+
+        for _ in 0..BULK_RATE_LIMIT {
+            assert!(bulk_vault_summary_handler(&store, &rate, &req, "user1").is_ok());
+        }
+        // 11th request in the same window should be rejected
+        let result = bulk_vault_summary_handler(&store, &rate, &req, "user1");
+        assert!(result.is_err(), "11th request should be rate-limited");
+        assert!(result.unwrap_err().contains("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_bulk_summary_rate_limit_independent_per_user() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        let req = BulkSummaryRequest { vault_ids: vec![] };
+
+        for _ in 0..BULK_RATE_LIMIT {
+            bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
+        }
+        // Different user should still have their full quota
+        assert!(
+            bulk_vault_summary_handler(&store, &rate, &req, "user2").is_ok(),
+            "user2 should have independent rate limit"
+        );
     }
 }
