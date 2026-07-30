@@ -4,6 +4,11 @@ pub mod websocket;
 pub mod db;
 pub mod templates;
 pub mod notifications;
+pub mod audit;
+pub mod error;
+pub mod routes;
+pub mod otel;
+pub mod fee_sponsorship;
 
 pub use models::*;
 pub use handlers::*;
@@ -11,3 +16,5 @@ pub use websocket::*;
 pub use db::*;
 pub use templates::*;
 pub use notifications::*;
+pub use audit::*;
+pub use fee_sponsorship::*;

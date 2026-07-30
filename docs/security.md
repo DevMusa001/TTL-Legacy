@@ -29,6 +29,7 @@
 - Admin cannot change vault owners or beneficiaries
 - Two-step admin transfer with `propose_admin` and `accept_admin`
 - Transparent on-chain actions
+- `accept_admin` emits an `adm_done` event with `(old_admin, new_admin, accepted_at)` so monitoring systems can detect admin rotations without inspecting raw ledger topics
 
 ### 4. Re-initialization Attack
 
@@ -47,6 +48,16 @@
 - `create_vault` rejects owner == beneficiary
 - `set_beneficiaries` rejects owner in beneficiary list
 - Returns `ContractError::InvalidBeneficiary`
+
+### 6. Withdrawal Without Second Factor
+
+**Risk**: Owner key compromise leads to unauthorized withdrawal even when the owner has opted into 2FA
+
+**Mitigations**:
+- If a vault has 2FA enabled (`enable_2fa`), `withdraw` requires `is_2fa_verified` to return `true` for the current ledger session before it proceeds
+- Verification is confirmed off-chain (`confirm_2fa`, after OTP/SMS/email validation) and expires 1 hour after confirmation
+- Returns `ContractError::TwoFactorRequired` if 2FA is enabled but not currently verified
+- Vaults without 2FA enabled are unaffected and withdraw normally
 
 ## Security Best Practices
 

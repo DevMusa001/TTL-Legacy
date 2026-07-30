@@ -147,3 +147,135 @@ cd backend
 cargo run
 # Metrics available at http://localhost:8080/metrics
 ```
+
+---
+
+## OpenTelemetry Distributed Tracing
+
+> Issue #1145: Add OpenTelemetry Distributed Tracing to Backend
+
+The backend exports distributed traces via the OpenTelemetry Protocol (OTLP).
+Every key operation — vault release simulation, backup/restore, notification
+dispatch — is wrapped in a span that captures the vault ID, duration, and
+errors. Multi-step flows (backend → Stellar RPC → contract) appear as
+connected spans in a trace waterfall.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC exporter endpoint |
+| `OTEL_SERVICE_NAME` | `ttl-legacy-backend` | Service name shown in Jaeger / Tempo |
+| `RUST_LOG` | `info` | Controls span verbosity |
+
+If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set or the exporter fails to connect,
+the backend falls back to stdout-only tracing so startup is never blocked.
+
+### Quick Start with Jaeger (all-in-one)
+
+```bash
+# Start Jaeger (OTLP gRPC on :4317, UI on :16686)
+docker run -d \
+  --name jaeger \
+  -p 4317:4317 \
+  -p 16686:16686 \
+  jaegertracing/all-in-one:latest
+
+# Start the backend with tracing enabled
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=ttl-legacy-backend \
+cargo run --manifest-path backend/Cargo.toml
+
+# Open Jaeger UI
+open http://localhost:16686
+```
+
+### Example Jaeger Queries
+
+Search for all vault release traces in the last hour:
+
+```
+Service: ttl-legacy-backend
+Operation: simulate_release_handler
+Tags: vault_id=<your-vault-id>
+Lookback: 1h
+```
+
+Find slow Stellar RPC calls:
+
+```
+Service: ttl-legacy-backend
+Operation: stellar.rpc
+Min Duration: 500ms
+```
+
+Find all traces with errors:
+
+```
+Service: ttl-legacy-backend
+Tags: error=true
+```
+
+### Instrumented Operations
+
+| Span Name | Attributes | Description |
+|---|---|---|
+| `simulate_release_handler` | `vault_id` | Full vault release simulation |
+| `backup_vault_handler` | `vault_id` | Vault state backup |
+| `restore_vault_handler` | `backup_id` | Vault state restore |
+| `set_notification_preferences_handler` | `vault_id` | Notification preference update |
+| `list_vault_reminders` | `vault_id` | List reminder preferences for a vault |
+| `set_preferences` | `vault_id` | Set reminder preferences |
+| `get_preferences` | `vault_id` | Get reminder preferences |
+| `delete_preferences` | `vault_id` | Delete reminder preferences |
+| `unsubscribe` | — | Process unsubscribe request |
+| `schedule_expiry_warning` | `vault_id` | Schedule expiry warning notification |
+| `schedule_immediate` | `vault_id`, `notification_type` | Schedule immediate notification |
+| `flush_pending` | — | Dispatch all due notifications |
+| `flush_retries` | — | Retry failed notifications |
+| `deliver_with_retry` | `vault_id`, `notification_type`, `attempt` | Single notification delivery with retry |
+| `run` | — | Scheduler main loop (reminder + TTL insurance) |
+| `extend_ttl_for_inactive_owners` | — | TTL extension for inactive vault owners |
+| `stellar.rpc` | `stellar.contract_id`, `db.operation` | Outbound Soroban RPC call |
+
+### Propagating Trace Context
+
+Outbound Stellar RPC calls are wrapped using the `stellar_rpc_span` helper
+defined in `backend/src/otel.rs`:
+
+```rust
+use crate::otel::stellar_rpc_span;
+use tracing::Instrument as _;
+
+async {
+    // … soroban client invoke …
+}
+.instrument(stellar_rpc_span("trigger_release", &contract_id))
+.await;
+```
+
+This attaches the parent trace context so Jaeger shows the RPC call as a
+child span within the handler span.
+
+### Docker Compose Integration
+
+Add Jaeger to `docker-compose.yml` for local development:
+
+```yaml
+jaeger:
+  image: jaegertracing/all-in-one:latest
+  ports:
+    - "4317:4317"   # OTLP gRPC
+    - "16686:16686" # Jaeger UI
+  environment:
+    COLLECTOR_OTLP_ENABLED: "true"
+```
+
+Then set in `docker-compose.override.yml`:
+
+```yaml
+backend:
+  environment:
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    OTEL_SERVICE_NAME: ttl-legacy-backend
+```

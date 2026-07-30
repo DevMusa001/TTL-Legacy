@@ -72,11 +72,67 @@ fn regression_checkin_extends_ttl() {
     assert!(ttl_before.is_some(), "TTL should exist after creation");
 
     env.ledger().set_sequence_number(env.ledger().sequence() + 500);
-    client.check_in(&vault_id);
+    client.check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64);
 
     let ttl_after = client.get_ttl_remaining(&vault_id);
     assert!(ttl_after.is_some(), "TTL should exist after check-in");
     assert!(ttl_after > ttl_before, "TTL should be extended after check-in");
+}
+
+#[test]
+fn passkey_biometric_bind_and_checkin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin).address();
+
+    // Initialize contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract_address);
+    client.initialize(&token_address, &admin);
+
+    // Create vault
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    // Prepare passkey and biometric hashes
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let biometric_hash = BytesN::<32>::from_array(&env, &[2u8; 32]);
+
+    // Add passkey and bind biometric
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+    client.bind_passkey_biometric(&vault_id, &owner, &passkey_hash, &biometric_hash);
+
+    // Perform biometric check-in
+    client.biometric_check_in(&vault_id, &owner, &passkey_hash, &biometric_hash);
+
+    // Verify passkey record contains biometric binding
+    let passkeys = client.get_vault_passkeys(&vault_id);
+    assert!(passkeys.len() > 0);
+    let found = passkeys.iter().any(|p| p.hash == passkey_hash && p.biometric_hash.is_some());
+    assert!(found, "Biometric binding should be present on the passkey");
+
+    // Verify events were emitted
+    let events = env.events().all();
+    let mut saw_bind = false;
+    let mut saw_bio_ci = false;
+    for e in events.iter() {
+        let topics: soroban_sdk::Vec<Val> = e.1.clone().into_val(&env);
+        if let Ok(sym) = topics.get(0).and_then(|t| t.try_into_val(&env)) {
+            let s: soroban_sdk::Symbol = sym;
+            if s == BIND_PASSKEY_BIOMETRIC_TOPIC {
+                saw_bind = true;
+            }
+            if s == BIO_CHECKIN_TOPIC {
+                saw_bio_ci = true;
+            }
+        }
+    }
+    assert!(saw_bind, "bind event should be emitted");
+    assert!(saw_bio_ci, "biometric check-in event should be emitted");
 }
 
 /// Regression test: Ensure deposit increases vault balance
@@ -226,4 +282,64 @@ fn regression_vault_isolation() {
 
     assert_eq!(balance_1, 100_000i128, "Vault 1 balance should be independent");
     assert_eq!(balance_2, 50_000i128, "Vault 2 balance should be independent");
+}
+
+/// Regression test for Issue #853: Vault ID uniqueness under concurrent creation
+/// Previously: No regression test existed for vault ID counter consistency
+/// Ensures vault IDs are unique across multiple sequential creates
+#[test]
+fn test_vault_ids_are_unique_across_multiple_creates() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    // Create 100 vaults and collect IDs
+    let mut vault_ids = alloc::vec::Vec::new();
+    for _ in 0..100 {
+        let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+        vault_ids.push(vault_id);
+    }
+
+    // Assert all IDs are distinct
+    for i in 0..vault_ids.len() {
+        for j in (i + 1)..vault_ids.len() {
+            assert_ne!(
+                vault_ids[i], vault_ids[j],
+                "Vault IDs must be unique: vault {} and {} have same ID {}",
+                i, j, vault_ids[i]
+            );
+        }
+    }
+
+    // Assert vault_count matches
+    assert_eq!(client.vault_count(), 100, "Vault count must equal number of created vaults");
+}
+
+/// Regression test for Issue #853: Vault ID counter consistency after failed creation
+/// Previously: No regression test existed for counter behavior on failed creates
+/// Ensures the counter does not advance when create_vault fails
+#[test]
+fn test_vault_id_counter_is_consistent_after_failure() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    // Count should start at 0
+    assert_eq!(client.vault_count(), 0, "Initial count should be 0");
+
+    // Successful create
+    let vault_1 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(vault_1, 1, "First vault should have ID 1");
+    assert_eq!(client.vault_count(), 1, "Count should be 1 after first create");
+
+    // Failed create (owner == beneficiary)
+    let result = client.try_create_vault(&owner, &owner, &100u64, &None);
+    assert!(result.is_err(), "Create with owner == beneficiary should fail");
+    assert_eq!(client.vault_count(), 1, "Count must not advance on failed create");
+
+    // Successful create again
+    let vault_2 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(vault_2, 2, "Second vault should have ID 2 (counter must not have advanced)");
+    assert_eq!(client.vault_count(), 2, "Count should be 2 after second create");
+
+    // Verify both vaults exist with correct IDs
+    assert!(client.vault_exists(&vault_1), "Vault 1 should exist");
+    assert!(client.vault_exists(&vault_2), "Vault 2 should exist");
+    assert!(!client.vault_exists(&3), "Vault 3 should not exist");
 }

@@ -1,7 +1,72 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
+// ── WebSocket authentication ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthClaims {
+    pub sub: String,
+    pub vault_ids: Vec<String>,
+    pub exp: usize,
+}
+
+// ── Locale support ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Locale {
+    En,
+    Es,
+    Fr,
+    De,
+}
+
 // ── Notification models ──────────────────────────────────────────────────────
+
+// ── Legacy reminder API models (axum + Db contract) ───────────────────────
+
+/// Reminder notification channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Email,
+    Sms,
+    Push,
+}
+
+/// Reminder frequency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Frequency {
+    Once,
+    Daily,
+    Weekly,
+    Hourly,
+    Monthly,
+}
+
+pub type VaultNotificationPreferences = NotificationPreferences;
+
+/// Persisted reminder preferences stored by `Db`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderPreferences {
+    pub vault_id: u64,
+    pub channels: Vec<Channel>,
+    pub hours_before_expiry: u32,
+    pub frequency: Frequency,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// Request body for setting reminder preferences.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SetPreferencesRequest {
+    pub channels: Vec<Channel>,
+    pub hours_before_expiry: u32,
+    pub frequency: Frequency,
+}
+
+
 
 /// Notification type sent to a device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -20,6 +85,27 @@ pub enum DeliveryStatus {
     Pending,
     Sent,
     Failed,
+    Retrying,
+}
+
+/// A single attempt entry within a reminder delivery log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryAttempt {
+    pub attempt: u32,
+    pub attempted_at: DateTime<Utc>,
+    pub error: String,
+}
+
+/// Per-notification retry log stored by notification ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderDeliveryLog {
+    pub notification_id: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub status: DeliveryStatus,
+    pub attempts: Vec<DeliveryAttempt>,
+    /// When the next retry should fire (None if not retrying).
+    pub next_retry_at: Option<DateTime<Utc>>,
 }
 
 /// A registered device push token.
@@ -32,7 +118,7 @@ pub struct DeviceToken {
     pub registered_at: DateTime<Utc>,
 }
 
-/// Per-owner notification preferences.
+/// Per-owner notification preferences (used by legacy scheduler/reminder engine).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationPreferences {
     pub owner: String,
@@ -41,6 +127,10 @@ pub struct NotificationPreferences {
     pub vault_released_enabled: bool,
     /// Hours before expiry to send the warning (default 24).
     pub warning_hours_before: u64,
+    pub locale: Option<Locale>,
+    pub preferred_channel: Option<NotificationChannel>,
+    pub fallback_channel: Option<NotificationChannel>,
+    pub unsubscribed: bool,
 }
 
 impl Default for NotificationPreferences {
@@ -51,9 +141,35 @@ impl Default for NotificationPreferences {
             check_in_reminder_enabled: true,
             vault_released_enabled: true,
             warning_hours_before: 24,
+            locale: None,
+            preferred_channel: None,
+            fallback_channel: None,
+            unsubscribed: false,
         }
     }
 }
+
+// ── Unsubscribe support (#828) ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsubscribeToken {
+    pub token: String,
+    pub owner: String,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── Channel fallback delivery log (#827) ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeliveryLog {
+    pub notification_id: String,
+    pub channel: NotificationChannel,
+    pub status: DeliveryStatus,
+    pub attempted_at: DateTime<Utc>,
+    pub error: Option<String>,
+}
+
+
 
 /// A scheduled notification (pending delivery).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +181,8 @@ pub struct ScheduledNotification {
     /// Unix timestamp when this should fire.
     pub scheduled_at: DateTime<Utc>,
     pub status: DeliveryStatus,
+    pub max_retry_attempts: u32,
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 /// Delivery record written after each send attempt.
@@ -96,6 +214,7 @@ pub struct UpdatePreferencesRequest {
     pub check_in_reminder_enabled: Option<bool>,
     pub vault_released_enabled: Option<bool>,
     pub warning_hours_before: Option<u64>,
+    pub locale: Option<Locale>,
 }
 
 // ── Existing models (unchanged) ──────────────────────────────────────────────
@@ -121,6 +240,48 @@ pub enum VaultStatus {
     Released,
     Paused,
 }
+
+// ── TTL Insurance models ───────────────────────────────────────────────────
+
+/// TTL insurance policy parameters purchased by a vault owner.
+///
+/// When enabled, the backend scheduler can automatically extend TTL once the
+/// owner is considered inactive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtlInsurancePolicy {
+    /// Vault id (matches `Vault.id` semantics in this backend).
+    pub vault_id: u64,
+    /// How much TTL to extend when triggered.
+    pub extension_seconds: u64,
+    /// Consider the owner inactive if no proof-of-life/check-in was recorded
+    /// within this window.
+    pub inactivity_threshold_seconds: u64,
+    /// Whether this policy is currently active.
+    pub enabled: bool,
+    pub purchased_at: DateTime<Utc>,
+    pub last_extended_at: Option<DateTime<Utc>>,
+}
+
+/// Persisted owner activity signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerActivity {
+    pub owner_id: u64,
+    pub last_active_at: DateTime<Utc>,
+}
+
+/// POST body to purchase/enable a TTL insurance policy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PurchaseTtlInsuranceRequest {
+    pub extension_seconds: u64,
+    pub inactivity_threshold_seconds: u64,
+}
+
+/// POST body to record owner activity (proof-of-life).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RecordOwnerActivityRequest {
+    pub owner_id: u64,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultEvent {
@@ -261,6 +422,48 @@ pub struct TimeSeriesPoint {
     pub vaults_released: u64,
 }
 
+// ── Per-Vault Analytics (#959) ───────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VaultDetailAnalytics {
+    pub vault_id: String,
+    pub ttl_history: Vec<TtlHistoryPoint>,
+    pub check_in_frequency: CheckInFrequency,
+    pub withdrawal_trends: WithdrawalTrends,
+    pub beneficiary_status: BeneficiaryStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TtlHistoryPoint {
+    pub date: String,
+    pub ttl_remaining_seconds: u64,
+    pub event: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckInFrequency {
+    pub average_interval_seconds: u64,
+    pub total_check_ins: u64,
+    pub next_deadline: String,
+    pub days_until_deadline: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WithdrawalTrends {
+    pub total_withdrawals: i128,
+    pub withdrawal_count: u64,
+    pub average_withdrawal_amount: f64,
+    pub last_withdrawal_date: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BeneficiaryStatus {
+    pub beneficiary_address: String,
+    pub is_active: bool,
+    pub vault_status: String,
+    pub can_receive_funds: bool,
+}
+
 // ── Task 2: Backup & Recovery ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +507,40 @@ pub struct ShareRequest {
     pub permission: SharePermission,
 }
 
+// ── Share tokens (temporary access tokens for read-only sharing) ─────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareToken {
+    pub token: String,
+    pub share_id: String,
+    pub vault_id: String,
+    pub shared_with: String,
+    pub permission: SharePermission,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateTokenRequest {
+    pub shared_with: String,
+    pub permission: Option<SharePermission>,
+    /// Seconds until the token expires (default 604800 = 7 days).
+    pub expiry_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShareTokenResponse {
+    pub share: VaultShare,
+    pub token: ShareToken,
+    pub access_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeTokenRequest {
+    pub token: String,
+}
+
 // ── Task 4: Notification Preferences ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -322,18 +559,125 @@ pub enum NotificationFrequency {
     Monthly,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationPreferences {
-    pub vault_id: String,
-    pub channels: Vec<NotificationChannel>,
-    pub frequency: NotificationFrequency,
-    pub updated_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotificationPreferencesRequest {
     pub channels: Vec<NotificationChannel>,
     pub frequency: NotificationFrequency,
+}
+
+// ── Vault Notification Subscription System ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionChannel {
+    Email,
+    Sms,
+    Webhook,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionFrequency {
+    Once,
+    Daily,
+    Weekly,
+    Hourly,
+    Monthly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Subscription {
+    pub vault_id: u64,
+    pub owner: String,
+    pub channels: Vec<SubscriptionChannel>,
+    pub frequency: SubscriptionFrequency,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SetSubscriptionRequest {
+    pub owner: String,
+    pub channels: Vec<SubscriptionChannel>,
+    pub frequency: SubscriptionFrequency,
+}
+
+
+// ── Idempotency Key support (#825) ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub response_body: String,
+    pub status_code: u16,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── Release Simulator models ─────────────────────────────────────────────────
+
+/// The scenario to simulate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioType {
+    /// Owner never checks in again — release is immediate at TTL expiry.
+    NoCheckIns,
+    /// Owner checks in consistently at their configured interval.
+    ConsistentCheckIns,
+    /// Owner misses one or more specific check-in dates before stopping.
+    MissedCheckInDates,
+}
+
+impl std::fmt::Display for ScenarioType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScenarioType::NoCheckIns => write!(f, "no_check_ins"),
+            ScenarioType::ConsistentCheckIns => write!(f, "consistent_check_ins"),
+            ScenarioType::MissedCheckInDates => write!(f, "missed_check_in_dates"),
+        }
+    }
+}
+
+/// Query parameters for the simulate-release endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SimulateReleaseQuery {
+    /// Comma-separated list of scenarios to run.
+    /// e.g. `scenarios=no_check_ins,consistent_check_ins`
+    /// Defaults to all three scenarios if omitted.
+    pub scenarios: Option<String>,
+    /// For `missed_check_in_dates`: number of consecutive missed check-ins
+    /// before the owner stops (defaults to 1).
+    pub missed_count: Option<u32>,
+}
+
+/// Projected outcome for a single scenario.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioResult {
+    /// Which scenario this result belongs to.
+    pub scenario: ScenarioType,
+    /// Human-readable description of the scenario.
+    pub description: String,
+    /// Projected UTC timestamp when the vault will release.
+    pub projected_release_at: DateTime<Utc>,
+    /// Seconds from now until the projected release.
+    pub seconds_until_release: i64,
+    /// Confidence level: "high", "medium", or "low".
+    pub confidence: String,
+    /// Optional extra notes about this scenario's assumptions.
+    pub notes: String,
+}
+
+/// Response body for GET /api/vaults/{id}/simulate-release.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SimulateReleaseResponse {
+    pub vault_id: String,
+    /// Current TTL remaining in seconds (None if already expired/released).
+    pub current_ttl_remaining: Option<u64>,
+    /// The vault's configured check-in interval in seconds.
+    pub check_in_interval: u64,
+    /// Timestamp of the last recorded check-in.
+    pub last_check_in: DateTime<Utc>,
+    /// Simulation results, one per requested scenario.
+    pub scenarios: Vec<ScenarioResult>,
+    /// When this simulation was generated.
+    pub simulated_at: DateTime<Utc>,
 }
 
 // ── Issue #1099: Vault Health Score ──────────────────────────────────────────
