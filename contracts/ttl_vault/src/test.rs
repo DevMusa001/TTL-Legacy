@@ -4298,3 +4298,36 @@ fn test_hibernation_duration_zero_still_errors() {
     let result = client.try_enter_hibernation(&id, &owner, &0u64);
     assert!(result.is_err(), "zero duration should still be rejected");
 }
+
+// ── Issue #1098: get_beneficiary query function tests ─────────────────────────
+
+#[test]
+fn test_get_beneficiary_returns_correct_address() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let result = client.get_beneficiary(&vault_id);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), beneficiary);
+}
+
+#[test]
+fn test_get_beneficiary_missing_vault_returns_error() {
+    let (_, _, _, _, _, client) = setup();
+    let missing_id: u64 = 9999;
+    let result = client.try_get_beneficiary(&missing_id);
+    assert!(result.is_err(), "expected VaultNotFound error");
+    let err = result.unwrap_err().unwrap();
+    // Error code 3 = VaultNotFound
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(3));
+}
+
+#[test]
+fn test_get_beneficiary_is_distinct_from_owner() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let returned_beneficiary = client.get_beneficiary(&vault_id).unwrap();
+    let returned_owner = client.get_vault_owner(&vault_id);
+    assert_ne!(returned_beneficiary, returned_owner);
+}
