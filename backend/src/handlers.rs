@@ -3,6 +3,7 @@ use crate::db::*;
 use crate::notifications::NotificationService;
 use chrono::Utc;
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -462,6 +463,133 @@ pub fn get_notification_preferences_handler(
     vault_id: &str,
 ) -> Option<NotificationPreferences> {
     get_notification_preferences(notif_store, vault_id)
+}
+
+// ── Issue #1099: Vault Health Score ──────────────────────────────────────────
+
+/// Healthy balance threshold in the same units as `Vault::balance`.
+/// Vaults at or above this level score full points for the balance factor.
+const HEALTH_BALANCE_THRESHOLD: i128 = 1_000;
+
+/// Number of consecutive check-ins needed to earn full streak points.
+const HEALTH_STREAK_FULL: u32 = 5;
+
+/// Number of passkeys needed to earn full passkey-diversity points.
+const HEALTH_PASSKEY_FULL: u32 = 3;
+
+/// Cache TTL: 5 minutes in seconds.
+const HEALTH_CACHE_TTL_SECS: i64 = 300;
+
+/// In-memory health score cache entry.
+#[derive(Clone)]
+struct HealthCacheEntry {
+    response: VaultHealthResponse,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+/// A simple in-memory cache for vault health scores.
+pub type HealthCache = Arc<Mutex<HashMap<String, HealthCacheEntry>>>;
+
+pub fn create_health_cache() -> HealthCache {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Invalidates any cached health score for `vault_id`.
+/// Call this after a check-in or deposit that changes health inputs.
+pub fn invalidate_health_cache(cache: &HealthCache, vault_id: &str) {
+    cache.lock().unwrap().remove(vault_id);
+}
+
+/// `GET /api/vaults/{id}/health`
+///
+/// Returns a 0-100 health score with a per-factor breakdown:
+/// - TTL buffer   30 pts — ratio of `ttl_remaining` to `check_in_interval`
+/// - Streak       20 pts — consecutive check-ins (full at `HEALTH_STREAK_FULL`)
+/// - Balance      30 pts — balance relative to `HEALTH_BALANCE_THRESHOLD`
+/// - Passkey div. 20 pts — number of distinct passkeys (full at `HEALTH_PASSKEY_FULL`)
+///
+/// Results are cached for 5 minutes and invalidated on check-in or deposit.
+pub fn get_vault_health_handler(
+    store: &VaultStore,
+    cache: &HealthCache,
+    vault_id: &str,
+    /// Streak value sourced from external context (0 if unavailable).
+    streak: u32,
+    /// Number of registered passkeys (0 if unavailable).
+    passkey_count: u32,
+) -> Result<VaultHealthResponse, String> {
+    // Return cached result if still fresh
+    {
+        let cache_lock = cache.lock().unwrap();
+        if let Some(entry) = cache_lock.get(vault_id) {
+            if Utc::now() < entry.expires_at {
+                return Ok(entry.response.clone());
+            }
+        }
+    }
+
+    let vault = store
+        .lock()
+        .unwrap()
+        .get(vault_id)
+        .cloned()
+        .ok_or_else(|| "Vault not found".to_string())?;
+
+    // ── TTL buffer factor (0-30) ──────────────────────────────────────────
+    let ttl_score: u8 = match vault.ttl_remaining {
+        Some(ttl) if vault.check_in_interval > 0 => {
+            let ratio = ttl as f64 / vault.check_in_interval as f64;
+            (ratio.min(1.0) * 30.0).round() as u8
+        }
+        _ => 0,
+    };
+
+    // ── Streak factor (0-20) ──────────────────────────────────────────────
+    let streak_score: u8 = {
+        let ratio = (streak as f64) / (HEALTH_STREAK_FULL as f64);
+        (ratio.min(1.0) * 20.0).round() as u8
+    };
+
+    // ── Balance factor (0-30) ─────────────────────────────────────────────
+    let balance_score: u8 = if HEALTH_BALANCE_THRESHOLD > 0 {
+        let ratio = vault.balance as f64 / HEALTH_BALANCE_THRESHOLD as f64;
+        (ratio.min(1.0) * 30.0).round() as u8
+    } else {
+        0
+    };
+
+    // ── Passkey diversity factor (0-20) ───────────────────────────────────
+    let passkey_score: u8 = {
+        let ratio = (passkey_count as f64) / (HEALTH_PASSKEY_FULL as f64);
+        (ratio.min(1.0) * 20.0).round() as u8
+    };
+
+    let score = ttl_score
+        .saturating_add(streak_score)
+        .saturating_add(balance_score)
+        .saturating_add(passkey_score);
+
+    let response = VaultHealthResponse {
+        score,
+        factors: HealthFactors {
+            ttl_buffer: ttl_score,
+            streak: streak_score,
+            balance: balance_score,
+            passkey_diversity: passkey_score,
+        },
+        computed_at: Utc::now(),
+    };
+
+    // Store in cache
+    cache.lock().unwrap().insert(
+        vault_id.to_string(),
+        HealthCacheEntry {
+            response: response.clone(),
+            expires_at: Utc::now() + chrono::Duration::seconds(HEALTH_CACHE_TTL_SECS),
+        },
+    );
+
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -968,5 +1096,107 @@ mod tests {
             frequency: NotificationFrequency::Daily,
         };
         assert!(set_notification_preferences_handler(&store, &notif_store, "v1", req).is_err());
+    }
+
+    // ── Issue #1099: Vault Health Score tests ─────────────────────────────────
+
+    fn make_vault_health(id: &str, balance: i128, ttl: Option<u64>, interval: u64) -> Vault {
+        Vault {
+            id: id.to_string(),
+            owner: "owner".to_string(),
+            beneficiary: "ben".to_string(),
+            balance,
+            check_in_interval: interval,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: ttl,
+        }
+    }
+
+    #[test]
+    fn test_health_score_perfect_vault() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", HEALTH_BALANCE_THRESHOLD, Some(86400), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", HEALTH_STREAK_FULL, HEALTH_PASSKEY_FULL)
+            .unwrap();
+        assert_eq!(r.score, 100);
+        assert_eq!(r.factors.ttl_buffer, 30);
+        assert_eq!(r.factors.streak, 20);
+        assert_eq!(r.factors.balance, 30);
+        assert_eq!(r.factors.passkey_diversity, 20);
+    }
+
+    #[test]
+    fn test_health_score_zero_balance_no_streak_no_passkeys() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 0, Some(86400), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", 0, 0).unwrap();
+        assert_eq!(r.factors.balance, 0);
+        assert_eq!(r.factors.streak, 0);
+        assert_eq!(r.factors.passkey_diversity, 0);
+        // ttl is 100% → 30 pts
+        assert_eq!(r.factors.ttl_buffer, 30);
+        assert_eq!(r.score, 30);
+    }
+
+    #[test]
+    fn test_health_score_half_ttl() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        // ttl_remaining = 43200, interval = 86400 → ratio 0.5 → 15 pts
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 500, Some(43200), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", 0, 1).unwrap();
+        assert_eq!(r.factors.ttl_buffer, 15);
+    }
+
+    #[test]
+    fn test_health_score_not_found_returns_error() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        let result = get_vault_health_handler(&store, &cache, "missing", 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_health_score_cached_result_returned() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 1000, Some(86400), 86400),
+        );
+        let r1 = get_vault_health_handler(&store, &cache, "v1", 3, 2).unwrap();
+        // Mutate vault — cached result should be returned unchanged
+        store.lock().unwrap().get_mut("v1").unwrap().balance = 0;
+        let r2 = get_vault_health_handler(&store, &cache, "v1", 3, 2).unwrap();
+        assert_eq!(r1.score, r2.score, "cache should shield against store mutation");
+    }
+
+    #[test]
+    fn test_health_cache_invalidated_yields_fresh_score() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 1000, Some(86400), 86400),
+        );
+        let r1 = get_vault_health_handler(&store, &cache, "v1", 5, 3).unwrap();
+        invalidate_health_cache(&cache, "v1");
+        // Zero out balance after invalidation
+        store.lock().unwrap().get_mut("v1").unwrap().balance = 0;
+        let r2 = get_vault_health_handler(&store, &cache, "v1", 5, 3).unwrap();
+        assert!(r2.score < r1.score, "score must drop after balance zeroed and cache cleared");
     }
 }
