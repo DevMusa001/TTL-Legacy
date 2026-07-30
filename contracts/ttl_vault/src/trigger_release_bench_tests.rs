@@ -150,7 +150,7 @@ fn bench_trigger_release_50_beneficiaries() {
         // we can't call the internal helper from tests, so we use a raw
         // storage write to simulate legacy / pre-guard data.
         env.as_contract(&client.address, || {
-            let key = DataKey::Vault(vault_id);
+            let key = StorageKey::Vault(vault_id);
             env.storage().persistent().set(&key, &vault);
         });
     }

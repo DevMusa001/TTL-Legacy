@@ -1809,7 +1809,7 @@ fn test_check_in_extends_owner_index_ttl() {
     let ttl = env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
-            .get_ttl(&DataKey::OwnerVaults(owner.clone()))
+            .get_ttl(&StorageKey::OwnerVaults(owner.clone()))
     });
     assert!(ttl >= VAULT_TTL_THRESHOLD as u32);
 }
@@ -3169,7 +3169,7 @@ fn test_get_vault_extends_ttl_when_below_threshold() {
         .as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get_ttl(&DataKey::Vault(vault_id))
+                .get_ttl(&StorageKey::Vault(vault_id))
         });
     assert!(
         ttl_before < VAULT_TTL_THRESHOLD,
@@ -3183,7 +3183,7 @@ fn test_get_vault_extends_ttl_when_below_threshold() {
         .as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get_ttl(&DataKey::Vault(vault_id))
+                .get_ttl(&StorageKey::Vault(vault_id))
         });
     assert!(
         ttl_after >= VAULT_TTL_LEDGERS,
@@ -3208,7 +3208,7 @@ fn test_get_vault_does_not_extend_ttl_when_above_threshold() {
         .as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get_ttl(&DataKey::Vault(vault_id))
+                .get_ttl(&StorageKey::Vault(vault_id))
         });
     assert!(
         ttl_after_create >= VAULT_TTL_THRESHOLD,
@@ -3224,7 +3224,7 @@ fn test_get_vault_does_not_extend_ttl_when_above_threshold() {
         .as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get_ttl(&DataKey::Vault(vault_id))
+                .get_ttl(&StorageKey::Vault(vault_id))
         });
     assert_eq!(
         ttl_after_create, ttl_after_reads,
@@ -5168,7 +5168,7 @@ fn test_get_check_in_history_page_entries_in_chronological_order() {
     assert!(page.get(1).unwrap().timestamp < page.get(2).unwrap().timestamp);
 }
 
-/// O(1) single-entry accessor — reads exactly one `DataKey::CheckInEntry` key.
+/// O(1) single-entry accessor — reads exactly one `StorageKey::CheckInEntry` key.
 #[test]
 fn test_get_check_in_history_entry_returns_correct_entry() {
     let (env, owner, beneficiary, _, _, client) = setup();
@@ -5790,6 +5790,54 @@ fn test_is_hibernating_false_when_never_hibernated() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
     assert!(!client.is_hibernating(&id));
+}
+
+// ── Issue #1133: Withdrawal guard on hibernating vault ────────────────────────
+
+#[test]
+fn test_withdraw_blocked_on_hibernating_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    let err = client.try_withdraw(&id, &owner, &100i128).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // AlreadyHibernating
+}
+
+#[test]
+fn test_withdraw_succeeds_after_exiting_hibernation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    client.withdraw(&id, &owner, &100i128);
+}
+
+// ── Issue #1134: WithdrawalCancelled event on reversal ────────────────────────
+
+#[test]
+fn test_reverse_withdrawal_emits_cancelled_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    let withdrawal_id = client.withdraw(&id, &owner, &100i128).unwrap();
+    client.reverse_withdrawal(&id, &owner, &withdrawal_id).unwrap();
+
+    let events = env.events().all();
+    let cancelled = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics.len() >= 2
+            && topics.get(0).unwrap() == WITHDRAWAL_CANCELLED_TOPIC.into_val(&env)
+            && topics.get(1).unwrap() == id.into_val(&env)
+    });
+    assert!(cancelled, "WITHDRAWAL_CANCELLED_TOPIC event not emitted");
 }
 
 // ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
@@ -6812,7 +6860,7 @@ fn test_deposit_limit_exceeded_error() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
     env.as_contract(&client.address, || {
-        let key = DataKey::Vault(vault_id);
+        let key = StorageKey::Vault(vault_id);
         let mut v: Vault = env.storage().persistent().get(&key).unwrap();
         v.max_deposit_amount = Some(50);
         env.storage().persistent().set(&key, &v);
@@ -6929,11 +6977,11 @@ fn test_nothing_to_clawback_error() {
     // Manually mark all installments as claimed so total_unvested == 0
     env.as_contract(&client.address, || {
         let count: u32 = env.storage().persistent()
-            .get(&DataKey::VestingScheduleCount(vault_id))
+            .get(&StorageKey::VestingScheduleCount(vault_id))
             .unwrap_or(0);
         for i in 0..count {
-            let key = DataKey::VestingSchedule(vault_id, i);
-            if let Some(mut sched) = env.storage().persistent().get::<DataKey, VestingSchedule>(&key) {
+            let key = StorageKey::VestingSchedule(vault_id, i);
+            if let Some(mut sched) = env.storage().persistent().get::<StorageKey, VestingSchedule>(&key) {
                 sched.claimed_installments = sched.num_installments;
                 env.storage().persistent().set(&key, &sched);
             }
