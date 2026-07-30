@@ -86,6 +86,8 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
+mod release_conditions_query_tests;
+#[cfg(test)]
 mod beneficiary_waitlist_tests;
 #[cfg(test)]
 mod beneficiary_notification_tests;
@@ -2721,7 +2723,7 @@ impl TtlVaultContract {
         }
 
         // Load release conditions
-        let conditions = Self::get_release_conditions(&env, vault_id);
+        let conditions = Self::get_release_conditions(env.clone(), vault_id);
         let mut condition_met = false;
         for cond in conditions.iter() {
             match cond {
@@ -7512,12 +7514,13 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Helper to retrieve stored release conditions.
-    fn get_release_conditions(env: &Env, vault_id: u64) -> Vec<ReleaseCondition> {
+    /// Returns the release conditions attached to a vault.
+    /// Returns an empty vector if none have been set.
+    pub fn get_release_conditions(env: Env, vault_id: u64) -> Vec<ReleaseCondition> {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseConditions(vault_id))
-            .unwrap_or_else(|| Vec::new(env))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Owner‑initiated panic release.
