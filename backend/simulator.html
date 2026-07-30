@@ -3,17 +3,35 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="TTL-Legacy vault release simulator — project when your vault will release to its beneficiary" />
   <title>TTL-Legacy — Release Simulator</title>
   <style>
     /* ── Reset & base ─────────────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Skip link (visually hidden until focused) ────────────────────── */
+    .skip-link {
+      position: absolute;
+      top: -100%;
+      left: 0;
+      background: var(--accent);
+      color: #fff;
+      padding: 0.5rem 1rem;
+      border-radius: 0 0 var(--radius) 0;
+      font-weight: 600;
+      font-size: 0.9rem;
+      text-decoration: none;
+      z-index: 1000;
+      transition: top 0.15s;
+    }
+    .skip-link:focus { top: 0; }
 
     :root {
       --bg:        #0f1117;
       --surface:   #1a1d27;
       --border:    #2a2e3f;
       --text:      #e2e8f0;
-      --muted:     #8892a4;
+      --muted:     #9aa3b2;
       --accent:    #6366f1;
       --accent-h:  #818cf8;
       --danger:    #ef4444;
@@ -265,17 +283,35 @@
       font-weight: 600;
     }
     .never-text { color: var(--success); font-style: italic; }
+
+    /* ── Mobile responsiveness (#1105) ───────────────────────────────── */
+    @media (max-width: 600px) {
+      header h1 { font-size: 1.25rem; }
+      .card { padding: 1rem; }
+      .run-btn { width: 100%; }
+      .tl-days { width: auto; }
+    }
+
+    @media (max-width: 480px) {
+      .scenarios-grid { grid-template-columns: 1fr; }
+      .tl-label { width: 110px; }
+    }
+
+    @media (max-width: 400px) {
+      .tl-label { display: none; }
+    }
   </style>
 </head>
 <body>
-<div class="container">
-  <header>
+<a href="#main-content" class="skip-link">Skip to main content</a>
+<div class="container" id="main-content" role="main">
+  <header role="banner">
     <h1>🕰️ Release Simulator</h1>
     <p>Project when your TTL-Legacy vault will release to its beneficiary based on check-in behaviour scenarios.</p>
   </header>
 
   <!-- ── Input Card ────────────────────────────────────────────────────── -->
-  <div class="card">
+  <div class="card" aria-label="Simulation Parameters">
     <p class="card-title">Simulation Parameters</p>
     <div class="form-grid">
       <div class="field">
@@ -291,34 +327,38 @@
         <input id="missedCount" type="number" value="1" min="1" max="100" />
       </div>
       <div class="field" style="align-self: end;">
-        <label>Scenarios to Simulate</label>
-        <div class="checkboxes">
-          <label><input type="checkbox" id="s-no-check-ins" value="no_check_ins" checked /> No check-ins</label>
-          <label><input type="checkbox" id="s-consistent" value="consistent_check_ins" checked /> Consistent</label>
-          <label><input type="checkbox" id="s-missed" value="missed_check_in_dates" checked /> Missed dates</label>
-        </div>
+        <fieldset style="border:none;padding:0;margin:0;">
+          <legend class="field" style="font-size:0.85rem;color:var(--muted);font-weight:500;margin-bottom:0.35rem;">Scenarios to Simulate</legend>
+          <div class="checkboxes">
+            <label><input type="checkbox" id="s-no-check-ins" value="no_check_ins" checked /> No check-ins</label>
+            <label><input type="checkbox" id="s-consistent" value="consistent_check_ins" checked /> Consistent</label>
+            <label><input type="checkbox" id="s-missed" value="missed_check_in_dates" checked /> Missed dates</label>
+          </div>
+        </fieldset>
       </div>
     </div>
-    <button class="run-btn" id="runBtn" onclick="runSimulation()">▶ Run Simulation</button>
-    <div id="statusMsg"></div>
+    <button class="run-btn" id="runBtn" onclick="runSimulation()" aria-busy="false">▶ Run Simulation</button>
+    <div id="statusMsg" role="status" aria-live="polite"></div>
   </div>
 
   <!-- ── Results ──────────────────────────────────────────────────────── -->
-  <div id="results" style="display:none;">
+  <div id="results" role="region" aria-label="Simulation Results" style="display:none;">
     <!-- Vault meta -->
     <div class="meta-row" id="vaultMeta"></div>
 
     <!-- Scenario cards -->
     <div class="card" id="scenariosCard" style="padding-bottom:1rem;">
       <p class="card-title">Projected Release Dates</p>
-      <div class="scenarios-grid" id="scenariosGrid"></div>
+      <div class="scenarios-grid" id="scenariosGrid" role="list"></div>
     </div>
 
     <!-- Timeline -->
     <div class="card">
       <div class="timeline">
         <p class="timeline-title">Relative Timeline (days until release)</p>
-        <div id="timelineRows"></div>
+        <div style="overflow-x: auto;">
+          <div id="timelineRows" role="list"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -388,6 +428,7 @@ async function runSimulation() {
   }
 
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   btn.innerHTML = '<span class="spinner"></span>Simulating…';
   resultsEl.style.display = 'none';
 
@@ -411,6 +452,7 @@ async function runSimulation() {
     statusEl.innerHTML = `<div class="status-msg error">⚠ ${e.message}</div>`;
   } finally {
     btn.disabled = false;
+    btn.setAttribute('aria-busy', 'false');
     btn.textContent = '▶ Run Simulation';
   }
 }
@@ -451,6 +493,7 @@ function renderResults(data) {
     // Scenario card
     const card = document.createElement('div');
     card.className = `scenario-card ${s.confidence}`;
+    card.setAttribute('role', 'listitem');
     card.innerHTML = `
       <p class="scenario-name">${escHtml(scenarioLabel(s.scenario))}</p>
       <span class="confidence-badge ${s.confidence}">${s.confidence} confidence</span>
@@ -466,6 +509,7 @@ function renderResults(data) {
     // Timeline row
     const row = document.createElement('div');
     row.className = 'tl-row';
+    row.setAttribute('role', 'listitem');
     const pct = isNever ? 0 : Math.round((s.seconds_until_release / maxSecs) * 100);
     row.innerHTML = `
       <span class="tl-label">${escHtml(scenarioLabel(s.scenario))}</span>
