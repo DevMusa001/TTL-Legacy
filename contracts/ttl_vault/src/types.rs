@@ -151,6 +151,8 @@ pub const WRAPPED_TOKEN_REGISTERED_TOPIC: Symbol = symbol_short!("wrp_reg");
 pub const WRAPPED_TOKEN_UNREGISTERED_TOPIC: Symbol = symbol_short!("wrp_unr");
 // Issue #568: withdrawal reversal
 pub const WITHDRAWAL_REVERSED_TOPIC: Symbol = symbol_short!("wd_rev");
+// Issue #1134: withdrawal cancellation
+pub const WITHDRAWAL_CANCELLED_TOPIC: Symbol = symbol_short!("wd_cancel");
 pub const REVERSAL_GRACE_EXPIRED_TOPIC: Symbol = symbol_short!("rev_exp");
 // Issue #547: vesting penalty applied
 pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
@@ -357,7 +359,7 @@ pub const MAX_RELEASE_MEMO_LEN: u32 = 256;
 
 #[contracttype(export = false)]
 #[derive(Clone)]
-pub enum DataKey {
+pub enum StorageKey {
     Vault(u64),
     OwnerVaults(Address),
     MaxVaultsPerOwner,

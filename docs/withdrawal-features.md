@@ -207,6 +207,7 @@ Reverses a withdrawal within the grace period.
 
 **Events:**
 - `WITHDRAWAL_REVERSED_TOPIC`: Emitted when a withdrawal is successfully reversed
+- `WITHDRAWAL_CANCELLED_TOPIC`: Emitted when a withdrawal is cancelled (Issue #1134)
 
 #### `get_withdrawal_reversal(vault_id, withdrawal_id) -> Option<WithdrawalReversal>`
 Retrieves a withdrawal reversal record.
@@ -242,6 +243,7 @@ pub struct WithdrawalReversal {
 
 ### Events
 - `WITHDRAWAL_REVERSED_TOPIC`: Emitted when a withdrawal is reversed
+- `WITHDRAWAL_CANCELLED_TOPIC`: Emitted when a withdrawal is cancelled (Issue #1134)
 - `REVERSAL_GRACE_EXPIRED_TOPIC`: Emitted when a grace period expires
 
 ---
