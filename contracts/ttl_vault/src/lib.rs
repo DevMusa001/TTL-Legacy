@@ -155,6 +155,11 @@ pub const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
 /// 72-hour time-lock before upgrade can be executed (in seconds)
 pub const UPGRADE_TIMELOCK: u64 = 259_200; // 72 hours
 
+/// Maximum hibernation duration in seconds.
+/// Soroban's maximum persistent entry TTL is 3_110_400 ledgers at ~5 s/ledger ≈ 180 days.
+/// We cap hibernation at that ceiling so storage extension can never fail.
+pub const MAX_HIBERNATION_SECONDS: u64 = 15_552_000; // 180 days
+
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
 /// interval, capped at the Soroban maximum.
@@ -229,55 +234,7 @@ pub enum ContractError {
     VotingNotEnabled = 54,
     AlreadyHibernating = 55,
     NotHibernating = 56,
-    DuplicateVault = 57,
-    CheckInTooFrequent = 58,
-    VaultFrozen = 59,
-    CliffNotReached = 60,
-    InsufficientTtlToAccelerate = 61,
-    TtlBorrowNotFound = 62,
-    TtlBorrowAlreadyRepaid = 63,
-    // Issue #565: withdrawal scheduling validation
-    OverlappingWithdrawalSchedule = 64,
-    ConflictingWithdrawalSchedule = 65,
-    // Issue #566: withdrawal limits by time
-    DailyWithdrawalLimitExceeded = 66,
-    WeeklyWithdrawalLimitExceeded = 67,
-    MonthlyWithdrawalLimitExceeded = 68,
-    // Issue #567: withdrawal destination whitelist
-    WithdrawalDestinationNotWhitelisted = 69,
-    // Issue #568: withdrawal reversal
-    WithdrawalReversalGracePeriodExpired = 70,
-    WithdrawalAlreadyReversed = 71,
-    // Issue #545: vesting catch-up
-    CatchUpNotEnabled = 72,
-    // Issue #546: vesting bonus
-    BonusNotEnabled = 73,
-    TokenNotWhitelisted = 74,
-    // Issue #526: post-release clawback
-    NotReleased = 75,
-    GracePeriodExpired = 76,
-    NothingToClawback = 77,
-    // Issue #527: beneficiary auction
-    AuctionNotFound = 78,
-    AuctionAlreadyExists = 79,
-    AuctionEnded = 80,
-    AuctionNotEnded = 81,
-    InvalidVestingSchedule = 82,
-    // Per-delegation nonce mismatch (replay attack prevention)
-    InvalidNonce = 83,
-    PasskeyExpired = 84,
-    PasskeyCompromised = 85,
-    ChallengeNotFound = 86,
-    ChallengeExpired = 87,
-    DuplicateSignature = 88,
-    CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
-    SnapshotNotFound = 90,         // Issue #1123: Vault archiving
-    AlreadyOwner = 91,             // Issue #1119: Two-step ownership transfer
-    NoPendingUpgrade = 92,         // Issue #1120: Contract upgrade mechanism
-    UpgradeTimelocked = 93,        // Issue #1120: Upgrade not yet executable
-    UpgradeInvalidWasm = 94,       // Issue #1120: Invalid WASM hash
-    TokenNotAllowed = 95,          // Issue #1118: Token not in allowlist
-    BeneficiaryMustBeAccount = 96, // Beneficiary must be a regular account, not a contract
+    HibernationDurationTooLong = 57,
 }
 
 #[contract]
@@ -3278,10 +3235,34 @@ impl TtlVaultContract {
     /// This allows the owner to distribute funds gradually while keeping the vault
     /// in Locked status. The vault can still be checked in and released later.
     ///
-    /// When a multi-beneficiary split has been configured via `set_beneficiaries`, the
-    /// `amount` is distributed proportionally according to each entry's BPS allocation,
-    /// using the same rounding logic as `trigger_release` (last entry absorbs dust).
-    /// When no split is configured, the full `amount` goes to the primary beneficiary.
+    /// # Returns
+    /// The owner `Address`
+    pub fn get_vault_owner(env: Env, vault_id: u64) -> Address {
+        Self::load_vault(&env, vault_id).owner
+    }
+
+    /// Returns the primary beneficiary address of a vault.
+    ///
+    /// This is a cheap, focused query — it avoids fetching the full `Vault` struct
+    /// in contexts where only the beneficiary address is needed (e.g., release logic,
+    /// dashboard components).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The beneficiary `Address`.
+    ///
+    /// # Errors
+    /// Panics with `ContractError::VaultNotFound` if the vault does not exist.
+    pub fn get_beneficiary(env: Env, vault_id: u64) -> Result<Address, ContractError> {
+        Self::try_load_vault(&env, vault_id)
+            .map(|v| v.beneficiary)
+            .ok_or(ContractError::VaultNotFound)
+    }
+
+    /// Returns the creation timestamp of a vault.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -5937,6 +5918,24 @@ impl TtlVaultContract {
     /// Panics if the vault does not exist
     pub fn get_release_status(env: Env, vault_id: u64) -> ReleaseStatus {
         Self::load_vault(&env, vault_id).status
+    }
+
+    /// Returns the vault status without fetching the entire vault struct.
+    ///
+    /// This is a lightweight query function that reduces instruction consumption
+    /// for read-heavy paths where only the vault status is needed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// * `Ok(ReleaseStatus)` - The vault status (Locked, Released, Cancelled, or EmergencyFrozen)
+    /// * `Err(ContractError::VaultNotFound)` - If the vault does not exist
+    pub fn get_vault_status(env: Env, vault_id: u64) -> Result<ReleaseStatus, ContractError> {
+        Self::try_load_vault(&env, vault_id)
+            .map(|vault| vault.status)
+            .ok_or(ContractError::VaultNotFound)
     }
 
     /// Returns the total number of vaults created.
@@ -13335,11 +13334,20 @@ impl TtlVaultContract {
         vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
         env.storage().persistent().remove(&hib_key);
         Self::save_vault(&env, vault_id, &vault);
+        
+        // Calculate the new TTL remaining after exiting hibernation
+        let deadline = vault.last_check_in + vault.check_in_interval;
+        let new_ttl_remaining = if now >= deadline {
+            0u64
+        } else {
+            deadline - now
+        };
+        
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
-            .publish((HIBERNATION_EXITED_TOPIC, vault_id), (caller, now, elapsed));
+            .publish((HIBERNATION_EXITED_TOPIC, vault_id), (now, new_ttl_remaining));
         Ok(())
     }
 
@@ -15871,11 +15879,29 @@ impl TtlVaultContract {
     /// `Ok(())` on success
     ///
     /// # Errors
-    /// * `ContractError::NotAdmin` - If caller is not the admin
-    /// * `ContractError::Paused` - If contract is paused
-    pub fn add_allowed_token(env: Env, token: Address) -> Result<(), ContractError> {
-        if Self::load_paused(&env) {
-            return Err(ContractError::Paused);
+    /// * `ContractError::NotOwner`          - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased`   - Vault is not Locked
+    /// * `ContractError::AlreadyHibernating`- Vault is already hibernating
+    /// * `ContractError::InvalidInterval`   - `duration_seconds` is zero
+    pub fn enter_hibernation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if duration_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
+        if duration_seconds > MAX_HIBERNATION_SECONDS {
+            return Err(ContractError::HibernationDurationTooLong);
+        }
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
         }
         Self::require_admin(&env);
 
