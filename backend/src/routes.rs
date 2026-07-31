@@ -17,6 +17,7 @@ use crate::{
     error::AppError,
     handlers::{parse_scenario_types, simulate_release_handler, export_vaults_handler},
     models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
+    AppState,
 };
 
 #[derive(Deserialize)]

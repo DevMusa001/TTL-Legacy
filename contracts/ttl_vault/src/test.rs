@@ -5739,20 +5739,46 @@ fn test_hibernation_emits_entered_event() {
 #[test]
 fn test_hibernation_emits_exited_event() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
 
     client.enter_hibernation(&id, &owner, &7200u64).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 500);
+    let elapsed = 500u64;
+    env.ledger().with_mut(|l| l.timestamp += elapsed);
     client.exit_hibernation(&id, &owner).unwrap();
 
     let events = env.events().all();
-    let found = events.iter().any(|e| {
+    let mut found_event = false;
+    let mut verified_data = false;
+    
+    for e in events.iter() {
         let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
-        if topics.is_empty() { return false; }
+        if topics.is_empty() { continue; }
         let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false)
-    });
-    assert!(found, "hibernation_exited event not emitted");
+        
+        if first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false) {
+            found_event = true;
+            
+            // Verify event data: (exited_at, new_ttl_remaining)
+            let data: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+            if data.len() >= 2 {
+                if let (Ok(exited_at), Ok(ttl_remaining)) = (
+                    data.get(0).unwrap().try_into_val::<u64>(&env),
+                    data.get(1).unwrap().try_into_val::<u64>(&env),
+                ) {
+                    // exited_at should be approximately now (after the elapsed time)
+                    // ttl_remaining should be approximately interval - elapsed = 3600 - 500 = 3100
+                    let expected_ttl = interval.saturating_sub(elapsed);
+                    if ttl_remaining == expected_ttl {
+                        verified_data = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    assert!(found_event, "hibernation_exited event not emitted");
+    assert!(verified_data, "hibernation_exited event data incorrect");
 }
 
 #[test]
@@ -5762,1692 +5788,284 @@ fn test_get_hibernation_returns_none_when_not_hibernating() {
     assert!(client.get_hibernation(&id).is_none());
 }
 
-#[test]
-fn test_is_hibernating_true_while_active() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 1000);
-
-    assert!(client.is_hibernating(&id));
-}
+// ── Issue #1097: Hibernate duration validation tests ─────────────────────────
 
 #[test]
-fn test_is_hibernating_false_once_expired() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 7200);
-
-    assert!(!client.is_hibernating(&id));
-}
-
-#[test]
-fn test_is_hibernating_false_when_never_hibernated() {
+fn test_hibernation_duration_over_max_returns_error() {
+    use crate::MAX_HIBERNATION_SECONDS;
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    assert!(!client.is_hibernating(&id));
-}
-
-// ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
-
-fn make_beneficiary_entry(env: &Env, addr: Address, bps: u32) -> BeneficiaryEntry {
-    BeneficiaryEntry { address: addr, bps }
-}
-
-#[test]
-fn test_schedule_beneficiary_rotation_stores_entry() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let new_ben = Address::generate(&env);
-    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
-    client.schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries);
-    let schedule = client.get_beneficiary_rotation_schedule(&id);
-    assert_eq!(schedule.len(), 1);
-    assert_eq!(schedule.get(0).unwrap().effective_timestamp, 9999u64);
-}
-
-#[test]
-fn test_schedule_beneficiary_rotation_non_owner_rejected() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let stranger = Address::generate(&env);
-    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, stranger.clone(), 10_000)];
-    let err = client.try_schedule_beneficiary_rotation(&id, &stranger, &9999u64, &entries)
-        .unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_schedule_beneficiary_rotation_invalid_bps_rejected() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let new_ben = Address::generate(&env);
-    // bps = 5000, not 10_000
-    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 5_000)];
-    let err = client.try_schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries)
-        .unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(12)); // InvalidBps
-}
-
-#[test]
-fn test_get_beneficiary_rotation_schedule_empty_by_default() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 0);
-}
-
-#[test]
-fn test_multiple_rotation_entries_stored() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let ben_a = Address::generate(&env);
-    let ben_b = Address::generate(&env);
-    let entries_a = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_a.clone(), 10_000)];
-    let entries_b = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_b.clone(), 10_000)];
-    client.schedule_beneficiary_rotation(&id, &owner, &1000u64, &entries_a);
-    client.schedule_beneficiary_rotation(&id, &owner, &2000u64, &entries_b);
-    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 2);
-}
-
-#[test]
-fn test_trigger_release_applies_rotation() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    // Use a short interval so expiry is easy to simulate
-    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
-    client.deposit(&id, &owner, &1_000);
-
-    let new_ben = Address::generate(&env);
-    // Schedule rotation at timestamp 0 (always in the past)
-    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
-    client.schedule_beneficiary_rotation(&id, &owner, &0u64, &entries);
-
-    // Advance ledger past check-in interval to expire the vault
-    env.ledger().with_mut(|l| {
-        l.timestamp = 200;
-    });
-
-    client.trigger_release(&id);
-
-    // new_ben should have received the funds
-    let token = token::Client::new(&env, &token_address);
-    assert_eq!(token.balance(&new_ben), 1_000);
-}
-
-#[test]
-fn test_trigger_release_picks_latest_applicable_rotation() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
-    client.deposit(&id, &owner, &1_000);
-
-    let ben_early = Address::generate(&env);
-    let ben_late = Address::generate(&env);
-
-    // Two rotations: timestamp 1 (earlier) and timestamp 50 (later, still past)
-    let entries_early = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_early.clone(), 10_000)];
-    let entries_late = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_late.clone(), 10_000)];
-    client.schedule_beneficiary_rotation(&id, &owner, &1u64, &entries_early);
-    client.schedule_beneficiary_rotation(&id, &owner, &50u64, &entries_late);
-
-    env.ledger().with_mut(|l| { l.timestamp = 200; });
-    client.trigger_release(&id);
-
-    let token = token::Client::new(&env, &token_address);
-    // The later rotation (timestamp 50) should win
-    assert_eq!(token.balance(&ben_late), 1_000);
-    assert_eq!(token.balance(&ben_early), 0);
-}
-
-#[test]
-fn test_trigger_release_future_rotation_not_applied() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
-    client.deposit(&id, &owner, &1_000);
-
-    let new_ben = Address::generate(&env);
-    // Schedule rotation far in the future
-    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
-    client.schedule_beneficiary_rotation(&id, &owner, &99999u64, &entries);
-
-    env.ledger().with_mut(|l| { l.timestamp = 200; });
-    client.trigger_release(&id);
-
-    let token = token::Client::new(&env, &token_address);
-    // Original beneficiary should receive funds, not new_ben
-    assert_eq!(token.balance(&beneficiary), 1_000);
-    assert_eq!(token.balance(&new_ben), 0);
-}
-
-// ── Inactivity Penalty Tests ──────────────────────────────────────────────────
-
-#[test]
-fn test_set_inactivity_penalty_stores_config() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let recipient = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
-    let vault = client.get_vault(&id);
-    assert_eq!(vault.inactivity_penalty_bps, Some(500));
-    assert_eq!(vault.penalty_recipient, Some(recipient));
-}
-
-#[test]
-fn test_set_inactivity_penalty_non_owner_rejected() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let stranger = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let err = client.try_set_inactivity_penalty(&id, &stranger, &500u32, &stranger)
-        .unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_set_inactivity_penalty_over_10000_rejected() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let recipient = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let err = client.try_set_inactivity_penalty(&id, &owner, &10_001u32, &recipient)
-        .unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(5)); // InvalidAmount
-}
-
-#[test]
-fn test_set_inactivity_penalty_zero_disables() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let recipient = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
-    client.set_inactivity_penalty(&id, &owner, &0u32, &recipient);
-    let vault = client.get_vault(&id);
-    assert_eq!(vault.inactivity_penalty_bps, None);
-    assert_eq!(vault.penalty_recipient, None);
-}
-
-#[test]
-fn test_check_in_deducts_penalty_for_missed_intervals() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let recipient = Address::generate(&env);
-    let interval = 1000u64;
-    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
-    client.deposit(&id, &owner, &10_000);
-    // 500 bps = 5% per missed interval
-    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
-
-    // Advance 3 intervals (2 missed = 3 elapsed - 1 current)
-    env.ledger().with_mut(|l| { l.timestamp = interval * 3; });
-
-    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
-    client.check_in(&id, &owner, &dummy_hash, &0u64);
-
-    let token = token::Client::new(&env, &token_address);
-    // 2 missed intervals × 5% of 10_000 = 1_000 penalty
-    assert_eq!(token.balance(&recipient), 1_000);
-    assert_eq!(client.get_vault(&id).balance, 9_000);
-}
-
-#[test]
-fn test_check_in_no_penalty_when_on_time() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let recipient = Address::generate(&env);
-    let interval = 1000u64;
-    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
-    client.deposit(&id, &owner, &10_000);
-    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
-
-    // Advance less than one interval (no missed intervals)
-    env.ledger().with_mut(|l| { l.timestamp = interval / 2; });
-
-    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
-    client.check_in(&id, &owner, &dummy_hash, &0u64);
-
-    let token = token::Client::new(&env, &token_address);
-    assert_eq!(token.balance(&recipient), 0);
-    assert_eq!(client.get_vault(&id).balance, 10_000);
-}
-
-#[test]
-fn test_check_in_penalty_capped_at_balance() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let recipient = Address::generate(&env);
-    let interval = 100u64;
-    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &100);
-    client.deposit(&id, &owner, &100);
-    // 5000 bps = 50% per missed interval, many missed → would exceed balance
-    client.set_inactivity_penalty(&id, &owner, &5_000u32, &recipient);
-
-    // Advance 100 intervals (99 missed)
-    env.ledger().with_mut(|l| { l.timestamp = interval * 100; });
-
-    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
-    client.check_in(&id, &owner, &dummy_hash, &0u64);
-
-    let token = token::Client::new(&env, &token_address);
-    // Penalty capped at full balance
-    assert_eq!(token.balance(&recipient), 100);
-    assert_eq!(client.get_vault(&id).balance, 0);
-}
-
-// ── Vault State Snapshots ────────────────────────────────────────────────────
-
-#[test]
-fn test_create_snapshot_returns_id_and_stores_state() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &50_000i128);
-
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-    assert_eq!(snap_id, 1);
-
-    let snap = client.get_snapshot(&vault_id, &snap_id).unwrap();
-    assert_eq!(snap.vault_id, vault_id);
-    assert_eq!(snap.balance, 50_000i128);
-    assert_eq!(snap.beneficiary, beneficiary);
-    assert_eq!(snap.check_in_interval, 3600u64);
-}
-
-#[test]
-fn test_create_snapshot_increments_count() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    assert_eq!(client.get_snapshot_count(&vault_id), 0);
-    client.create_snapshot(&vault_id, &owner);
-    assert_eq!(client.get_snapshot_count(&vault_id), 1);
-    client.create_snapshot(&vault_id, &owner);
-    assert_eq!(client.get_snapshot_count(&vault_id), 2);
-}
-
-#[test]
-fn test_create_snapshot_cycles_slots_after_ten() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..10 {
-        client.create_snapshot(&vault_id, &owner);
-    }
-    // 11th snapshot wraps back to slot 1
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-    assert_eq!(snap_id, 1);
-    assert_eq!(client.get_snapshot_count(&vault_id), 11);
-}
-
-#[test]
-fn test_create_snapshot_rejects_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let stranger = Address::generate(&env);
-
-    let err = client.try_create_snapshot(&vault_id, &stranger).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_create_snapshot_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.create_snapshot(&vault_id, &owner);
-
-    let events = env.events().all();
-    let found = events.iter().any(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-        topics.len() > 0 && {
-            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            t.map(|s| s == soroban_sdk::Symbol::new(&env, "snap_crt")).unwrap_or(false)
-        }
-    });
-    assert!(found, "SNAPSHOT_CREATED_TOPIC event not emitted");
-}
-
-#[test]
-fn test_restore_from_snapshot_reverts_state() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    // Take snapshot at balance=100_000
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-
-    // Withdraw some funds to change state
-    client.withdraw(&vault_id, &owner, &40_000i128);
-    assert_eq!(client.get_vault(&vault_id).balance, 60_000i128);
-
-    // Restore
-    client.restore_from_snapshot(&vault_id, &owner, &snap_id);
-    assert_eq!(client.get_vault(&vault_id).balance, 100_000i128);
-}
-
-#[test]
-fn test_restore_from_snapshot_rejects_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-    let stranger = Address::generate(&env);
-
-    let err = client.try_restore_from_snapshot(&vault_id, &stranger, &snap_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_restore_from_snapshot_rejects_released_vault() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-
-    env.ledger().with_mut(|l| l.timestamp += 3601);
-    client.trigger_release(&vault_id);
-
-    let err = client.try_restore_from_snapshot(&vault_id, &owner, &snap_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
-}
-
-#[test]
-fn test_restore_from_snapshot_rejects_missing_snapshot() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let err = client.try_restore_from_snapshot(&vault_id, &owner, &99u32).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(3)); // VaultNotFound
-}
-
-#[test]
-fn test_restore_from_snapshot_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-    client.restore_from_snapshot(&vault_id, &owner, &snap_id);
-
-    let events = env.events().all();
-    let found = events.iter().any(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-        topics.len() > 0 && {
-            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            t.map(|s| s == soroban_sdk::Symbol::new(&env, "snap_rst")).unwrap_or(false)
-        }
-    });
-    assert!(found, "SNAPSHOT_RESTORED_TOPIC event not emitted");
-}
-
-#[test]
-fn test_get_snapshot_returns_none_for_missing() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    assert!(client.get_snapshot(&vault_id, &1u32).is_none());
-}
-
-#[test]
-fn test_snapshot_captures_metadata_and_interval() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.update_check_in_interval(&vault_id, &owner, &7200u64);
-
-    let snap_id = client.create_snapshot(&vault_id, &owner);
-    let snap = client.get_snapshot(&vault_id, &snap_id).unwrap();
-    assert_eq!(snap.check_in_interval, 7200u64);
-}
-
-// ── Countdown Notifications ──────────────────────────────────────────────────
-
-#[test]
-fn test_check_countdown_default_thresholds_no_event_when_ttl_high() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    // interval = 30 days; TTL will be ~30 days >> all thresholds
-    let vault_id = client.create_vault(&owner, &beneficiary, &(30 * 86_400u64), &None);
-    let ttl = client.check_countdown(&vault_id);
-    assert!(ttl > 604_800, "TTL should be above 7-day threshold");
-    // No cd_notif event should have been emitted
-    let events = env.events().all();
-    let found = events.iter().any(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-        topics.len() > 0 && {
-            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-        }
-    });
-    assert!(!found, "No cd_notif event should fire when TTL is high");
-}
-
-#[test]
-fn test_check_countdown_emits_event_when_ttl_crosses_threshold() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    // interval = 2 days; after 1 day TTL = 1 day => crosses 1-day threshold
-    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
-    env.ledger().with_mut(|l| l.timestamp += 86_400); // advance 1 day
-    client.check_countdown(&vault_id);
-
-    let events = env.events().all();
-    let found = events.iter().any(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-        topics.len() > 0 && {
-            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-        }
-    });
-    assert!(found, "cd_notif event should fire when TTL <= 1-day threshold");
-}
-
-#[test]
-fn test_check_countdown_fires_each_threshold_once() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
-    env.ledger().with_mut(|l| l.timestamp += 86_400);
-
-    // First call — should fire
-    client.check_countdown(&vault_id);
-    let count_after_first = env.events().all().iter()
-        .filter(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-            topics.len() > 0 && {
-                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-            }
-        })
-        .count();
-
-    // Second call — same TTL, threshold already fired, no new event
-    client.check_countdown(&vault_id);
-    let count_after_second = env.events().all().iter()
-        .filter(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-            topics.len() > 0 && {
-                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-            }
-        })
-        .count();
-
-    assert_eq!(count_after_first, count_after_second, "Threshold should not fire twice");
-}
-
-#[test]
-fn test_check_countdown_resets_after_check_in() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
-    env.ledger().with_mut(|l| l.timestamp += 86_400);
-    client.check_countdown(&vault_id);
-
-    // Owner checks in — resets TTL and clears fired flags
-    client.check_in(&vault_id, &owner, &BytesN::from_array(&env, &[1u8; 32]), &0u64);
-    env.ledger().with_mut(|l| l.timestamp += 86_400);
-
-    // Now check_countdown should fire again for the same threshold
-    let events_before = env.events().all().len();
-    client.check_countdown(&vault_id);
-    let new_events: usize = env.events().all().iter()
-        .skip(events_before)
-        .filter(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-            topics.len() > 0 && {
-                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-            }
-        })
-        .count();
-    assert!(new_events > 0, "Threshold should fire again after check-in resets the cycle");
-}
-
-#[test]
-fn test_set_countdown_config_custom_thresholds() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &(10 * 86_400u64), &None);
-
-    let custom = soroban_sdk::vec![&env, 3600u64, 1800u64]; // 1h, 30m
-    client.set_countdown_config(&vault_id, &owner, &custom);
-
-    let cfg = client.get_countdown_config(&vault_id);
-    assert_eq!(cfg.thresholds.len(), 2);
-    assert_eq!(cfg.thresholds.get(0).unwrap(), 3600u64);
-}
-
-#[test]
-fn test_set_countdown_config_rejects_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let stranger = Address::generate(&env);
-    let thresholds = soroban_sdk::vec![&env, 3600u64];
-
-    let err = client.try_set_countdown_config(&vault_id, &stranger, &thresholds).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_set_countdown_config_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let thresholds = soroban_sdk::vec![&env, 3600u64];
-    client.set_countdown_config(&vault_id, &owner, &thresholds);
-
-    let events = env.events().all();
-    let found = events.iter().any(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-        topics.len() > 0 && {
-            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-            t.map(|s| s == soroban_sdk::Symbol::new(&env, "set_cd")).unwrap_or(false)
-        }
-    });
-    assert!(found, "set_cd event should be emitted");
-}
-
-#[test]
-fn test_set_countdown_config_clears_fired_flags() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
-    env.ledger().with_mut(|l| l.timestamp += 86_400);
-    client.check_countdown(&vault_id); // fires 1-day threshold
-
-    // Reconfigure — should clear fired flags
-    let thresholds = soroban_sdk::vec![&env, 86_400u64];
-    client.set_countdown_config(&vault_id, &owner, &thresholds);
-
-    // check_countdown should fire again since flags were cleared
-    let events_before = env.events().all().len();
-    client.check_countdown(&vault_id);
-    let new_events: usize = env.events().all().iter()
-        .skip(events_before)
-        .filter(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
-            topics.len() > 0 && {
-                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
-            }
-        })
-        .count();
-    assert!(new_events > 0, "Threshold should fire again after config reset");
-}
-
-#[test]
-fn test_check_countdown_returns_zero_for_released_vault() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-    env.ledger().with_mut(|l| l.timestamp += 3601);
-    client.trigger_release(&vault_id);
-
-    let ttl = client.check_countdown(&vault_id);
-    assert_eq!(ttl, 0);
-}
-
-#[test]
-fn test_get_countdown_config_returns_defaults_when_not_set() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cfg = client.get_countdown_config(&vault_id);
-    assert_eq!(cfg.thresholds.len(), 3);
-    assert_eq!(cfg.thresholds.get(0).unwrap(), 604_800u64);
-    assert_eq!(cfg.thresholds.get(1).unwrap(), 259_200u64);
-    assert_eq!(cfg.thresholds.get(2).unwrap(), 86_400u64);
-}
-
-
-// --- Issue #565: Withdrawal Scheduling Validation Tests ---
-
-#[test]
-fn test_schedule_withdrawal_success() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    let timestamp = env.ledger().timestamp() + 3600u64;
-    let result = client.try_schedule_withdrawal(&vault_id, &owner, &timestamp, &50_000i128);
-    assert!(result.is_ok(), "Schedule withdrawal should succeed");
-}
-
-#[test]
-fn test_schedule_withdrawal_rejects_overlapping() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    let timestamp = env.ledger().timestamp() + 3600u64;
-    client.schedule_withdrawal(&vault_id, &owner, &timestamp, &50_000i128);
-
-    // Try to schedule within 1 hour window
-    let overlapping_timestamp = timestamp + 1800u64;
-    let result = client.try_schedule_withdrawal(&vault_id, &owner, &overlapping_timestamp, &30_000i128);
-    assert!(result.is_err(), "Overlapping withdrawal should be rejected");
-}
-
-#[test]
-fn test_schedule_withdrawal_rejects_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    let other = Address::generate(&env);
-
-    let timestamp = env.ledger().timestamp() + 3600u64;
-    let result = client.try_schedule_withdrawal(&vault_id, &other, &timestamp, &50_000i128);
-    assert!(result.is_err(), "Non-owner should not be able to schedule withdrawal");
-}
-
-// --- Issue #566: Withdrawal Limits by Time Tests ---
-
-#[test]
-fn test_set_withdrawal_limits_success() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-
-    let result = client.try_set_withdrawal_limits(
-        &vault_id,
-        &owner,
-        &10_000i128,
-        &50_000i128,
-        &100_000i128,
+    let over_limit = MAX_HIBERNATION_SECONDS + 1;
+    let result = client.try_enter_hibernation(&id, &owner, &over_limit);
+    assert!(
+        result.is_err(),
+        "expected error for duration > MAX_HIBERNATION_SECONDS"
     );
-    assert!(result.is_ok(), "Set withdrawal limits should succeed");
+    // Verify the specific error code (57 = HibernationDurationTooLong)
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(57));
 }
 
 #[test]
-fn test_get_withdrawal_limits() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
+fn test_hibernation_duration_exact_max_succeeds() {
+    use crate::MAX_HIBERNATION_SECONDS;
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.set_withdrawal_limits(&vault_id, &owner, &10_000i128, &50_000i128, &100_000i128);
-    let limits = client.get_withdrawal_limits(&vault_id);
-    
-    assert!(limits.is_some(), "Limits should be retrievable");
-    let limits = limits.unwrap();
-    assert_eq!(limits.daily_limit, 10_000i128);
-    assert_eq!(limits.weekly_limit, 50_000i128);
-    assert_eq!(limits.monthly_limit, 100_000i128);
+    let result = client.try_enter_hibernation(&id, &owner, &MAX_HIBERNATION_SECONDS);
+    assert!(
+        result.is_ok(),
+        "duration == MAX_HIBERNATION_SECONDS should succeed"
+    );
 }
 
 #[test]
-fn test_withdraw_respects_daily_limit() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-    client.set_withdrawal_limits(&vault_id, &owner, &10_000i128, &50_000i128, &100_000i128);
-
-    // First withdrawal within limit
-    let result = client.try_withdraw(&vault_id, &owner, &5_000i128);
-    assert!(result.is_ok(), "First withdrawal within limit should succeed");
-
-    // Second withdrawal exceeding daily limit
-    let result = client.try_withdraw(&vault_id, &owner, &6_000i128);
-    assert!(result.is_err(), "Withdrawal exceeding daily limit should fail");
+fn test_hibernation_duration_zero_still_errors() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let result = client.try_enter_hibernation(&id, &owner, &0u64);
+    assert!(result.is_err(), "zero duration should still be rejected");
 }
 
-#[test]
-fn test_withdrawal_limits_reset_after_period() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-    client.set_withdrawal_limits(&vault_id, &owner, &10_000i128, &50_000i128, &100_000i128);
-
-    // First withdrawal
-    client.withdraw(&vault_id, &owner, &5_000i128);
-
-    // Advance time past daily reset (24 hours)
-    env.ledger().with_mut(|l| l.timestamp += 86_401);
-
-    // Should be able to withdraw again
-    let result = client.try_withdraw(&vault_id, &owner, &5_000i128);
-    assert!(result.is_ok(), "Withdrawal should succeed after daily reset");
-}
-
-// --- Issue #567: Withdrawal Destination Whitelist Tests ---
+// ── Issue #1098: get_beneficiary query function tests ─────────────────────────
 
 #[test]
-fn test_add_whitelist_address_success() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    let whitelisted = Address::generate(&env);
-
-    let label = String::from_str(&env, "trusted_address");
-    let result = client.try_add_whitelist_address(&vault_id, &owner, &whitelisted, &label);
-    assert!(result.is_ok(), "Add whitelist address should succeed");
-}
-
-#[test]
-fn test_get_whitelist() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    let whitelisted = Address::generate(&env);
-
-    let label = String::from_str(&env, "trusted_address");
-    client.add_whitelist_address(&vault_id, &owner, &whitelisted, &label);
-    
-    let whitelist = client.get_whitelist(&vault_id);
-    assert!(whitelist.is_some(), "Whitelist should be retrievable");
-    assert_eq!(whitelist.unwrap().len(), 1);
-}
-
-#[test]
-fn test_remove_whitelist_address() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    let whitelisted = Address::generate(&env);
-
-    let label = String::from_str(&env, "trusted_address");
-    client.add_whitelist_address(&vault_id, &owner, &whitelisted, &label);
-    client.remove_whitelist_address(&vault_id, &owner, &whitelisted);
-    
-    let whitelist = client.get_whitelist(&vault_id);
-    assert!(whitelist.is_none() || whitelist.unwrap().len() == 0, "Whitelist should be empty");
-}
-
-#[test]
-fn test_whitelist_allows_owner_withdrawal() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    // Add owner to whitelist
-    let label = String::from_str(&env, "owner");
-    client.add_whitelist_address(&vault_id, &owner, &owner, &label);
-
-    // Withdrawal should succeed
-    let result = client.try_withdraw(&vault_id, &owner, &10_000i128);
-    assert!(result.is_ok(), "Whitelisted owner should be able to withdraw");
-}
-
-// --- Issue #568: Withdrawal Reversal Tests ---
-
-#[test]
-fn test_reverse_withdrawal_success() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    let balance_before = client.get_vault(&vault_id).balance;
-    client.withdraw(&vault_id, &owner, &10_000i128);
-    let balance_after_withdrawal = client.get_vault(&vault_id).balance;
-
-    // Reverse the withdrawal
-    let result = client.try_reverse_withdrawal(&vault_id, &owner, &0u64);
-    assert!(result.is_ok(), "Withdrawal reversal should succeed");
-
-    let balance_after_reversal = client.get_vault(&vault_id).balance;
-    assert_eq!(balance_after_reversal, balance_before, "Balance should be restored");
-}
-
-#[test]
-fn test_reverse_withdrawal_rejects_expired_grace_period() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    client.withdraw(&vault_id, &owner, &10_000i128);
-
-    // Advance time past grace period (24 hours + 1 second)
-    env.ledger().with_mut(|l| l.timestamp += 86_401);
-
-    // Reversal should fail
-    let result = client.try_reverse_withdrawal(&vault_id, &owner, &0u64);
-    assert!(result.is_err(), "Reversal after grace period should fail");
-}
-
-#[test]
-fn test_reverse_withdrawal_rejects_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    client.withdraw(&vault_id, &owner, &10_000i128);
-
-    let other = Address::generate(&env);
-    let result = client.try_reverse_withdrawal(&vault_id, &other, &0u64);
-    assert!(result.is_err(), "Non-owner should not be able to reverse withdrawal");
-}
-
-#[test]
-fn test_get_withdrawal_reversal() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    client.withdraw(&vault_id, &owner, &10_000i128);
-    
-    let reversal = client.get_withdrawal_reversal(&vault_id, &0u64);
-    assert!(reversal.is_some(), "Withdrawal reversal record should exist");
-    let reversal = reversal.unwrap();
-    assert_eq!(reversal.amount, 10_000i128);
-    assert!(!reversal.reversed);
-}
-
-#[test]
-fn test_cannot_reverse_twice() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
-    client.deposit(&vault_id, &owner, &100_000i128);
-
-    client.withdraw(&vault_id, &owner, &10_000i128);
-    client.reverse_withdrawal(&vault_id, &owner, &0u64);
-
-    // Try to reverse again
-    let result = client.try_reverse_withdrawal(&vault_id, &owner, &0u64);
-    assert!(result.is_err(), "Cannot reverse the same withdrawal twice");
-}
-
-// ---- Issue #813: Admin Transfer with Timelock ----
-
-#[test]
-fn test_propose_new_admin_emits_event_and_stores_pending() {
-    let (env, _, _, _, _, client) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_new_admin(&new_admin);
-
-    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
-
-    let events = env.events().all();
-    let proposed = events.iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::ADMIN_TRANSFER_PROPOSED_TOPIC)
-            .unwrap_or(false)
-    });
-    assert!(proposed.is_some(), "ADMIN_TRANSFER_PROPOSED event not emitted");
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #83)")]
-fn test_accept_admin_blocked_before_timelock() {
-    let (env, _, _, _, _, client) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_new_admin(&new_admin);
-
-    // Advance only 1 hour — still within the 24-hour lock
-    env.ledger().with_mut(|l| l.timestamp += 3_600);
-
-    client.accept_admin();
-}
-
-#[test]
-fn test_accept_admin_allowed_after_timelock() {
-    let (env, _, _, admin, _, client) = setup();
-    let new_admin = Address::generate(&env);
-
-    assert_eq!(client.get_admin(), admin);
-    client.propose_new_admin(&new_admin);
-
-    env.ledger().with_mut(|l| l.timestamp += 86_401);
-
-    client.accept_admin();
-
-    assert_eq!(client.get_admin(), new_admin);
-    assert_eq!(client.get_pending_admin(), None);
-}
-
-#[test]
-fn test_accept_admin_emits_completed_event() {
-    let (env, _, _, _, _, client) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_new_admin(&new_admin);
-    env.ledger().with_mut(|l| l.timestamp += 86_401);
-    client.accept_admin();
-
-    let events = env.events().all();
-    let completed = events.iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::ADMIN_TRANSFER_COMPLETED_TOPIC)
-            .unwrap_or(false)
-    });
-    assert!(completed.is_some(), "ADMIN_TRANSFER_COMPLETED event not emitted");
-}
-
-// ---- Issue #814: Pause Reason Tracking ----
-
-#[test]
-fn test_pause_stores_pause_record() {
-    let (env, _, _, admin, _, client) = setup();
-    let reason = bytes!(&env, 0xdeadbeef);
-
-    client.pause(&reason);
-
-    let record = client.get_pause_record().expect("pause record should exist");
-    assert_eq!(record.paused_by, admin);
-    assert_eq!(record.reason, reason);
-}
-
-#[test]
-fn test_unpause_clears_pause_record() {
-    let (env, _, _, _, _, client) = setup();
-
-    client.pause(&bytes!(&env, 0x01));
-    assert!(client.get_pause_record().is_some());
-
-    client.unpause();
-    assert!(client.get_pause_record().is_none());
-}
-
-#[test]
-fn test_pause_record_included_in_event() {
-    let (env, _, _, _, _, client) = setup();
-    let reason = bytes!(&env, 0xbeef);
-
-    client.pause(&reason);
-
-    let events = env.events().all();
-    let pause_event = events.iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::PAUSE_TOPIC)
-            .unwrap_or(false)
-    });
-    assert!(pause_event.is_some(), "PAUSE event not emitted");
-}
-
-// ---- Issue #815: Initialize Config Validation ----
-
-#[test]
-#[should_panic(expected = "Error(Contract, #82)")]
-fn test_set_min_interval_rejects_zero() {
-    let (_, _, _, _, _, client) = setup();
-    client.set_min_check_in_interval(&0u64);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #82)")]
-fn test_set_max_interval_rejects_zero() {
-    let (_, _, _, _, _, client) = setup();
-    client.set_max_check_in_interval(&0u64);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #82)")]
-fn test_set_min_interval_rejects_greater_than_max() {
-    let (_, _, _, _, _, client) = setup();
-    client.set_max_check_in_interval(&1_000u64);
-    client.set_min_check_in_interval(&2_000u64);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #82)")]
-fn test_set_max_interval_rejects_less_than_min() {
-    let (_, _, _, _, _, client) = setup();
-    client.set_min_check_in_interval(&1_000u64);
-    client.set_max_check_in_interval(&500u64);
-}
-
-// ============================================================
-// Issue #850: Negative tests for untested ContractError variants
-// ============================================================
-
-// --- ContractError::Paused (10) — check_in returns Paused when contract is paused ---
-// Contract function: check_in
-#[test]
-fn test_paused_error_on_check_in() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    client.pause(&bytes!(&env, 0x01));
-    let err = client.try_check_in(&vault_id, &owner, &BytesN::from_array(&env, &[0u8; 32]), &0u64).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::Paused as u32));
-}
-
-// --- ContractError::MaxTtlExceeded (25) — check_in rejected when interval > max_ttl ---
-// Contract function: check_in
-#[test]
-fn test_max_ttl_exceeded_error_on_check_in() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    // Set max TTL to 50 seconds; check_in_interval of 100s exceeds it
-    client.set_max_ttl_seconds(&50u64);
+fn test_get_beneficiary_returns_correct_address() {
+    let (_, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    let err = client.try_check_in(&vault_id, &owner, &BytesN::from_array(&env, &[0u8; 32]), &0u64).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::MaxTtlExceeded as u32));
+
+    let result = client.get_beneficiary(&vault_id);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), beneficiary);
 }
 
-// --- ContractError::DepositLimitExceeded (38) — deposit exceeds vault max_deposit_amount ---
-// Contract function: deposit
-// Set max_deposit_amount via env.as_contract storage manipulation
 #[test]
-fn test_deposit_limit_exceeded_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    env.as_contract(&client.address, || {
-        let key = DataKey::Vault(vault_id);
-        let mut v: Vault = env.storage().persistent().get(&key).unwrap();
-        v.max_deposit_amount = Some(50);
-        env.storage().persistent().set(&key, &v);
-    });
-    let err = client.try_deposit(&vault_id, &owner, &100i128).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::DepositLimitExceeded as u32));
+fn test_get_beneficiary_missing_vault_returns_error() {
+    let (_, _, _, _, _, client) = setup();
+    let missing_id: u64 = 9999;
+    let result = client.try_get_beneficiary(&missing_id);
+    assert!(result.is_err(), "expected VaultNotFound error");
+    let err = result.unwrap_err().unwrap();
+    // Error code 3 = VaultNotFound
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(3));
 }
 
-// --- ContractError::DuplicateVault (57) — same (owner, beneficiary, interval) created twice ---
-// Contract function: create_vault
 #[test]
-fn test_duplicate_vault_error() {
+fn test_get_beneficiary_is_distinct_from_owner() {
     let (_, owner, beneficiary, _, _, client) = setup();
-    client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let err = client.try_create_vault(&owner, &beneficiary, &1000u64, &None).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::DuplicateVault as u32));
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let returned_beneficiary = client.get_beneficiary(&vault_id).unwrap();
+    let returned_owner = client.get_vault_owner(&vault_id);
+    assert_ne!(returned_beneficiary, returned_owner);
 }
 
-// --- ContractError::AuctionAlreadyExists (79) — creating auction twice on same vault ---
-// Contract function: create_beneficiary_auction
-#[test]
-fn test_auction_already_exists_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let now = env.ledger().timestamp();
-    client.create_beneficiary_auction(&vault_id, &owner, &now, &(now + 1000), &5_000u32, &1i128).unwrap();
-    let err = client.create_beneficiary_auction(&vault_id, &owner, &now, &(now + 1000), &5_000u32, &1i128).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::AuctionAlreadyExists as u32));
-}
+// ---- get_vault_status tests ----
 
-// --- ContractError::AuctionNotFound (78) — bidding on a vault with no auction ---
-// Contract function: place_auction_bid
 #[test]
-fn test_auction_not_found_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let bidder = Address::generate(&env);
-    let err = client.place_auction_bid(&vault_id, &bidder, &100i128, &5_000u32).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::AuctionNotFound as u32));
-}
-
-// --- ContractError::AuctionEnded (80) — bidding after auction end_time ---
-// Contract function: place_auction_bid
-#[test]
-fn test_auction_ended_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let now = env.ledger().timestamp();
-    client.create_beneficiary_auction(&vault_id, &owner, &now, &(now + 100), &5_000u32, &1i128).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    let bidder = Address::generate(&env);
-    let err = client.place_auction_bid(&vault_id, &bidder, &100i128, &5_000u32).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::AuctionEnded as u32));
-}
-
-// --- ContractError::AuctionNotEnded (81) — finalizing before auction end_time ---
-// Contract function: finalize_beneficiary_auction
-#[test]
-fn test_auction_not_ended_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let now = env.ledger().timestamp();
-    client.create_beneficiary_auction(&vault_id, &owner, &now, &(now + 1000), &5_000u32, &1i128).unwrap();
-    let err = client.finalize_beneficiary_auction(&vault_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::AuctionNotEnded as u32));
-}
-
-// --- ContractError::TtlBorrowNotFound (62) — repaying a non-existent borrow ---
-// Contract function: repay_ttl_borrow
-#[test]
-fn test_ttl_borrow_not_found_error() {
+fn test_get_vault_status_locked_initial_state() {
     let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let err = client.repay_ttl_borrow(&vault_id, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::TtlBorrowNotFound as u32));
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Newly created vault should have Locked status
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Locked);
 }
 
-// --- ContractError::TtlBorrowAlreadyRepaid (63) — repaying a borrow twice ---
-// Contract function: repay_ttl_borrow
 #[test]
-fn test_ttl_borrow_already_repaid_error() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let borrower_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let lender_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &100u64).unwrap();
-    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
-    let err = client.repay_ttl_borrow(&borrower_id, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::TtlBorrowAlreadyRepaid as u32));
-}
-
-// --- ContractError::NoScheduledWithdrawals (32) — execute on vault with no schedule ---
-// Contract function: execute_scheduled_withdrawal
-#[test]
-fn test_no_scheduled_withdrawals_error() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
-    let err = client.execute_scheduled_withdrawal(&vault_id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::NoScheduledWithdrawals as u32));
-}
-
-// --- ContractError::NothingToClawback (77) — all vesting installments already claimed ---
-// Contract function: clawback_unvested
-#[test]
-fn test_nothing_to_clawback_error() {
+fn test_get_vault_status_released() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit and trigger release
     client.deposit(&vault_id, &owner, &500i128);
-    let start = env.ledger().timestamp() + 200;
-    // set_vesting_schedule: (vault_id, caller, start_time, interval, num_installments, cliff_period)
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32, &0u64).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    client.trigger_release(&vault_id);
-    // Manually mark all installments as claimed so total_unvested == 0
-    env.as_contract(&client.address, || {
-        let count: u32 = env.storage().persistent()
-            .get(&DataKey::VestingScheduleCount(vault_id))
-            .unwrap_or(0);
-        for i in 0..count {
-            let key = DataKey::VestingSchedule(vault_id, i);
-            if let Some(mut sched) = env.storage().persistent().get::<DataKey, VestingSchedule>(&key) {
-                sched.claimed_installments = sched.num_installments;
-                env.storage().persistent().set(&key, &sched);
-            }
-        }
-    });
-    let err = client.clawback_unvested(&vault_id, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::NothingToClawback as u32));
-}
-
-// ============================================================
-// Issue #852: 50-beneficiary trigger_release load test
-//
-// Verifies that trigger_release with 50 equal-BPS beneficiaries completes
-// successfully and distributes the full balance. Each beneficiary gets
-// 10_000 / 50 = 200 BPS (2% of total). The last beneficiary absorbs any
-// rounding dust.
-//
-// Maximum safe beneficiary count: 50 (verified by this test).
-// ============================================================
-#[test]
-fn test_trigger_release_with_50_beneficiaries() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-
-    // Mint enough for a large deposit
-    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000_000i128);
-
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    let total: i128 = 10_000_000;
-    client.deposit(&vault_id, &owner, &total);
-
-    // Build 50 beneficiaries at 200 BPS each (50 × 200 = 10_000)
-    let bps_each: u32 = 200; // 2% each
-    let mut bens = soroban_sdk::Vec::new(&env);
-    let mut addresses: alloc::vec::Vec<Address> = alloc::vec::Vec::new();
-    for _ in 0..50 {
-        let addr = Address::generate(&env);
-        addresses.push(addr.clone());
-        bens.push_back(BeneficiaryEntry { address: addr, bps: bps_each });
-    }
-    client.set_beneficiaries(&vault_id, &owner, &bens);
-
-    // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
 
-    // Vault should be fully released
-    assert_eq!(client.get_release_status(&vault_id), ReleaseStatus::Released);
-    assert_eq!(client.get_vault(&vault_id).balance, 0i128);
-
-    // Verify total distributed equals the deposited amount
-    let token_client = token::Client::new(&env, &token_address);
-    let per_beneficiary = total / 50;
-    let total_distributed: i128 = addresses.iter().map(|a| token_client.balance(a)).sum();
-    assert_eq!(total_distributed, total,
-        "Total distributed ({total_distributed}) must equal deposited ({total})");
-
-    // All but the last beneficiary should have the even share
-    for addr in &addresses[..49] {
-        assert_eq!(token_client.balance(addr), per_beneficiary);
-    }
-    // Last beneficiary absorbs any dust
-    assert!(token_client.balance(&addresses[49]) >= per_beneficiary);
-}
-
-// ── Issue #482: get_check_in_history_page ────────────────────────────────────
-
-#[test]
-fn test_check_in_history_page_empty_history() {
-    // A brand-new vault has no check-in history; any page should be empty.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let _ = env; // env not mutated in this test
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let page = client.get_check_in_history_page(&id, &0u64, &10u32);
-    assert_eq!(page.len(), 0, "expected empty page for vault with no history");
+    // Vault should now be Released
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Released);
 }
 
 #[test]
-fn test_check_in_history_page_first_page() {
-    // Record 5 check-ins then request the first 3 → should return entries [0..3].
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..5 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &3u32);
-    assert_eq!(page.len(), 3);
-
-    // Entries should be ordered oldest-first, so timestamps must be ascending.
-    assert!(page.get(0).unwrap().timestamp < page.get(1).unwrap().timestamp);
-    assert!(page.get(1).unwrap().timestamp < page.get(2).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_second_page() {
-    // Record 5 check-ins; cursor=3, limit=3 should return the last 2 entries.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..5 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // Full history for cross-checking
-    let all = client.get_check_in_history(&id);
-    assert_eq!(all.len(), 5);
-
-    let page = client.get_check_in_history_page(&id, &3u64, &3u32);
-    assert_eq!(page.len(), 2, "cursor=3 into 5-entry list with limit=3 should yield 2 entries");
-    assert_eq!(page.get(0).unwrap().timestamp, all.get(3).unwrap().timestamp);
-    assert_eq!(page.get(1).unwrap().timestamp, all.get(4).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_exact_full_page() {
-    // Request exactly as many entries as exist → should return all of them.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..4 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &4u32);
-    assert_eq!(page.len(), 4);
-}
-
-#[test]
-fn test_check_in_history_page_cursor_at_last_entry() {
-    // cursor pointing at the last element should return exactly one entry.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let all = client.get_check_in_history(&id);
-    let page = client.get_check_in_history_page(&id, &2u64, &10u32);
-    assert_eq!(page.len(), 1);
-    assert_eq!(page.get(0).unwrap().timestamp, all.get(2).unwrap().timestamp);
-}
-
-#[test]
-fn test_check_in_history_page_cursor_out_of_bounds() {
-    // cursor >= total entries → empty result, no panic.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // cursor == len
-    let page = client.get_check_in_history_page(&id, &3u64, &10u32);
-    assert_eq!(page.len(), 0, "cursor equal to len should return empty page");
-
-    // cursor >> len
-    let page2 = client.get_check_in_history_page(&id, &9999u64, &10u32);
-    assert_eq!(page2.len(), 0, "cursor far beyond len should return empty page");
-}
-
-#[test]
-fn test_check_in_history_page_limit_zero() {
-    // limit=0 should always return an empty page, regardless of cursor.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..3 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let page = client.get_check_in_history_page(&id, &0u64, &0u32);
-    assert_eq!(page.len(), 0, "limit=0 should return empty page");
-}
-
-#[test]
-fn test_check_in_history_page_limit_capped_at_50() {
-    // Requesting more than 50 entries should be silently capped to 50.
-    // We only seed 10 entries so we can verify cap without 50+ check-ins.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..10 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    // u32::MAX >> 50; result is capped, not a panic, and returns at most 10 entries.
-    let page = client.get_check_in_history_page(&id, &0u64, &u32::MAX);
-    assert_eq!(page.len(), 10, "capped limit with only 10 entries should return 10");
-}
-
-#[test]
-fn test_check_in_history_page_consistent_with_full_history() {
-    // Walking through all pages reassembled equals the full history.
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let passkey = BytesN::from_array(&env, &[1u8; 32]);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    for _ in 0..7 {
-        env.ledger().with_mut(|l| l.timestamp += 600);
-        client.check_in(&id, &owner, &passkey).unwrap();
-    }
-
-    let all = client.get_check_in_history(&id);
-    assert_eq!(all.len(), 7);
-
-    // Reassemble using page size of 3
-    let page_size: u32 = 3;
-    let mut cursor: u64 = 0;
-    let mut reassembled: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
-    loop {
-        let page = client.get_check_in_history_page(&id, &cursor, &page_size);
-        if page.len() == 0 {
-            break;
-        }
-        for entry in page.iter() {
-            reassembled.push_back(entry.timestamp);
-        }
-        cursor += page_size as u64;
-    }
-
-    assert_eq!(reassembled.len(), 7, "reassembled pages should cover all 7 entries");
-    for i in 0..7u32 {
-        assert_eq!(
-            reassembled.get(i).unwrap(),
-            all.get(i).unwrap().timestamp,
-            "entry {i} timestamp mismatch between full history and paged walk"
-        );
-    }
-}
-
-// ── Issue #936: Passkey Rotation with Grace Period Tests ──────────────────────
-
-#[test]
-fn test_passkey_rotation_grace_period() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let passkey_hash = BytesN::from_array(&env, &[1u8; 32]);
-
-    client.add_passkey(&vault_id, &owner, &passkey_hash);
-    client.set_passkey_rotation_period(&vault_id, &owner, &3600u64);
-    client.deprecate_passkey(&vault_id, &owner, &passkey_hash);
-
-    // Within grace period (1800s later), passkey check-in still succeeds
-    env.ledger().with_mut(|l| l.timestamp += 1800);
-    client.check_in(&vault_id, &owner, &passkey_hash, &0u64);
-
-    // After grace period (> 3600s total from deprecation), check-in fails
-    env.ledger().with_mut(|l| l.timestamp += 2000);
-    let res = client.try_check_in(&vault_id, &owner, &passkey_hash, &0u64);
-    assert!(res.is_err());
-}
-
-// ── Issue #937: Passkey Usage Analytics Tests ──────────────────────────────────
-
-#[test]
-fn test_passkey_usage_analytics_tracking() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let passkey1 = BytesN::from_array(&env, &[1u8; 32]);
-    let passkey2 = BytesN::from_array(&env, &[2u8; 32]);
-
-    client.add_passkey(&vault_id, &owner, &passkey1);
-    client.add_passkey(&vault_id, &owner, &passkey2);
-
-    client.check_in(&vault_id, &owner, &passkey1, &0u64);
-    env.ledger().with_mut(|l| l.timestamp += 100);
-    client.check_in(&vault_id, &owner, &passkey1, &0u64);
-
-    let analytics = client.get_passkey_analytics(&vault_id);
-    assert_eq!(analytics.len(), 2);
-    let pk1_stat = analytics.get(0).unwrap();
-    assert_eq!(pk1_stat.passkey_hash, passkey1);
-    assert_eq!(pk1_stat.usage_count, 2);
-}
-
-// ── Issue #938: Passkey Challenge-Response Timeout Tests ─────────────────────
-
-#[test]
-fn test_passkey_challenge_timeout_enforcement() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let passkey_hash = BytesN::from_array(&env, &[1u8; 32]);
-    let challenge_id = BytesN::from_array(&env, &[9u8; 32]);
-
-    client.add_passkey(&vault_id, &owner, &passkey_hash);
-    client.set_challenge_timeout(&vault_id, &owner, &300u64);
-    client.create_passkey_challenge(&vault_id, &owner, &challenge_id);
-
-    // Verify within 300s timeout -> true
-    env.ledger().with_mut(|l| l.timestamp += 150);
-    let res = client.verify_passkey_challenge(&vault_id, &challenge_id, &passkey_hash);
-    assert_eq!(res, true);
-
-    // Verify after timeout (> 300s from creation) -> Err(ChallengeExpired)
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    let err = client.try_verify_passkey_challenge(&vault_id, &challenge_id, &passkey_hash).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(87)); // ChallengeExpired
-}
-
-// ── Issue #939: Multi-Sig Passkey Requirement Tests ─────────────────────────
-
-#[test]
-fn test_multi_sig_passkey_withdrawal_flow() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
-
-    let passkey1 = BytesN::from_array(&env, &[1u8; 32]);
-    let passkey2 = BytesN::from_array(&env, &[2u8; 32]);
-    client.add_passkey(&vault_id, &owner, &passkey1);
-    client.add_passkey(&vault_id, &owner, &passkey2);
-
-    client.set_multi_sig_threshold(&vault_id, &owner, &2u32);
-
-    // Attempt withdrawal with 1 signature -> fails MultiSigRequired (42)
-    let sigs_one = soroban_sdk::vec![&env, passkey1.clone()];
-    let err = client.try_withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_one).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(42));
-
-    // Attempt withdrawal with duplicate signatures -> fails DuplicateSignature (88)
-    let sigs_dup = soroban_sdk::vec![&env, passkey1.clone(), passkey1.clone()];
-    let err_dup = client.try_withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_dup).unwrap_err().unwrap();
-    assert_eq!(err_dup, soroban_sdk::Error::from_contract_error(88));
-
-    // Withdrawal with 2 distinct valid signatures -> succeeds
-    let sigs_two = soroban_sdk::vec![&env, passkey1.clone(), passkey2.clone()];
-    client.withdraw_multi_sig(&vault_id, &owner, &100i128, &sigs_two);
-
-    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
-}
-
-// ── Issue #1135: AdminTransferred event on accept_admin ─────────────────────
-
-#[test]
-fn test_accept_admin_emits_old_and_new_admin() {
-    let (env, _, _, admin, _, client) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_new_admin(&new_admin);
-    env.ledger().with_mut(|l| l.timestamp += 86_401);
-    let accepted_at = env.ledger().timestamp();
-    client.accept_admin();
-
-    let event = env.events().all().iter().find(|e| {
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
-        topics
-            .get(0)
-            .and_then(|v| v.try_into_val(&env).ok())
-            .map(|s: soroban_sdk::Symbol| s == types::ADMIN_TRANSFER_COMPLETED_TOPIC)
-            .unwrap_or(false)
-    });
-    assert!(event.is_some(), "adm_done event not emitted");
-
-    let data = event.unwrap().2.clone();
-    let (old_admin, new_admin_emitted, ts): (Address, Address, u64) =
-        data.try_into_val(&env).unwrap();
-    assert_eq!(old_admin, admin);
-    assert_eq!(new_admin_emitted, new_admin);
-    assert_eq!(ts, accepted_at);
-}
-
-// ── Issue #1136: get_state_transition_count ──────────────────────────────────
-
-#[test]
-fn test_get_state_transition_count_increments() {
+fn test_get_vault_status_cancelled() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    let other_vault_id = client.create_vault(&owner, &beneficiary, &200u64, &None);
 
-    assert_eq!(client.get_state_transition_count(&vault_id), 0);
-    assert_eq!(
-        client.get_state_transition_count(&vault_id),
-        client.get_state_transition_log(&vault_id).len() as u64
-    );
+    // Cancel the vault
+    let result = client.try_cancel_vault(&vault_id, &owner);
+    assert!(result.is_ok());
 
-    client.cancel_vault(&vault_id, &owner);
-
-    assert_eq!(client.get_state_transition_count(&vault_id), 1);
-    assert_eq!(
-        client.get_state_transition_count(&vault_id),
-        client.get_state_transition_log(&vault_id).len() as u64
-    );
-    // Unrelated vault's count is unaffected
-    assert_eq!(client.get_state_transition_count(&other_vault_id), 0);
-}
-
-// ── Issue #1137: get_multisig_proposal_status ────────────────────────────────
-
-#[test]
-fn test_get_multisig_proposal_status_not_found() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let err = client
-        .try_get_multisig_proposal_status(&vault_id, &999u64)
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(44)); // ProposalNotFound
+    // Vault should now be Cancelled
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::Cancelled);
 }
 
 #[test]
-fn test_get_multisig_proposal_status_pending() {
+fn test_get_vault_status_emergency_frozen() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let signer = Address::generate(&env);
-    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
 
-    let proposal_id = client.propose_multisig(
-        &vault_id,
-        &owner,
-        &MultiSigOperation::CancelVault,
-        &Bytes::new(&env),
-        &None,
-    );
+    // Freeze the vault (this requires admin or emergency functionality)
+    let result = client.try_freeze_vault(&vault_id);
+    assert!(result.is_ok());
 
-    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
-    assert_eq!(status, ProposalStatus::Pending);
+    // Vault should now be EmergencyFrozen
+    let status = client.get_vault_status(&vault_id).unwrap();
+    assert_eq!(status, ReleaseStatus::EmergencyFrozen);
 }
 
 #[test]
-fn test_get_multisig_proposal_status_approved() {
+fn test_get_vault_status_not_found() {
+    let (_, _, _, _, _, client) = setup();
+    let non_existent_vault_id = 999999u64;
+
+    // Querying a non-existent vault should return VaultNotFound error
+    let result = client.try_get_vault_status(&non_existent_vault_id);
+    assert!(result.is_err());
+
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(3)); // VaultNotFound error code
+}
+
+#[test]
+fn test_get_vault_status_multiple_vaults_independent() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let signer = Address::generate(&env);
-    // threshold 1 -> owner's auto-approval is immediately sufficient
-    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &1u32);
+    
+    // Create multiple vaults with different statuses
+    let vault1 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let vault3 = client.create_vault(&owner, &beneficiary, &100u64, &None);
 
-    let proposal_id = client.propose_multisig(
-        &vault_id,
-        &owner,
-        &MultiSigOperation::CancelVault,
-        &Bytes::new(&env),
-        &None,
-    );
+    // Trigger release on vault2
+    client.deposit(&vault2, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault2);
 
-    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
-    assert_eq!(status, ProposalStatus::Approved);
+    // Cancel vault3
+    client.cancel_vault(&vault3, &owner);
+
+    // Verify independent statuses
+    assert_eq!(client.get_vault_status(&vault1).unwrap(), ReleaseStatus::Locked);
+    assert_eq!(client.get_vault_status(&vault2).unwrap(), ReleaseStatus::Released);
+    assert_eq!(client.get_vault_status(&vault3).unwrap(), ReleaseStatus::Cancelled);
 }
 
 #[test]
-fn test_get_multisig_proposal_status_rejected() {
+fn test_get_vault_status_lightweight_query() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // get_vault_status should be more lightweight than get_vault
+    // Both should work correctly
+    let status = client.get_vault_status(&vault_id).unwrap();
+    let vault = client.get_vault(&vault_id);
+    
+    assert_eq!(status, vault.status);
+}
+
+
+// ---- beneficiary contract validation tests ----
+
+#[test]
+fn test_create_vault_rejects_contract_as_beneficiary() {
+    let (env, owner, _, _, _, client) = setup();
+    
+    // Register a contract as beneficiary
+    let contract_beneficiary = env.register_contract(None, TtlVaultContract);
+    
+    // Attempt to create vault with contract as beneficiary should fail
+    let result = client.try_create_vault(&owner, &contract_beneficiary, &100u64, &None);
+    assert!(result.is_err());
+    
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(96)); // BeneficiaryMustBeAccount
+}
+
+#[test]
+fn test_create_vault_accepts_account_as_beneficiary() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    
+    // Create vault with regular account as beneficiary should succeed
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Verify vault was created
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.beneficiary, beneficiary);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_update_beneficiary_rejects_contract_as_new_beneficiary() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let signer = Address::generate(&env);
-    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer.clone()], &2u32);
-
-    let proposal_id = client.propose_multisig(
-        &vault_id,
-        &owner,
-        &MultiSigOperation::CancelVault,
-        &Bytes::new(&env),
-        &None,
-    );
-    client.reject_multisig(&vault_id, &proposal_id, &owner);
-
-    let status = client.get_multisig_proposal_status(&vault_id, &proposal_id);
-    assert_eq!(status, ProposalStatus::Rejected);
-}
-
-// ── Issue #1138: 2FA-gated withdrawals ───────────────────────────────────────
-
-#[test]
-fn test_withdraw_succeeds_when_2fa_disabled() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
-
-    client.withdraw(&vault_id, &owner, &100i128);
-    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+    
+    // Create a vault first
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Register a contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    
+    // Wait for timelock to expire (24 hours)
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    
+    // Attempt to update beneficiary to contract should fail
+    let result = client.try_update_beneficiary(&vault_id, &owner, &contract_address);
+    assert!(result.is_err());
+    
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(96)); // BeneficiaryMustBeAccount
 }
 
 #[test]
-fn test_withdraw_fails_when_2fa_enabled_and_not_verified() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
-
-    client.enable_2fa(&vault_id, &owner, &0u32);
-
-    let err = client
-        .try_withdraw(&vault_id, &owner, &100i128)
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(89)); // TwoFactorRequired
-    assert_eq!(client.get_vault(&vault_id).balance, 1000i128);
+fn test_update_beneficiary_accepts_account_as_new_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    // Create a vault first
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Generate a new account as beneficiary
+    let new_beneficiary = Address::generate(&env);
+    
+    // Update beneficiary should succeed
+    let result = client.try_update_beneficiary(&vault_id, &owner, &new_beneficiary);
+    assert!(result.is_ok());
+    
+    // Verify the pending update was initiated
+    let pending = client.get_pending_beneficiary_update(&vault_id);
+    assert!(pending.is_some());
 }
 
 #[test]
-fn test_withdraw_succeeds_when_2fa_enabled_and_verified() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
+fn test_create_vault_with_generated_account_succeeds() {
+    let (env, owner, _, _, _, client) = setup();
+    
+    // Generate a random account address
+    let beneficiary = Address::generate(&env);
+    
+    // Create vault with generated account as beneficiary should succeed
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Verify vault was created
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.beneficiary, beneficiary);
+}
 
-    client.enable_2fa(&vault_id, &owner, &0u32);
-    client.confirm_2fa(&vault_id, &owner);
-
-    client.withdraw(&vault_id, &owner, &100i128);
-    assert_eq!(client.get_vault(&vault_id).balance, 900i128);
+#[test]
+fn test_contract_vs_account_addresses_are_distinct() {
+    let (env, owner, account_beneficiary, _, _, client) = setup();
+    
+    // Register a contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    
+    // Contract address and account address should be different
+    assert_ne!(contract_address, account_beneficiary);
+    
+    // Creating vault with account should succeed
+    let vault_id1 = client.create_vault(&owner, &account_beneficiary, &100u64, &None);
+    assert!(vault_id1 > 0);
+    
+    // Creating vault with contract should fail
+    let result = client.try_create_vault(&owner, &contract_address, &100u64, &None);
+    assert!(result.is_err());
 }

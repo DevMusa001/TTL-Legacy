@@ -620,6 +620,63 @@ impl Db {
                 "#,
             ),
             (
+                "5",
+                r#"
+                CREATE TABLE IF NOT EXISTS escalation_states (
+                    vault_id                INTEGER PRIMARY KEY,
+                    last_escalation_tier    TEXT,
+                    escalated_at            TEXT
+                );
+                CREATE TABLE IF NOT EXISTS escalation_events (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        INTEGER NOT NULL,
+                    tier            TEXT NOT NULL,
+                    dispatched_at   TEXT NOT NULL,
+                    channels        TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_escalation_events_vault_id ON escalation_events(vault_id);
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    event_type      TEXT NOT NULL,
+                    payload         TEXT NOT NULL DEFAULT '{}',
+                    endpoint_url    TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count   INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at   TEXT,
+                    created_at      TEXT NOT NULL,
+                    attempts        TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_vault_id ON webhook_deliveries(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status   ON webhook_deliveries(status);
+                CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    endpoint_url    TEXT NOT NULL,
+                    event_types     TEXT NOT NULL DEFAULT '[]',
+                    created_at      TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_vault_id ON webhook_subscriptions(vault_id);
+                CREATE TABLE IF NOT EXISTS vault_timeline_events (
+                    id          TEXT PRIMARY KEY,
+                    vault_id    TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    amount      INTEGER,
+                    metadata    TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_timeline_events_vault_id  ON vault_timeline_events(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_vault_timeline_events_kind      ON vault_timeline_events(kind);
+                CREATE TABLE IF NOT EXISTS vault_subscriptions (
+                    vault_id  INTEGER PRIMARY KEY,
+                    owner     TEXT NOT NULL,
+                    channels  TEXT NOT NULL,
+                    frequency TEXT NOT NULL
+                );
+                "#,
+            ),
+            (
                 "4",
                 r#"
                 CREATE TABLE IF NOT EXISTS sponsored_releases (
@@ -1244,6 +1301,374 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    // ── #1101: Reminder Escalation ───────────────────────────────────────────
+
+    /// Upsert the escalation state for a vault.
+    pub fn upsert_escalation_state(
+        &self,
+        state: &crate::models::EscalationState,
+    ) -> Result<(), rusqlite::Error> {
+        use crate::models::EscalationTier;
+        let tier_str = state.last_escalation_tier.as_ref().map(|t| match t {
+            EscalationTier::T1 => "t1",
+            EscalationTier::T2 => "t2",
+            EscalationTier::T3 => "t3",
+        });
+        let escalated_at_str = state.escalated_at.map(|d| d.to_rfc3339());
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO escalation_states (vault_id, last_escalation_tier, escalated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(vault_id) DO UPDATE SET
+                last_escalation_tier = excluded.last_escalation_tier,
+                escalated_at = excluded.escalated_at
+            "#,
+            params![state.vault_id as i64, tier_str, escalated_at_str],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the escalation state for a vault.
+    pub fn get_escalation_state(
+        &self,
+        vault_id: u64,
+    ) -> Result<Option<crate::models::EscalationState>, rusqlite::Error> {
+        use crate::models::EscalationTier;
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT vault_id, last_escalation_tier, escalated_at FROM escalation_states WHERE vault_id = ?1",
+        )?;
+        let row = stmt.query_row(params![vault_id as i64], |r| {
+            let tier_str: Option<String> = r.get(1)?;
+            let tier = tier_str.as_deref().and_then(|s| match s {
+                "t1" => Some(EscalationTier::T1),
+                "t2" => Some(EscalationTier::T2),
+                "t3" => Some(EscalationTier::T3),
+                _ => None,
+            });
+            let escalated_at_str: Option<String> = r.get(2)?;
+            let escalated_at = escalated_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            Ok(crate::models::EscalationState {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                last_escalation_tier: tier,
+                escalated_at,
+            })
+        });
+        match row {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Append a new escalation audit event.
+    pub fn insert_escalation_event(
+        &self,
+        event: &crate::models::EscalationEvent,
+    ) -> Result<(), rusqlite::Error> {
+        use crate::models::EscalationTier;
+        let tier_str = match event.tier {
+            EscalationTier::T1 => "t1",
+            EscalationTier::T2 => "t2",
+            EscalationTier::T3 => "t3",
+        };
+        let channels_json = serde_json::to_string(&event.channels).unwrap_or_default();
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO escalation_events (id, vault_id, tier, dispatched_at, channels)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                event.id,
+                event.vault_id as i64,
+                tier_str,
+                event.dispatched_at.to_rfc3339(),
+                channels_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all escalation events for a vault (newest first).
+    pub fn get_escalation_events(
+        &self,
+        vault_id: u64,
+    ) -> Result<Vec<crate::models::EscalationEvent>, rusqlite::Error> {
+        use crate::models::EscalationTier;
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT id, vault_id, tier, dispatched_at, channels FROM escalation_events WHERE vault_id = ?1 ORDER BY dispatched_at DESC",
+        )?;
+        let iter = stmt.query_map(params![vault_id as i64], |r| {
+            let tier_str: String = r.get(2)?;
+            let tier = match tier_str.as_str() {
+                "t1" => EscalationTier::T1,
+                "t2" => EscalationTier::T2,
+                _ => EscalationTier::T3,
+            };
+            let dispatched_at_str: String = r.get(3)?;
+            let dispatched_at = chrono::DateTime::parse_from_rfc3339(&dispatched_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+            let channels_str: String = r.get(4)?;
+            let channels: Vec<String> = serde_json::from_str(&channels_str).unwrap_or_default();
+            Ok(crate::models::EscalationEvent {
+                id: r.get(0)?,
+                vault_id: r.get::<_, i64>(1)? as u64,
+                tier,
+                dispatched_at,
+                channels,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter { out.push(item?); }
+        Ok(out)
+    }
+
+    // ── #1102: Webhook Delivery Retry ────────────────────────────────────────
+
+    /// Insert a new webhook delivery job.
+    pub fn insert_webhook_delivery(
+        &self,
+        delivery: &crate::models::WebhookDelivery,
+    ) -> Result<(), rusqlite::Error> {
+        let status_str = self.webhook_status_str(&delivery.status);
+        let attempts_json = serde_json::to_string(&delivery.attempts).unwrap_or_default();
+        let payload_json = serde_json::to_string(&delivery.payload).unwrap_or_default();
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO webhook_deliveries (
+                id, vault_id, event_type, payload, endpoint_url, status,
+                attempt_count, next_retry_at, created_at, attempts
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                delivery.id,
+                delivery.vault_id,
+                delivery.event_type,
+                payload_json,
+                delivery.endpoint_url,
+                status_str,
+                delivery.attempt_count as i64,
+                delivery.next_retry_at.map(|d| d.to_rfc3339()),
+                delivery.created_at.to_rfc3339(),
+                attempts_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a webhook delivery job (status, attempt_count, next_retry_at, attempts).
+    pub fn update_webhook_delivery(
+        &self,
+        delivery: &crate::models::WebhookDelivery,
+    ) -> Result<(), rusqlite::Error> {
+        let status_str = self.webhook_status_str(&delivery.status);
+        let attempts_json = serde_json::to_string(&delivery.attempts).unwrap_or_default();
+        self.conn.lock().unwrap().execute(
+            r#"
+            UPDATE webhook_deliveries
+            SET status = ?1, attempt_count = ?2, next_retry_at = ?3, attempts = ?4
+            WHERE id = ?5
+            "#,
+            params![
+                status_str,
+                delivery.attempt_count as i64,
+                delivery.next_retry_at.map(|d| d.to_rfc3339()),
+                attempts_json,
+                delivery.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve all webhook deliveries due for retry (status=retrying, next_retry_at <= now).
+    pub fn get_due_webhook_retries(
+        &self,
+    ) -> Result<Vec<crate::models::WebhookDelivery>, rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT id, vault_id, event_type, payload, endpoint_url, status, attempt_count, next_retry_at, created_at, attempts \
+             FROM webhook_deliveries \
+             WHERE status = 'retrying' AND next_retry_at <= ?1",
+        )?;
+        self.map_webhook_rows(&mut stmt, params![now])
+    }
+
+    /// Retrieve all pending webhook deliveries (not yet attempted).
+    pub fn get_pending_webhook_deliveries(
+        &self,
+    ) -> Result<Vec<crate::models::WebhookDelivery>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT id, vault_id, event_type, payload, endpoint_url, status, attempt_count, next_retry_at, created_at, attempts \
+             FROM webhook_deliveries WHERE status = 'pending'",
+        )?;
+        self.map_webhook_rows(&mut stmt, params![])
+    }
+
+    /// Retrieve webhook delivery log for a vault.
+    pub fn get_webhook_deliveries_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<crate::models::WebhookDelivery>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT id, vault_id, event_type, payload, endpoint_url, status, attempt_count, next_retry_at, created_at, attempts \
+             FROM webhook_deliveries WHERE vault_id = ?1 ORDER BY created_at DESC",
+        )?;
+        self.map_webhook_rows(&mut stmt, params![vault_id])
+    }
+
+    fn webhook_status_str(&self, status: &crate::models::WebhookDeliveryStatus) -> &'static str {
+        match status {
+            crate::models::WebhookDeliveryStatus::Pending => "pending",
+            crate::models::WebhookDeliveryStatus::Delivered => "delivered",
+            crate::models::WebhookDeliveryStatus::Retrying => "retrying",
+            crate::models::WebhookDeliveryStatus::DeliveryFailed => "delivery_failed",
+        }
+    }
+
+    fn map_webhook_rows(
+        &self,
+        stmt: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<crate::models::WebhookDelivery>, rusqlite::Error> {
+        let iter = stmt.query_map(params, |r| {
+            let status_str: String = r.get(5)?;
+            let status = match status_str.as_str() {
+                "delivered" => crate::models::WebhookDeliveryStatus::Delivered,
+                "retrying" => crate::models::WebhookDeliveryStatus::Retrying,
+                "delivery_failed" => crate::models::WebhookDeliveryStatus::DeliveryFailed,
+                _ => crate::models::WebhookDeliveryStatus::Pending,
+            };
+            let payload_str: String = r.get(3)?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            let attempts_str: String = r.get(9)?;
+            let attempts: Vec<crate::models::WebhookAttempt> = serde_json::from_str(&attempts_str).unwrap_or_default();
+            let created_at_str: String = r.get(8)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?;
+            let next_retry_at_str: Option<String> = r.get(7)?;
+            let next_retry_at = next_retry_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            Ok(crate::models::WebhookDelivery {
+                id: r.get(0)?,
+                vault_id: r.get(1)?,
+                event_type: r.get(2)?,
+                payload,
+                endpoint_url: r.get(4)?,
+                status,
+                attempt_count: r.get::<_, i64>(6)? as u32,
+                next_retry_at,
+                created_at,
+                attempts,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter { out.push(item?); }
+        Ok(out)
+    }
+
+    // ── #1104: Vault Timeline Events ─────────────────────────────────────────
+
+    /// Insert a timeline event.
+    pub fn insert_timeline_event(
+        &self,
+        event: &crate::models::TimelineEvent,
+    ) -> Result<(), rusqlite::Error> {
+        let kind_str = format!("{:?}", event.kind).to_lowercase();
+        let metadata_json = serde_json::to_string(&event.metadata).unwrap_or_default();
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO vault_timeline_events (id, vault_id, kind, timestamp, description, amount, metadata)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                event.id,
+                event.vault_id,
+                kind_str,
+                event.timestamp.to_rfc3339(),
+                event.description,
+                event.amount.map(|a| a as i64),
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve timeline events for a vault, with optional kind filter.
+    pub fn get_timeline_events(
+        &self,
+        vault_id: &str,
+        kind_filter: Option<&str>,
+    ) -> Result<Vec<crate::models::TimelineEvent>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let (sql, use_filter) = if kind_filter.is_some() {
+            (
+                "SELECT id, vault_id, kind, timestamp, description, amount, metadata \
+                 FROM vault_timeline_events WHERE vault_id = ?1 AND kind = ?2 ORDER BY timestamp DESC",
+                true,
+            )
+        } else {
+            (
+                "SELECT id, vault_id, kind, timestamp, description, amount, metadata \
+                 FROM vault_timeline_events WHERE vault_id = ?1 ORDER BY timestamp DESC",
+                false,
+            )
+        };
+        let mut stmt = binding.prepare(sql)?;
+
+        let map_row = |r: &rusqlite::Row<'_>| {
+            use crate::models::TimelineEventKind;
+            let kind_str: String = r.get(2)?;
+            let kind = match kind_str.as_str() {
+                "created" => TimelineEventKind::Created,
+                "deposited" => TimelineEventKind::Deposited,
+                "checkedin" | "checked_in" => TimelineEventKind::CheckedIn,
+                "hibernated" => TimelineEventKind::Hibernated,
+                "released" => TimelineEventKind::Released,
+                "escalationsent" | "escalation_sent" => TimelineEventKind::EscalationSent,
+                "webhookdelivered" | "webhook_delivered" => TimelineEventKind::WebhookDelivered,
+                "webhookfailed" | "webhook_failed" => TimelineEventKind::WebhookFailed,
+                _ => TimelineEventKind::Created,
+            };
+            let timestamp_str: String = r.get(3)?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+            let amount: Option<i64> = r.get(5)?;
+            let metadata_str: String = r.get(6)?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_str).unwrap_or(serde_json::Value::Null);
+            Ok(crate::models::TimelineEvent {
+                id: r.get(0)?,
+                vault_id: r.get(1)?,
+                kind,
+                timestamp,
+                description: r.get(4)?,
+                amount: amount.map(|a| a as i128),
+                metadata,
+            })
+        };
+
+        let iter = if use_filter {
+            stmt.query_map(params![vault_id, kind_filter.unwrap()], map_row)?
+        } else {
+            stmt.query_map(params![vault_id], map_row)?
+        };
+
+        let mut out = Vec::new();
+        for item in iter { out.push(item?); }
+        Ok(out)
     }
 
 }
