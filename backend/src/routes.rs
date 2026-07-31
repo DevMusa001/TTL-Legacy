@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    middleware::Next,
     Json,
 };
+use chrono::DateTime;
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -12,7 +15,7 @@ use crate::{
     audit,
     db::Db,
     error::AppError,
-    handlers::{parse_scenario_types, simulate_release_handler},
+    handlers::{parse_scenario_types, simulate_release_handler, export_vaults_handler},
     models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
     AppState,
 };
@@ -195,86 +198,81 @@ pub async fn get_sponsored_releases(
     Ok(Json(result))
 }
 
-// ── #1101: Escalation endpoints ──────────────────────────────────────────────
-
-/// GET /api/vaults/:vault_id/escalation-state
-/// Retrieve the current escalation state for a vault.
-pub async fn get_escalation_state(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-) -> Result<Json<crate::models::EscalationState>, AppError> {
-    match state.db.get_escalation_state(vault_id)? {
-        Some(s) => Ok(Json(s)),
-        None => Ok(Json(crate::models::EscalationState {
-            vault_id,
-            last_escalation_tier: None,
-            escalated_at: None,
-        })),
-    }
-}
-
-/// GET /api/vaults/:vault_id/escalation-events
-/// List escalation audit events for a vault.
-pub async fn list_escalation_events(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-) -> Result<Json<Vec<crate::models::EscalationEvent>>, AppError> {
-    let events = state.db.get_escalation_events(vault_id)?;
-    Ok(Json(events))
-}
-
-// ── #1102: Webhook delivery endpoints ────────────────────────────────────────
-
-/// POST /api/vaults/:vault_id/webhooks
-/// Register a webhook endpoint and enqueue an initial test delivery.
-pub async fn register_webhook(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-    Json(req): Json<crate::models::RegisterWebhookRequest>,
-) -> Result<(StatusCode, Json<crate::models::WebhookDelivery>), AppError> {
-    let payload = serde_json::json!({
-        "event": "webhook_registered",
-        "vault_id": vault_id,
-        "endpoint_url": req.endpoint_url,
-    });
-    let delivery = crate::webhook_retry::enqueue(
-        &state.db,
-        &vault_id,
-        "webhook_registered",
-        payload,
-        &req.endpoint_url,
-    )
-    .map_err(AppError::InvalidInput)?;
-    Ok((StatusCode::CREATED, Json(delivery)))
-}
-
-/// GET /api/vaults/:vault_id/webhooks
-/// Retrieve the webhook delivery log for a vault.
-pub async fn list_webhook_deliveries(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-) -> Result<Json<Vec<crate::models::WebhookDelivery>>, AppError> {
-    let log = crate::webhook_retry::get_delivery_log(&state.db, &vault_id)
-        .map_err(AppError::InvalidInput)?;
-    Ok(Json(log))
-}
-
-// ── #1104: Vault Timeline endpoints ──────────────────────────────────────────
+// ── Audit Log Export (#1128) ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-pub struct TimelineQuery {
-    pub kind: Option<String>,
+pub struct ExportQuery {
+    pub format: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
-/// GET /api/vaults/:vault_id/events
-/// Returns the vault status timeline, optionally filtered by event kind.
-pub async fn list_vault_timeline(
+/// GET /api/vaults/:vault_id/export?format=csv|json&from=&to=
+#[instrument(skip(state, headers), fields(vault_id = %vault_id))]
+pub async fn export_vault(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
-    Query(query): Query<TimelineQuery>,
-) -> Result<Json<Vec<crate::models::TimelineEvent>>, AppError> {
-    let events = state
-        .db
-        .get_timeline_events(&vault_id, query.kind.as_deref())?;
-    Ok(Json(events))
+    Query(query): Query<ExportQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let user_id = headers
+        .get("x-user-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let format = match query.format.as_str() {
+        "csv" | "json" => query.format,
+        _ => {
+            return Err(AppError::InvalidInput(
+                "format must be csv or json".into(),
+            ))
+        }
+    };
+
+    let from = query
+        .from
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let to = query
+        .to
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let result = export_vaults_handler(
+        &state.db.vault_store,
+        &state.db.event_store,
+        &state.db.audit_store,
+        &vault_id,
+        &format,
+        from,
+        to,
+        if user_id.is_empty() { None } else { Some(user_id) },
+    )
+    .map_err(|e| AppError::InvalidInput(e))?;
+
+    let content_type = if format == "csv" {
+        "text/csv"
+    } else {
+        "application/json"
+    };
+
+    Ok(Response::builder()
+        .header("Content-Type", content_type)
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", format!("vault-{}.{}", vault_id, format)))
+        .body(Body::from(result))
+        .unwrap())
+}
+
+// ── Rate Limited Stub Endpoints (#1127) ──────────────────────────────────────
+
+pub async fn stub_checkin() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"error": "not_implemented", "message": "checkin endpoint not yet available"}))
+}
+
+pub async fn stub_release() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"error": "not_implemented", "message": "release endpoint not yet available"}))
+}
+
+pub async fn stub_email_token() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"error": "not_implemented", "message": "email-token endpoint not yet available"}))
 }

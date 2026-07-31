@@ -36,6 +36,9 @@ pub fn export_vaults_handler(
     audit_store: &AuditStore,
     vault_id: &str,
     format: &str,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    user_id: Option<&str>,
 ) -> Result<String, String> {
     let vaults = store.lock().unwrap();
     let vault = vaults
@@ -43,13 +46,53 @@ pub fn export_vaults_handler(
         .cloned()
         .ok_or_else(|| "Vault not found".to_string())?;
 
+    if let Some(uid) = user_id {
+        if vault.owner != uid {
+            return Err("Forbidden: not vault owner".to_string());
+        }
+    }
+
     let history = get_vault_history(event_store, vault_id);
     let audit_log = get_vault_audit_log(audit_store, vault_id);
 
+    let filtered_history: Vec<VaultEvent> = history
+        .into_iter()
+        .filter(|e| {
+            if let Some(from) = from {
+                if e.timestamp < from {
+                    return false;
+                }
+            }
+            if let Some(to) = to {
+                if e.timestamp > to {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let filtered_audit: Vec<AuditEntry> = audit_log
+        .into_iter()
+        .filter(|a| {
+            if let Some(from) = from {
+                if a.timestamp < from {
+                    return false;
+                }
+            }
+            if let Some(to) = to {
+                if a.timestamp > to {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
     let export_data = ExportData {
         vault,
-        history,
-        audit_log,
+        history: filtered_history,
+        audit_log: filtered_audit,
     };
 
     match format {
@@ -1137,7 +1180,7 @@ mod tests {
         };
         store.lock().unwrap().insert("v1".to_string(), vault);
 
-        let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "json");
+        let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "json", None, None, None);
         assert!(result.is_ok());
         let json_str = result.unwrap();
         assert!(json_str.contains("v1"));
@@ -1162,7 +1205,7 @@ mod tests {
         };
         store.lock().unwrap().insert("v1".to_string(), vault);
 
-        let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "csv");
+        let result = export_vaults_handler(&store, &event_store, &audit_store, "v1", "csv", None, None, None);
         assert!(result.is_ok());
         let csv_str = result.unwrap();
         assert!(csv_str.contains("v1"));

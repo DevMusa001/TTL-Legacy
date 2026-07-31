@@ -189,8 +189,8 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
 /// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
 pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
 
-/// Multi-sig pending operation timeout: 15 minutes (900 seconds) - Issue #1117
-pub const PENDING_MULTISIG_OP_EXPIRY: u64 = 900;
+/// Maximum number of beneficiaries allowed per vault.
+pub const MAX_BENEFICIARIES: u32 = 20;
 
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -3546,6 +3546,67 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Sets beneficiaries with equal basis point (BPS) allocations.
+    ///
+    /// Each beneficiary receives an equal share of 10,000 BPS (100%).
+    /// Remainder BPS are assigned to the first beneficiary.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `caller` - The address of the caller (must be the vault owner)
+    /// * `addresses` - Vector of beneficiary addresses
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err` on failure
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    /// * `ContractError::InvalidBps` - If list is empty or exceeds max count
+    pub fn set_equal_split_beneficiaries(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        addresses: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let len = addresses.len();
+        if len == 0 || len > MAX_BENEFICIARIES as usize {
+            return Err(ContractError::InvalidBps);
+        }
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let base = 10_000u32 / len as u32;
+        let remainder = 10_000u32 - base * len as u32;
+        let mut beneficiaries = Vec::new(&env);
+        for (i, address) in addresses.iter().enumerate() {
+            if *address == vault.owner {
+                return Err(ContractError::InvalidBeneficiary);
+            }
+            Self::assert_not_zero_address(&env, address);
+            let bps = if i == 0 { base + remainder } else { base };
+            beneficiaries.push_back(BeneficiaryEntry {
+                address: address.clone(),
+                bps,
+                minimum_threshold: 0,
+            });
+        }
+        vault.beneficiaries = beneficiaries.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((SET_BENEFICIARIES_TOPIC, vault_id), beneficiaries);
+        Ok(())
+    }
+
     /// Schedule a beneficiary rotation for a vault.
     ///
     /// The caller must be the vault owner. The `new_beneficiaries` vector must
@@ -5869,6 +5930,18 @@ impl TtlVaultContract {
     /// The Unix timestamp when the vault was created
     pub fn get_vault_created_at(env: Env, vault_id: u64) -> u64 {
         Self::load_vault(&env, vault_id).created_at
+    }
+
+    /// Returns the check-in interval for a vault.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The check-in interval in seconds
+    pub fn get_check_in_interval(env: Env, vault_id: u64) -> u64 {
+        Self::load_vault(&env, vault_id).check_in_interval
     }
 
     /// Returns the unconditional release time for a vault.

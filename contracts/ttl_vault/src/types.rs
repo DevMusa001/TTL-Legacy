@@ -3,6 +3,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, String, Sy
 /// Maximum number of vesting schedules per vault.
 pub const MAX_VESTING_SCHEDULES: u32 = 20;
 
+/// Maximum number of beneficiaries allowed per vault.
+pub const MAX_BENEFICIARIES: u32 = 20;
+
 pub const RELEASE_TOPIC: Symbol = symbol_short!("release");
 pub const VAULT_CREATED_TOPIC: Symbol = symbol_short!("v_created");
 pub const PING_EXPIRY_TOPIC: Symbol = symbol_short!("ping_exp");
