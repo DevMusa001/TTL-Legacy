@@ -58,7 +58,7 @@ use types::{
     TOKEN_LENDING_TOPIC, TOKEN_LEND_REPAY_TOPIC, TOKEN_REBALANCED_TOPIC, TOKEN_REBALANCE_TOPIC,
     TOKEN_STAKING_TOPIC, TOKEN_UNSTAKING_TOPIC, TOKEN_WHITELIST_VALIDATED_TOPIC,
     TTL_ACCELERATE_TOPIC, TTL_BORROW_TOPIC, TTL_DECAY_TOPIC, TTL_PREDICTED_TOPIC, TTL_REPAY_TOPIC,
-    UNPAUSE_TOPIC, UPDATE_INTERVAL_TOPIC, UPDATE_METADATA_TOPIC, VAULT_ARCHIVED_TOPIC,
+    UNPAUSE_TOPIC, UPDATE_INTERVAL_TOPIC, UPDATE_METADATA_TOPIC, ADAPTIVE_INTERVAL_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC, VAULT_CLONED_OVERRIDE_TOPIC, VAULT_CLONED_TOPIC, VAULT_CREATED_TOPIC,
     VAULT_MERGED_TOPIC, VESTING_BONUS_CLAIMED_TOPIC, VESTING_BONUS_SET_TOPIC,
     VESTING_CANCELLED_TOPIC, VESTING_CATCHUP_CLAIMED_TOPIC, VESTING_CATCHUP_SET_TOPIC,
@@ -337,6 +337,9 @@ impl TtlVaultContract {
             .set(&DataKey::TokenAddress, &xlm_token);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCheckInInterval, &MIN_CHECK_IN_INTERVAL);
         env.storage()
             .instance()
             .set(&DataKey::Version, &String::from_str(&env, "1.0.0"));
@@ -1431,6 +1434,7 @@ impl TtlVaultContract {
             check_in_score: 10000,
             total_check_ins: 0,
             on_time_check_ins: 0,
+            adaptive_interval_enabled: false,
         };
         Self::save_vault(&env, vault_id, &vault);
         Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -6951,6 +6955,9 @@ impl TtlVaultContract {
         if new_interval == 0 {
             return Err(ContractError::InvalidInterval);
         }
+        if new_interval < MIN_CHECK_IN_INTERVAL {
+            return Err(ContractError::CheckInIntervalTooShort);
+        }
         Self::assert_interval_in_bounds(&env, new_interval);
         let mut vault = Self::load_vault(&env, vault_id);
         vault.owner.require_auth();
@@ -7751,6 +7758,7 @@ impl TtlVaultContract {
             check_in_score: 10000,
             total_check_ins: 0,
             on_time_check_ins: 0,
+            adaptive_interval_enabled: false,
         };
 
         Self::save_vault(&env, vault_id, &new_vault);
@@ -9403,6 +9411,7 @@ impl TtlVaultContract {
             check_in_score: 10000,
             total_check_ins: 0,
             on_time_check_ins: 0,
+            adaptive_interval_enabled: false,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, original.check_in_interval);
@@ -9546,6 +9555,7 @@ impl TtlVaultContract {
             check_in_score: 10000,
             total_check_ins: 0,
             on_time_check_ins: 0,
+            adaptive_interval_enabled: false,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, check_in_interval);
