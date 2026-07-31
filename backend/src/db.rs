@@ -620,6 +620,63 @@ impl Db {
                 "#,
             ),
             (
+                "5",
+                r#"
+                CREATE TABLE IF NOT EXISTS escalation_states (
+                    vault_id                INTEGER PRIMARY KEY,
+                    last_escalation_tier    TEXT,
+                    escalated_at            TEXT
+                );
+                CREATE TABLE IF NOT EXISTS escalation_events (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        INTEGER NOT NULL,
+                    tier            TEXT NOT NULL,
+                    dispatched_at   TEXT NOT NULL,
+                    channels        TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_escalation_events_vault_id ON escalation_events(vault_id);
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    event_type      TEXT NOT NULL,
+                    payload         TEXT NOT NULL DEFAULT '{}',
+                    endpoint_url    TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count   INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at   TEXT,
+                    created_at      TEXT NOT NULL,
+                    attempts        TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_vault_id ON webhook_deliveries(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status   ON webhook_deliveries(status);
+                CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    endpoint_url    TEXT NOT NULL,
+                    event_types     TEXT NOT NULL DEFAULT '[]',
+                    created_at      TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_vault_id ON webhook_subscriptions(vault_id);
+                CREATE TABLE IF NOT EXISTS vault_timeline_events (
+                    id          TEXT PRIMARY KEY,
+                    vault_id    TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    amount      INTEGER,
+                    metadata    TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_timeline_events_vault_id  ON vault_timeline_events(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_vault_timeline_events_kind      ON vault_timeline_events(kind);
+                CREATE TABLE IF NOT EXISTS vault_subscriptions (
+                    vault_id  INTEGER PRIMARY KEY,
+                    owner     TEXT NOT NULL,
+                    channels  TEXT NOT NULL,
+                    frequency TEXT NOT NULL
+                );
+                "#,
+            ),
+            (
                 "4",
                 r#"
                 CREATE TABLE IF NOT EXISTS sponsored_releases (
@@ -642,6 +699,16 @@ impl Db {
                 CREATE INDEX IF NOT EXISTS idx_sponsored_releases_beneficiary ON sponsored_releases(beneficiary);
                 CREATE INDEX IF NOT EXISTS idx_sponsored_releases_status ON sponsored_releases(status);
                 CREATE INDEX IF NOT EXISTS idx_sponsored_releases_created_at ON sponsored_releases(created_at);
+                "#,
+            ),
+            (
+                "5",
+                r#"
+                CREATE TABLE IF NOT EXISTS vesting_bonus_config (
+                    vault_id              TEXT PRIMARY KEY,
+                    bonus_bps             INTEGER NOT NULL,
+                    on_time_window_seconds INTEGER NOT NULL
+                );
                 "#,
             ),
         ];
@@ -1246,6 +1313,44 @@ impl Db {
         Ok(())
     }
 
+    pub fn get_vesting_bonus(&self, vault_id: &str) -> Result<Option<crate::models::VestingBonusConfig>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT vault_id, bonus_bps, on_time_window_seconds
+               FROM vesting_bonus_config
+               WHERE vault_id = ?1"#,
+        )?;
+        let result = stmt.query_row(params![vault_id], |r| {
+            Ok(crate::models::VestingBonusConfig {
+                vault_id: r.get(0)?,
+                bonus_bps: r.get(1)?,
+                on_time_window_seconds: r.get(2)?,
+            })
+        });
+        match result {
+            Ok(config) => Ok(Some(config)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn upsert_vesting_bonus(&self, config: &crate::models::VestingBonusConfig) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO vesting_bonus_config (vault_id, bonus_bps, on_time_window_seconds)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              bonus_bps = excluded.bonus_bps,
+              on_time_window_seconds = excluded.on_time_window_seconds
+            "#,
+            params![
+                config.vault_id,
+                config.bonus_bps as i64,
+                config.on_time_window_seconds as i64,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

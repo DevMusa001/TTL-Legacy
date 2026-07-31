@@ -40,6 +40,53 @@
       --radius:    0.75rem;
     }
 
+    /* Light theme overrides */
+    :root[data-theme="light"] {
+      --bg:        #f8f9fc;
+      --surface:   #ffffff;
+      --border:    #d1d5e0;
+      --text:      #1a1d27;
+      --muted:     #5a6478;
+      --accent:    #4f46e5;
+      --accent-h:  #6366f1;
+      --danger:    #dc2626;
+      --warn:      #d97706;
+      --success:   #16a34a;
+    }
+
+    /* Respect system preference when no manual override is set */
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        --bg:        #f8f9fc;
+        --surface:   #ffffff;
+        --border:    #d1d5e0;
+        --text:      #1a1d27;
+        --muted:     #5a6478;
+        --accent:    #4f46e5;
+        --accent-h:  #6366f1;
+        --danger:    #dc2626;
+        --warn:      #d97706;
+        --success:   #16a34a;
+      }
+    }
+
+    /* ── Theme toggle button ──────────────────────────────────────────── */
+    .theme-toggle {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 99px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 500;
+      padding: 0.35rem 0.85rem;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
     body {
       background: var(--bg);
       color: var(--text);
@@ -352,7 +399,7 @@
       <div class="scenarios-grid" id="scenariosGrid" role="list"></div>
     </div>
 
-    <!-- Timeline -->
+    <!-- Timeline bar -->
     <div class="card">
       <div class="timeline">
         <p class="timeline-title">Relative Timeline (days until release)</p>
@@ -360,6 +407,35 @@
           <div id="timelineRows" role="list"></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ── #1104: Vault Status Timeline ──────────────────────────────────── -->
+  <div class="card" style="margin-top:2rem;">
+    <p class="card-title">Vault Status Timeline</p>
+    <div class="vault-timeline">
+      <div class="vtl-filter-row">
+        <label for="vtlKind">Filter by event type:</label>
+        <select id="vtlKind" onchange="loadTimeline()">
+          <option value="">All events</option>
+          <option value="created">Created</option>
+          <option value="deposited">Deposited</option>
+          <option value="checkedin">Checked In</option>
+          <option value="hibernated">Hibernated</option>
+          <option value="released">Released</option>
+          <option value="escalation_sent">Escalation Sent</option>
+          <option value="webhook_delivered">Webhook Delivered</option>
+          <option value="webhook_failed">Webhook Failed</option>
+        </select>
+        <button class="vtl-reload-btn" onclick="loadTimeline()">↺ Refresh</button>
+      </div>
+      <ul class="vtl-list" id="vtlList">
+        <!-- populated by loadTimeline() -->
+        <li class="vtl-empty">
+          <div class="vtl-empty-icon">📋</div>
+          <p>Enter a Vault ID above and run a simulation to load the event timeline.</p>
+        </li>
+      </ul>
     </div>
   </div>
 </div>
@@ -536,6 +612,154 @@ function escHtml(str) {
 document.getElementById('vaultId').addEventListener('keydown', e => {
   if (e.key === 'Enter') runSimulation();
 });
+
+/* ── #1103: Dark Mode Toggle ──────────────────────────────────────────── */
+
+(function initTheme() {
+  // Restore preference from localStorage, if any.
+  const saved = localStorage.getItem('ttl-theme');
+  if (saved === 'light' || saved === 'dark') {
+    document.documentElement.setAttribute('data-theme', saved);
+  }
+  updateToggleButton();
+})();
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme');
+  // Determine effective theme (accounting for system preference when unset).
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const effectiveDark = current ? current === 'dark' : systemDark;
+  const next = effectiveDark ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('ttl-theme', next);
+  updateToggleButton();
+}
+
+function updateToggleButton() {
+  const current = document.documentElement.getAttribute('data-theme');
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const isDark = current ? current === 'dark' : systemDark;
+  document.getElementById('themeIcon').textContent  = isDark ? '☀️' : '🌙';
+  document.getElementById('themeLabel').textContent = isDark ? 'Light' : 'Dark';
+}
+
+// Sync button label if OS theme changes while the tab is open.
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (!document.documentElement.getAttribute('data-theme')) updateToggleButton();
+});
+
+/* ── #1104: Vault Status Timeline ─────────────────────────────────────── */
+
+const KIND_ICONS = {
+  created:           '🏦',
+  deposited:         '💰',
+  checkedin:         '✅',
+  checked_in:        '✅',
+  hibernated:        '❄️',
+  released:          '🔓',
+  escalation_sent:   '🚨',
+  escalationsent:    '🚨',
+  webhook_delivered: '🔗',
+  webhookdelivered:  '🔗',
+  webhook_failed:    '⚠️',
+  webhookfailed:     '⚠️',
+};
+
+const KIND_CLASS = {
+  created:           'created',
+  deposited:         'deposited',
+  checkedin:         'checkedin',
+  checked_in:        'checkedin',
+  hibernated:        'hibernated',
+  released:          'released',
+  escalation_sent:   'escalation',
+  escalationsent:    'escalation',
+  webhook_delivered: 'webhook',
+  webhookdelivered:  'webhook',
+  webhook_failed:    'webhook',
+  webhookfailed:     'webhook',
+};
+
+function renderSkeletons(n) {
+  return Array.from({ length: n }, () => `
+    <li class="vtl-skeleton">
+      <div class="skel-circle"></div>
+      <div class="skel-lines">
+        <div class="skel-line"></div>
+        <div class="skel-line short"></div>
+      </div>
+    </li>
+  `).join('');
+}
+
+async function loadTimeline() {
+  const vaultId = document.getElementById('vaultId').value.trim();
+  const list    = document.getElementById('vtlList');
+
+  if (!vaultId) {
+    list.innerHTML = `
+      <li class="vtl-empty">
+        <div class="vtl-empty-icon">📋</div>
+        <p>Enter a Vault ID above to load the event timeline.</p>
+      </li>`;
+    return;
+  }
+
+  // Show loading skeletons.
+  list.innerHTML = renderSkeletons(4);
+
+  const apiBase = document.getElementById('apiBase').value.trim().replace(/\/$/, '');
+  const kind    = document.getElementById('vtlKind').value;
+  const params  = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+  const url     = `${apiBase}/api/vaults/${encodeURIComponent(vaultId)}/events${params}`;
+
+  try {
+    const res    = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const events = await res.json();
+
+    if (!Array.isArray(events) || events.length === 0) {
+      list.innerHTML = `
+        <li class="vtl-empty">
+          <div class="vtl-empty-icon">🌱</div>
+          <p>No events recorded yet for this vault.</p>
+        </li>`;
+      return;
+    }
+
+    list.innerHTML = events.map(ev => {
+      const kindKey  = (ev.kind || '').toLowerCase().replace(/-/g, '_');
+      const icon     = KIND_ICONS[kindKey]  ?? '📌';
+      const cssClass = KIND_CLASS[kindKey]  ?? 'created';
+      const amount   = ev.amount != null
+        ? `<span class="vtl-amount">+${Number(ev.amount).toLocaleString()} XLM</span>` : '';
+      return `
+        <li class="vtl-item">
+          <div class="vtl-icon ${cssClass}" aria-hidden="true">${icon}</div>
+          <div class="vtl-body">
+            <div class="vtl-desc">${escHtml(ev.description || kindKey)}</div>
+            <div class="vtl-meta">
+              <span>${formatDate(ev.timestamp)}</span>
+              ${amount}
+            </div>
+          </div>
+        </li>`;
+    }).join('');
+  } catch (e) {
+    list.innerHTML = `
+      <li class="vtl-empty">
+        <div class="vtl-empty-icon">⚠️</div>
+        <p>Could not load timeline: ${escHtml(e.message)}</p>
+      </li>`;
+  }
+}
+
+// Auto-load timeline after a successful simulation.
+const _origRunSimulation = runSimulation;
+async function runSimulation() {
+  await _origRunSimulation();
+  await loadTimeline();
+}
 </script>
 </body>
 </html>

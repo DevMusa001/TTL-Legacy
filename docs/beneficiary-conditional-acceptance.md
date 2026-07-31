@@ -203,6 +203,18 @@ Comprehensive tests are included in `contracts/ttl_vault/src/test.rs`:
 3. **No Bypass**: Threshold is enforced at release time and cannot be bypassed.
 4. **Auth Required**: Only the beneficiary can set a conditional acceptance.
 
+## Owner-Beneficiary Validation
+
+`create_vault` rejects configurations where the owner and beneficiary addresses are identical. An `InvalidBeneficiary` error is returned (panic in contract terms) in this case.
+
+This prevents degenerate vaults where the release mechanism has no practical effect and blocks potential gaming of reward/streak mechanics in future features.
+
+```rust
+client.create_vault(&owner, &beneficiary, &interval, &None);
+```
+
+If `owner == beneficiary`, the contract returns `ContractError::InvalidBeneficiary`.
+
 ## Future Enhancements
 
 - Allow beneficiary to update threshold before release
