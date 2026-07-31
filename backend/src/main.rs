@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::{
     extract::{FromRef, State},
     http::{HeaderValue, Method, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -16,9 +17,12 @@ mod handlers;
 mod models;
 mod notifications;
 mod otel;
+mod rate_limit;
 mod routes;
 mod scheduler;
 mod two_factor;
+mod escalation;
+mod webhook_retry;
 
 #[cfg(test)]
 mod tests;
@@ -163,19 +167,25 @@ async fn main() {
         consensus,
     };
 
+    let global_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(100, 60));
+    let checkin_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(10, 60));
+    let release_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(5, 60));
+    let email_token_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(3, 60));
+    let sensitive_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(20, 60));
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
-            post(routes::set_preferences)
+            post(routes::set_preferences).layer(middleware::from_fn_with_state(sensitive_limiter.clone(), rate_limit::rate_limit_middleware))
                 .get(routes::get_preferences)
                 .delete(routes::delete_preferences),
         )
         .route(
             "/api/vaults/:vault_id/subscriptions",
-            post(routes::set_subscription)
+            post(routes::set_subscription).layer(middleware::from_fn_with_state(sensitive_limiter.clone(), rate_limit::rate_limit_middleware))
                 .delete(routes::delete_subscription),
         )
         .route(
@@ -188,7 +198,7 @@ async fn main() {
         )
         .route(
             "/api/vaults/:vault_id/sponsored-release",
-            post(routes::create_sponsored_release)
+            post(routes::create_sponsored_release).layer(middleware::from_fn_with_state(sensitive_limiter, rate_limit::rate_limit_middleware))
                 .get(routes::get_sponsored_releases),
         )
         .route(
@@ -200,6 +210,7 @@ async fn main() {
             get(routes::get_vesting_bonus),
         )
         .layer(build_cors_layer())
+        .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

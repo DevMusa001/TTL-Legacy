@@ -3,6 +3,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, String, Sy
 /// Maximum number of vesting schedules per vault.
 pub const MAX_VESTING_SCHEDULES: u32 = 20;
 
+/// Maximum number of beneficiaries allowed per vault.
+pub const MAX_BENEFICIARIES: u32 = 20;
+
 pub const RELEASE_TOPIC: Symbol = symbol_short!("release");
 pub const VAULT_CREATED_TOPIC: Symbol = symbol_short!("v_created");
 pub const PING_EXPIRY_TOPIC: Symbol = symbol_short!("ping_exp");
@@ -23,6 +26,8 @@ pub const UPDATE_INTERVAL_TOPIC: Symbol = symbol_short!("upd_intv");
 pub const UPDATE_METADATA_TOPIC: Symbol = symbol_short!("upd_meta");
 pub const SET_MIN_INTERVAL_TOPIC: Symbol = symbol_short!("set_min");
 pub const SET_MAX_INTERVAL_TOPIC: Symbol = symbol_short!("set_max");
+/// Emitted when adaptive interval is enabled/disabled or a new suggestion is computed - Issue #2
+pub const ADAPTIVE_INTERVAL_TOPIC: Symbol = symbol_short!("adap_int");
 pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
@@ -320,6 +325,12 @@ pub const UPGRADE_CANCELLED_TOPIC: Symbol = symbol_short!("upg_canc");
 pub const TOKEN_ALLOWLIST_ADDED_TOPIC: Symbol = symbol_short!("tok_add");
 pub const TOKEN_ALLOWLIST_REMOVED_TOPIC: Symbol = symbol_short!("tok_rem");
 
+// Issue 2: vault owner lock/unlock events
+pub const VAULT_LOCK_TOPIC: Symbol = symbol_short!("v_lock");
+pub const VAULT_UNLOCK_TOPIC: Symbol = symbol_short!("v_unlk");
+// Issue 3: low-TTL warning event (per-vault configurable threshold)
+pub const LOW_TTL_WARNING_TOPIC: Symbol = symbol_short!("low_ttl");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -407,6 +418,8 @@ pub enum DataKey {
     CheckInHistoryHead(u64),
     // Issue #873: number of check-in history entries
     CheckInHistoryLen(u64),
+    /// Stores the most recently computed adaptive interval suggestion (seconds) - Issue #2
+    AdaptiveIntervalSuggestion(u64),
     CheckInStreak(u64),
     // Issue #481: proof-of-work nonce
     CheckInNonce(u64),
@@ -498,6 +511,10 @@ pub enum DataKey {
     PendingUpgrade,
     // Issue #1118: admin-controlled token allowlist
     AllowedTokens,
+    // Issue 2: owner-initiated vault lock (separate from admin freeze)
+    VaultLocked(u64),
+    // Issue 3: per-vault configurable low-TTL warning threshold (seconds)
+    VaultLowTtlThreshold(u64),
 }
 
 
@@ -871,6 +888,8 @@ pub struct Vault {
     pub multi_sig_threshold: u32,
     /// Operations that require multi-sig approval (2-of-N) - Issue #1117
     pub multisig_required_ops: Vec<MultiSigOperation>,
+    /// Whether adaptive interval adjustment is enabled for this vault - Issue #2
+    pub adaptive_interval_enabled: bool,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -1199,6 +1218,21 @@ pub struct StateTransitionEntry {
     pub timestamp: u64,
 }
 
+/// Pending multi-signature operation - Issue #1117
+/// Represents an operation awaiting co-signatures from passkeys.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingMultiSigOp {
+    pub nonce: u64,
+    pub vault_id: u64,
+    pub operation: MultiSigOperation,
+    pub signers: Vec<Address>,  // Addresses that have signed
+    pub payload: Bytes,
+    pub address_payload: Option<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub threshold: u32,
+}
 
 /// Ownership proof result - Issue #473
 #[contracttype]
@@ -1530,25 +1564,18 @@ pub const AUCTION_FINALIZED_TOPIC: Symbol = symbol_short!("auc_fin");
 pub const PROTOCOL_CONFIG_PROPOSED_TOPIC: Symbol = symbol_short!("pc_prop");
 pub const PROTOCOL_CONFIG_APPLIED_TOPIC: Symbol = symbol_short!("pc_apply");
 
-// Issue #1117: Multi-sig topics and constants
-pub const MULTISIG_COSIGNED_TOPIC: Symbol = symbol_short!("ms_cos");
-pub const MULTISIG_OP_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exe");
-pub const MULTISIG_OP_EXPIRED_TOPIC: Symbol = symbol_short!("ms_exp");
-pub const PENDING_MULTISIG_OP_EXPIRY: u64 = 900; // 15 minutes in seconds
-pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
-pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
-pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
-pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
-pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
-pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
-pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 2_592_000; // 30 days in seconds
-pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rem");
+/// Issue #1117: Pending multi-sig operation topics
+pub const PENDING_MULTISIG_OP_CREATED_TOPIC: Symbol = symbol_short!("pm_created");
+pub const PENDING_MULTISIG_OP_COSIGNED_TOPIC: Symbol = symbol_short!("pm_cosign");
+pub const PENDING_MULTISIG_OP_EXECUTED_TOPIC: Symbol = symbol_short!("pm_exec");
+pub const PENDING_MULTISIG_OP_EXPIRED_TOPIC: Symbol = symbol_short!("pm_exp");
 
 /// Aggregated protocol-level configuration — Issue #810.
 /// Returned by `get_protocol_config` so off-chain clients avoid raw storage key coupling.
 #[contracttype]
 #[derive(Clone)]
 pub struct ProtocolConfig {
+    /// Minimum check-in interval in seconds. Defaults to MIN_CHECK_IN_INTERVAL (3600s = 1 hour) if None.
     pub min_check_in_interval: Option<u64>,
     pub max_check_in_interval: Option<u64>,
     pub max_ttl_seconds: u64,
@@ -1706,3 +1733,41 @@ pub const BACKUP_CODES_ENCRYPTED_TOPIC: Symbol = symbol_short!("bkp_enc");
 pub const BACKUP_CODE_USED_TOPIC: Symbol = symbol_short!("bkp_used");
 pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
 pub const ADD_PASSKEY_TOPIC: Symbol = symbol_short!("add_pk");
+
+// ============================================================
+// Issue #951: Graduated Release Schedule
+// ============================================================
+
+/// A single tranche in a graduated release schedule.
+/// The beneficiary can claim this tranche once `release_timestamp` has passed.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseTranche {
+    /// Amount (in stroops) allocated to this tranche.
+    pub amount: i128,
+    /// Unix timestamp after which this tranche can be claimed.
+    pub release_timestamp: u64,
+    /// Whether this tranche has already been claimed.
+    pub claimed: bool,
+}
+
+/// A graduated release schedule attached to a vault.
+/// On `trigger_release`, tranches are not distributed immediately; instead,
+/// the beneficiary calls `claim_tranche` as each tranche unlocks.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseSchedule {
+    /// Ordered list of tranches. Amounts must sum to the vault balance at
+    /// the time `set_release_schedule` is called.
+    pub tranches: Vec<ReleaseTranche>,
+    /// Total amount escrowed across all tranches.
+    pub total_amount: i128,
+    /// Amount already claimed by the beneficiary.
+    pub claimed_amount: i128,
+    /// Whether the schedule has been activated (i.e., `trigger_release` fired).
+    pub active: bool,
+}
+
+// Issue #951: topic constants for release schedule events
+pub const SET_RELEASE_SCHEDULE_TOPIC: Symbol = symbol_short!("rl_sched");
+pub const TRANCHE_CLAIMED_TOPIC: Symbol = symbol_short!("tr_claim");
