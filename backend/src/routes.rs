@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    middleware::Next,
     Json,
 };
+use chrono::DateTime;
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -12,8 +15,19 @@ use crate::{
     audit,
     db::Db,
     error::AppError,
-    handlers::{parse_scenario_types, simulate_release_handler},
-    models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
+    handlers::{
+        claim_vesting_bonus_handler,
+        get_vesting_bonus_handler,
+        parse_scenario_types,
+        simulate_release_handler,
+    },
+    models::{
+        ClaimBonusRequest,
+        ReminderPreferences,
+        SetPreferencesRequest,
+        SimulateReleaseQuery,
+        SimulateReleaseResponse,
+    },
 };
 
 #[derive(Deserialize)]
@@ -191,5 +205,31 @@ pub async fn get_sponsored_releases(
     let result = list_sponsored_releases_handler(Arc::clone(&state.db), &vault_id)
         .map_err(|e| AppError::InvalidInput(e))?;
 
+    Ok(Json(result))
+}
+
+// --- Issue #1143: Vesting Bonus endpoints ---
+
+/// POST /api/vaults/:vault_id/vesting/claim-bonus
+/// Claim vesting bonus on behalf of the beneficiary.
+pub async fn claim_vesting_bonus(
+    State(db): State<Arc<Db>>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimBonusRequest>,
+) -> Result<(StatusCode, Json<crate::models::ClaimBonusResponse>), AppError> {
+    let result = claim_vesting_bonus_handler(Arc::clone(&db), headers, &vault_id, req)
+        .map_err(|e| AppError::InvalidInput(e))?;
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// GET /api/vaults/:vault_id/vesting/bonus
+/// Return current vesting bonus configuration for the vault.
+pub async fn get_vesting_bonus(
+    State(db): State<Arc<Db>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<crate::models::VestingBonusResponse>, AppError> {
+    let result = get_vesting_bonus_handler(Arc::clone(&db), &vault_id)
+        .map_err(|e| AppError::InvalidInput(e))?;
     Ok(Json(result))
 }

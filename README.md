@@ -1,6 +1,7 @@
 # TTL-Legacy — Micro-Endowment Check-In Vault on Stellar
 
 [![CI](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml/badge.svg)](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/OxDev-max/TTL-Legacy/branch/main/graph/badge.svg)](https://codecov.io/gh/OxDev-max/TTL-Legacy)
 
 A decentralized "Dead Man's Switch" built on Stellar/Soroban smart contracts.
 
@@ -193,6 +194,7 @@ The script will display the target network and identity, then require you to typ
 ```rust
 create_vault(beneficiary: Address, check_in_interval: u64) -> u64
 get_vault(vault_id: u64) -> Vault
+get_deposit_total(vault_id: u64) -> Result<i128, ContractError>
 get_ttl_remaining(vault_id: u64) -> Option<u64>
 ```
 

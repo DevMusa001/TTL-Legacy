@@ -34,6 +34,38 @@ jobs:
       - name: Build crate
         run: cargo build --package ttl-vault --lib
 
+      - name: Build release WASM
+        run: cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+
+      - name: Check WASM size
+        run: |
+          SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/ttl_vault.wasm)
+          THRESHOLD=$((256 * 1024))
+          if [ "$SIZE" -gt "$THRESHOLD" ]; then
+            echo "WASM size exceeds threshold by $(( (SIZE - THRESHOLD) / 1024 )) KB"
+            echo "WASM size: $(( SIZE / 1024 )) KB (threshold: 256 KB)"
+            exit 1
+          fi
+          echo "WASM size: $(( SIZE / 1024 )) KB (threshold: 256 KB)"
+
+      - name: Comment WASM size on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'target/wasm32-unknown-unknown/release/ttl_vault.wasm';
+            if (fs.existsSync(path)) {
+              const size = fs.statSync(path).size;
+              const kb = (size / 1024).toFixed(2);
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `📦 **WASM Size Report**: ${kb} KB (threshold: 256 KB)`
+              });
+            }
+
       - name: Run tests
         run: cargo test --package ttl-vault
 
@@ -74,3 +106,47 @@ jobs:
             echo "Version mismatch: CHANGELOG ($CHANGELOG_VERSION) != lib.rs ($LIB_VERSION)"
             exit 1
           fi
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: [ci]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, llvm-tools-preview
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --package ttl-vault --lcov --output-path lcov.info
+
+      - name: Check minimum coverage threshold
+        run: cargo llvm-cov --package ttl-vault --fail-under-lines 70
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
