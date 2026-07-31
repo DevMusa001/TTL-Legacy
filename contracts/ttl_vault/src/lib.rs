@@ -89,7 +89,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
-mod release_conditions_query_tests;
+mod passkey_last_used_tests;
 #[cfg(test)]
 mod beneficiary_waitlist_tests;
 #[cfg(test)]
@@ -10461,6 +10461,32 @@ impl TtlVaultContract {
             });
         }
         result
+    }
+
+    /// Returns the last-used timestamp for a specific passkey, or `None` if
+    /// the passkey is not registered on the vault or has never been used.
+    pub fn get_passkey_last_used(
+        env: Env,
+        vault_id: u64,
+        passkey_hash: BytesN<32>,
+    ) -> Option<u64> {
+        let key = DataKey::VaultPasskeys(vault_id);
+        let passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        for pk in passkeys.iter() {
+            if pk.hash == passkey_hash {
+                return if pk.last_used_timestamp == 0 {
+                    None
+                } else {
+                    Some(pk.last_used_timestamp)
+                };
+            }
+        }
+        None
     }
 
     // --- Issue #938: Passkey Challenge-Response Timeout ---
