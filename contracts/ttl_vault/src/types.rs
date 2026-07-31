@@ -491,13 +491,10 @@ pub enum DataKey {
     /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
     /// are all rejected with `ContractError::VaultFrozen`.
     VaultFrozen(u64),
-    // Issue #1117: pending multi-sig operations with nonce
-    PendingMultiSigOp(u64, u64), // (vault_id, nonce)
-    PendingMultiSigOpNonce(u64), // counter per vault
-    // Issue #1120: timelock-gated contract upgrade
-    PendingUpgrade,
-    // Issue #1118: admin-controlled token allowlist
-    AllowedTokens,
+    /// Pending multi-sig operation - Issue #1117
+    PendingMultiSigOp(u64, u64),  // (vault_id, nonce)
+    /// Counter for pending multi-sig operation nonces - Issue #1117
+    PendingMultiSigOpNonce(u64),
 }
 
 
@@ -1199,6 +1196,21 @@ pub struct StateTransitionEntry {
     pub timestamp: u64,
 }
 
+/// Pending multi-signature operation - Issue #1117
+/// Represents an operation awaiting co-signatures from passkeys.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingMultiSigOp {
+    pub nonce: u64,
+    pub vault_id: u64,
+    pub operation: MultiSigOperation,
+    pub signers: Vec<Address>,  // Addresses that have signed
+    pub payload: Bytes,
+    pub address_payload: Option<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub threshold: u32,
+}
 
 /// Ownership proof result - Issue #473
 #[contracttype]
@@ -1530,19 +1542,11 @@ pub const AUCTION_FINALIZED_TOPIC: Symbol = symbol_short!("auc_fin");
 pub const PROTOCOL_CONFIG_PROPOSED_TOPIC: Symbol = symbol_short!("pc_prop");
 pub const PROTOCOL_CONFIG_APPLIED_TOPIC: Symbol = symbol_short!("pc_apply");
 
-// Issue #1117: Multi-sig topics and constants
-pub const MULTISIG_COSIGNED_TOPIC: Symbol = symbol_short!("ms_cos");
-pub const MULTISIG_OP_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exe");
-pub const MULTISIG_OP_EXPIRED_TOPIC: Symbol = symbol_short!("ms_exp");
-pub const PENDING_MULTISIG_OP_EXPIRY: u64 = 900; // 15 minutes in seconds
-pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
-pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
-pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
-pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
-pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
-pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
-pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 2_592_000; // 30 days in seconds
-pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rem");
+/// Issue #1117: Pending multi-sig operation topics
+pub const PENDING_MULTISIG_OP_CREATED_TOPIC: Symbol = symbol_short!("pm_created");
+pub const PENDING_MULTISIG_OP_COSIGNED_TOPIC: Symbol = symbol_short!("pm_cosign");
+pub const PENDING_MULTISIG_OP_EXECUTED_TOPIC: Symbol = symbol_short!("pm_exec");
+pub const PENDING_MULTISIG_OP_EXPIRED_TOPIC: Symbol = symbol_short!("pm_exp");
 
 /// Aggregated protocol-level configuration — Issue #810.
 /// Returned by `get_protocol_config` so off-chain clients avoid raw storage key coupling.

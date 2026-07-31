@@ -22,6 +22,59 @@ We welcome contributions! Please follow these guidelines to help us maintain pro
    ```
 5. **Pull Requests:** Open a PR against main. Ensure your PR description clearly outlines the changes and links to the relevant issue.
 
+## Automated Security Scanning in CI
+
+The CI pipeline includes three layers of automated security scanning that run on every push and pull request:
+
+### 1. **Gitleaks (Secret Detection)**
+Gitleaks scans for accidentally committed secrets (API keys, tokens, credentials, etc.) in the git history and working directory.
+
+- **Configuration:** `.gitleaks.toml` contains the detection rules and allowlist for test fixtures
+- **False positives:** If legitimate test credentials or documentation examples trigger a false positive, add them to the `allowlist.regexes` or `allowlist.paths` in `.gitleaks.toml`
+- **Local testing:** Run gitleaks locally before pushing:
+  ```bash
+  gitleaks detect --source . --config .gitleaks.toml --redact --fail
+  ```
+
+### 2. **Cargo Audit (Vulnerability Advisories)**
+Cargo audit checks Rust dependencies against a database of known security vulnerabilities.
+
+- **Runs:** `cargo audit --deny warnings`
+- **What it catches:** Known CVEs in transitive dependencies
+- **If audit fails:** Update the vulnerable dependency to a patched version, or if no fix is available, document the exception and work with the security team
+- **Local testing:**
+  ```bash
+  cargo audit --deny warnings
+  ```
+
+### 3. **Clippy Linting (Static Analysis)**
+Clippy enforces lint warnings as hard errors to catch common mistakes and anti-patterns.
+
+- **Runs:** `cargo clippy --package ttl-vault -- -D warnings`
+- **Warnings treated as errors:** All clippy warnings must be fixed before merging
+- **Suppress spurious warnings:** Use `#[allow(clippy::rule_name)]` on specific code with a comment explaining why
+- **Local testing:**
+  ```bash
+  cargo clippy --package ttl-vault -- -D warnings
+  ```
+
+### Running Security Checks Locally
+
+Before opening a PR, run all security checks locally:
+
+```bash
+# Run the full CI suite including all security scans
+just ci
+
+# Or manually:
+cargo fmt --all -- --check
+cargo clippy --package ttl-vault -- -D warnings
+cargo audit --deny warnings
+gitleaks detect --source . --config .gitleaks.toml --redact --fail
+```
+
+If any check fails, fix it before pushing. The CI pipeline will enforce the same checks.
+
 ## Available `just` Targets
 
 Install [just](https://just.systems/man/en/packages.html), then run `just --list` from the repo root:
