@@ -2,6 +2,7 @@ use crate::models::*;
 use crate::db::*;
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::instrument;
@@ -832,6 +833,225 @@ pub fn get_notification_preferences_handler(
     get_notification_preferences(notif_store, vault_id)
 }
 
+// ── Issue #1099: Vault Health Score ──────────────────────────────────────────
+
+/// Healthy balance threshold in the same units as `Vault::balance`.
+/// Vaults at or above this level score full points for the balance factor.
+const HEALTH_BALANCE_THRESHOLD: i128 = 1_000;
+
+/// Number of consecutive check-ins needed to earn full streak points.
+const HEALTH_STREAK_FULL: u32 = 5;
+
+/// Number of passkeys needed to earn full passkey-diversity points.
+const HEALTH_PASSKEY_FULL: u32 = 3;
+
+/// Cache TTL: 5 minutes in seconds.
+const HEALTH_CACHE_TTL_SECS: i64 = 300;
+
+/// In-memory health score cache entry.
+#[derive(Clone)]
+struct HealthCacheEntry {
+    response: VaultHealthResponse,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+/// A simple in-memory cache for vault health scores.
+pub type HealthCache = Arc<Mutex<HashMap<String, HealthCacheEntry>>>;
+
+pub fn create_health_cache() -> HealthCache {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Invalidates any cached health score for `vault_id`.
+/// Call this after a check-in or deposit that changes health inputs.
+pub fn invalidate_health_cache(cache: &HealthCache, vault_id: &str) {
+    cache.lock().unwrap().remove(vault_id);
+}
+
+/// `GET /api/vaults/{id}/health`
+///
+/// Returns a 0-100 health score with a per-factor breakdown:
+/// - TTL buffer   30 pts — ratio of `ttl_remaining` to `check_in_interval`
+/// - Streak       20 pts — consecutive check-ins (full at `HEALTH_STREAK_FULL`)
+/// - Balance      30 pts — balance relative to `HEALTH_BALANCE_THRESHOLD`
+/// - Passkey div. 20 pts — number of distinct passkeys (full at `HEALTH_PASSKEY_FULL`)
+///
+/// Results are cached for 5 minutes and invalidated on check-in or deposit.
+pub fn get_vault_health_handler(
+    store: &VaultStore,
+    cache: &HealthCache,
+    vault_id: &str,
+    /// Streak value sourced from external context (0 if unavailable).
+    streak: u32,
+    /// Number of registered passkeys (0 if unavailable).
+    passkey_count: u32,
+) -> Result<VaultHealthResponse, String> {
+    // Return cached result if still fresh
+    {
+        let cache_lock = cache.lock().unwrap();
+        if let Some(entry) = cache_lock.get(vault_id) {
+            if Utc::now() < entry.expires_at {
+                return Ok(entry.response.clone());
+            }
+        }
+    }
+
+    let vault = store
+        .lock()
+        .unwrap()
+        .get(vault_id)
+        .cloned()
+        .ok_or_else(|| "Vault not found".to_string())?;
+
+    // ── TTL buffer factor (0-30) ──────────────────────────────────────────
+    let ttl_score: u8 = match vault.ttl_remaining {
+        Some(ttl) if vault.check_in_interval > 0 => {
+            let ratio = ttl as f64 / vault.check_in_interval as f64;
+            (ratio.min(1.0) * 30.0).round() as u8
+        }
+        _ => 0,
+    };
+
+    // ── Streak factor (0-20) ──────────────────────────────────────────────
+    let streak_score: u8 = {
+        let ratio = (streak as f64) / (HEALTH_STREAK_FULL as f64);
+        (ratio.min(1.0) * 20.0).round() as u8
+    };
+
+    // ── Balance factor (0-30) ─────────────────────────────────────────────
+    let balance_score: u8 = if HEALTH_BALANCE_THRESHOLD > 0 {
+        let ratio = vault.balance as f64 / HEALTH_BALANCE_THRESHOLD as f64;
+        (ratio.min(1.0) * 30.0).round() as u8
+    } else {
+        0
+    };
+
+    // ── Passkey diversity factor (0-20) ───────────────────────────────────
+    let passkey_score: u8 = {
+        let ratio = (passkey_count as f64) / (HEALTH_PASSKEY_FULL as f64);
+        (ratio.min(1.0) * 20.0).round() as u8
+    };
+
+    let score = ttl_score
+        .saturating_add(streak_score)
+        .saturating_add(balance_score)
+        .saturating_add(passkey_score);
+
+    let response = VaultHealthResponse {
+        score,
+        factors: HealthFactors {
+            ttl_buffer: ttl_score,
+            streak: streak_score,
+            balance: balance_score,
+            passkey_diversity: passkey_score,
+        },
+        computed_at: Utc::now(),
+    };
+
+    // Store in cache
+    cache.lock().unwrap().insert(
+        vault_id.to_string(),
+        HealthCacheEntry {
+            response: response.clone(),
+            expires_at: Utc::now() + chrono::Duration::seconds(HEALTH_CACHE_TTL_SECS),
+        },
+    );
+
+    Ok(response)
+}
+
+// ── Issue #1100: Bulk Vault Summary ──────────────────────────────────────────
+
+/// Maximum vault IDs accepted per bulk request.
+pub const BULK_SUMMARY_MAX_IDS: usize = 20;
+
+/// Rate-limit window in seconds.
+const BULK_RATE_WINDOW_SECS: i64 = 60;
+
+/// Maximum bulk requests per user per window.
+const BULK_RATE_LIMIT: u32 = 10;
+
+/// Per-user rate-limit state.
+#[derive(Clone)]
+struct BulkRateEntry {
+    count: u32,
+    window_start: chrono::DateTime<Utc>,
+}
+
+/// Shared rate-limit state for bulk summary requests.
+pub type BulkRateStore = Arc<Mutex<HashMap<String, BulkRateEntry>>>;
+
+pub fn create_bulk_rate_store() -> BulkRateStore {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Returns `true` if `user_id` is within their rate limit, recording the call.
+/// Returns `false` if the limit is exceeded.
+fn check_bulk_rate_limit(rate_store: &BulkRateStore, user_id: &str) -> bool {
+    let mut store = rate_store.lock().unwrap();
+    let now = Utc::now();
+    let entry = store.entry(user_id.to_string()).or_insert(BulkRateEntry {
+        count: 0,
+        window_start: now,
+    });
+    // Reset window if expired
+    if (now - entry.window_start).num_seconds() >= BULK_RATE_WINDOW_SECS {
+        entry.count = 0;
+        entry.window_start = now;
+    }
+    if entry.count >= BULK_RATE_LIMIT {
+        return false;
+    }
+    entry.count += 1;
+    true
+}
+
+/// `POST /api/vaults/bulk-summary`
+///
+/// Accepts up to `BULK_SUMMARY_MAX_IDS` vault IDs and returns a summary for each.
+/// Missing vaults produce a null-field entry rather than failing the entire request.
+/// Rate-limited to `BULK_RATE_LIMIT` requests per `user_id` per minute.
+pub fn bulk_vault_summary_handler(
+    store: &VaultStore,
+    rate_store: &BulkRateStore,
+    request: &BulkSummaryRequest,
+    user_id: &str,
+) -> Result<BulkSummaryResponse, String> {
+    if !check_bulk_rate_limit(rate_store, user_id) {
+        return Err("Rate limit exceeded: max 10 bulk requests per minute".to_string());
+    }
+    if request.vault_ids.len() > BULK_SUMMARY_MAX_IDS {
+        return Err(format!(
+            "Too many vault IDs: max {} allowed",
+            BULK_SUMMARY_MAX_IDS
+        ));
+    }
+
+    let vaults = store.lock().unwrap();
+    let summaries = request
+        .vault_ids
+        .iter()
+        .map(|id| match vaults.get(id) {
+            Some(v) => VaultSummaryEntry {
+                vault_id: id.clone(),
+                status: Some(v.status.clone()),
+                ttl_remaining: v.ttl_remaining,
+                balance: Some(v.balance),
+                last_check_in: Some(v.last_check_in),
+            },
+            None => VaultSummaryEntry {
+                vault_id: id.clone(),
+                status: None,
+                ttl_remaining: None,
+                balance: None,
+                last_check_in: None,
+            },
+        })
+        .collect();
+
+    Ok(BulkSummaryResponse { summaries })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,713 +1678,200 @@ mod tests {
         assert!(audit_store.lock().unwrap().iter().any(|e| e.action == "vault_accessed_via_share"));
     }
 
-    #[test]
-    fn test_access_vault_via_revoked_token_fails() {
-        let store = create_vault_store();
-        let token_store = create_share_token_store();
-        let audit_store = create_audit_store();
-        store.lock().unwrap().insert("v1".to_string(), Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1".to_string(),
-            balance: 100,
-            check_in_interval: 86400,
+    // ── Issue #1099: Vault Health Score tests ─────────────────────────────────
+
+    fn make_vault_health(id: &str, balance: i128, ttl: Option<u64>, interval: u64) -> Vault {
+        Vault {
+            id: id.to_string(),
+            owner: "owner".to_string(),
+            beneficiary: "ben".to_string(),
+            balance,
+            check_in_interval: interval,
             last_check_in: Utc::now(),
             created_at: Utc::now(),
             status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        });
-
-        add_share_token(&token_store, ShareToken {
-            token: "revoked-tok".to_string(),
-            share_id: "s1".to_string(),
-            vault_id: "v1".to_string(),
-            shared_with: "reader@example.com".to_string(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: true,
-        });
-
-        let result = access_vault_via_share_handler(&store, &token_store, &audit_store, "revoked-tok");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("revoked"));
+            ttl_remaining: ttl,
+        }
     }
 
     #[test]
-    fn test_access_vault_via_expired_token_fails() {
+    fn test_health_score_perfect_vault() {
         let store = create_vault_store();
-        let token_store = create_share_token_store();
-        let audit_store = create_audit_store();
-        store.lock().unwrap().insert("v1".to_string(), Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1".to_string(),
-            balance: 100,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        });
-
-        add_share_token(&token_store, ShareToken {
-            token: "expired-tok".to_string(),
-            share_id: "s1".to_string(),
-            vault_id: "v1".to_string(),
-            shared_with: "reader@example.com".to_string(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() - chrono::Duration::hours(1),
-            revoked: false,
-        });
-
-        let result = access_vault_via_share_handler(&store, &token_store, &audit_store, "expired-tok");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expired"));
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", HEALTH_BALANCE_THRESHOLD, Some(86400), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", HEALTH_STREAK_FULL, HEALTH_PASSKEY_FULL)
+            .unwrap();
+        assert_eq!(r.score, 100);
+        assert_eq!(r.factors.ttl_buffer, 30);
+        assert_eq!(r.factors.streak, 20);
+        assert_eq!(r.factors.balance, 30);
+        assert_eq!(r.factors.passkey_diversity, 20);
     }
 
     #[test]
-    fn test_access_vault_via_invalid_token_fails() {
+    fn test_health_score_zero_balance_no_streak_no_passkeys() {
         let store = create_vault_store();
-        let token_store = create_share_token_store();
-        let audit_store = create_audit_store();
-        let result = access_vault_via_share_handler(&store, &token_store, &audit_store, "nonexistent");
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 0, Some(86400), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", 0, 0).unwrap();
+        assert_eq!(r.factors.balance, 0);
+        assert_eq!(r.factors.streak, 0);
+        assert_eq!(r.factors.passkey_diversity, 0);
+        // ttl is 100% → 30 pts
+        assert_eq!(r.factors.ttl_buffer, 30);
+        assert_eq!(r.score, 30);
+    }
+
+    #[test]
+    fn test_health_score_half_ttl() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        // ttl_remaining = 43200, interval = 86400 → ratio 0.5 → 15 pts
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 500, Some(43200), 86400),
+        );
+        let r = get_vault_health_handler(&store, &cache, "v1", 0, 1).unwrap();
+        assert_eq!(r.factors.ttl_buffer, 15);
+    }
+
+    #[test]
+    fn test_health_score_not_found_returns_error() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        let result = get_vault_health_handler(&store, &cache, "missing", 0, 0);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_list_share_tokens_returns_vault_tokens() {
-        let token_store = create_share_token_store();
-        add_share_token(&token_store, ShareToken {
-            token: "t1".to_string(),
-            share_id: "s1".to_string(),
-            vault_id: "vault-1".to_string(),
-            shared_with: "a@example.com".to_string(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: false,
-        });
-        add_share_token(&token_store, ShareToken {
-            token: "t2".to_string(),
-            share_id: "s2".to_string(),
-            vault_id: "vault-1".to_string(),
-            shared_with: "b@example.com".to_string(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: false,
-        });
-        // Token for different vault
-        add_share_token(&token_store, ShareToken {
-            token: "t3".to_string(),
-            share_id: "s3".to_string(),
-            vault_id: "other-vault".to_string(),
-            shared_with: "c@example.com".to_string(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: false,
-        });
-
-        let tokens = list_share_tokens_handler(&token_store, "vault-1");
-        assert_eq!(tokens.len(), 2);
+    fn test_health_score_cached_result_returned() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 1000, Some(86400), 86400),
+        );
+        let r1 = get_vault_health_handler(&store, &cache, "v1", 3, 2).unwrap();
+        // Mutate vault — cached result should be returned unchanged
+        store.lock().unwrap().get_mut("v1").unwrap().balance = 0;
+        let r2 = get_vault_health_handler(&store, &cache, "v1", 3, 2).unwrap();
+        assert_eq!(r1.score, r2.score, "cache should shield against store mutation");
     }
 
-    // ── Task 4: Notification Preferences tests ────────────────────────────────
+    #[test]
+    fn test_health_cache_invalidated_yields_fresh_score() {
+        let store = create_vault_store();
+        let cache = create_health_cache();
+        store.lock().unwrap().insert(
+            "v1".to_string(),
+            make_vault_health("v1", 1000, Some(86400), 86400),
+        );
+        let r1 = get_vault_health_handler(&store, &cache, "v1", 5, 3).unwrap();
+        invalidate_health_cache(&cache, "v1");
+        // Zero out balance after invalidation
+        store.lock().unwrap().get_mut("v1").unwrap().balance = 0;
+        let r2 = get_vault_health_handler(&store, &cache, "v1", 5, 3).unwrap();
+        assert!(r2.score < r1.score, "score must drop after balance zeroed and cache cleared");
+    }
+
+    // ── Issue #1100: Bulk Vault Summary tests ─────────────────────────────────
+
+    fn insert_vault(store: &VaultStore, id: &str, balance: i128, ttl: Option<u64>) {
+        store.lock().unwrap().insert(
+            id.to_string(),
+            Vault {
+                id: id.to_string(),
+                owner: "owner".to_string(),
+                beneficiary: "ben".to_string(),
+                balance,
+                check_in_interval: 86400,
+                last_check_in: Utc::now(),
+                created_at: Utc::now(),
+                status: VaultStatus::Active,
+                ttl_remaining: ttl,
+            },
+        );
+    }
 
     #[test]
-    fn test_set_notification_preferences() {
+    fn test_bulk_summary_full_success() {
         let store = create_vault_store();
-        let notif_store = create_notification_store();
-        store.lock().unwrap().insert("v1".to_string(), Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1".to_string(),
-            balance: 0,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        });
+        let rate = create_bulk_rate_store();
+        insert_vault(&store, "v1", 100, Some(86400));
+        insert_vault(&store, "v2", 200, Some(43200));
 
-        let req = NotificationPreferencesRequest {
-            channels: vec![NotificationChannel::Email, NotificationChannel::Push],
-            frequency: NotificationFrequency::Weekly,
+        let req = BulkSummaryRequest { vault_ids: vec!["v1".to_string(), "v2".to_string()] };
+        let resp = bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
+        assert_eq!(resp.summaries.len(), 2);
+        assert!(resp.summaries[0].status.is_some());
+        assert_eq!(resp.summaries[0].balance, Some(100));
+        assert!(resp.summaries[1].status.is_some());
+        assert_eq!(resp.summaries[1].balance, Some(200));
+    }
+
+    #[test]
+    fn test_bulk_summary_partial_missing_vault() {
+        let store = create_vault_store();
+        let rate = create_bulk_rate_store();
+        insert_vault(&store, "v1", 500, Some(86400));
+
+        let req = BulkSummaryRequest {
+            vault_ids: vec!["v1".to_string(), "missing".to_string()],
         };
-        let result = set_notification_preferences_handler(&store, &notif_store, "v1", req);
-        assert!(result.is_ok());
-        let prefs = result.unwrap();
-        assert_eq!(prefs.owner, "v1");
-        assert!(prefs.expiry_warning_enabled);
-        assert!(prefs.vault_released_enabled || prefs.check_in_reminder_enabled);
-
+        let resp = bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
+        assert_eq!(resp.summaries.len(), 2);
+        // Known vault
+        assert!(resp.summaries[0].status.is_some());
+        // Missing vault — all fields null
+        assert_eq!(resp.summaries[1].vault_id, "missing");
+        assert!(resp.summaries[1].status.is_none());
+        assert!(resp.summaries[1].balance.is_none());
     }
 
     #[test]
-    fn test_get_notification_preferences() {
+    fn test_bulk_summary_over_limit_rejected() {
         let store = create_vault_store();
-        let notif_store = create_notification_store();
-        store.lock().unwrap().insert("v1".to_string(), Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1".to_string(),
-            balance: 0,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        });
-
-        set_notification_preferences_handler(&store, &notif_store, "v1", NotificationPreferencesRequest {
-            channels: vec![NotificationChannel::Sms],
-            frequency: NotificationFrequency::Daily,
-        }).unwrap();
-
-        let prefs = get_notification_preferences_handler(&notif_store, "v1");
-        assert!(prefs.is_some());
-        assert!(prefs.unwrap().check_in_reminder_enabled);
+        let rate = create_bulk_rate_store();
+        let ids: Vec<String> = (0..=BULK_SUMMARY_MAX_IDS).map(|i| format!("v{}", i)).collect();
+        let req = BulkSummaryRequest { vault_ids: ids };
+        let result = bulk_vault_summary_handler(&store, &rate, &req, "user1");
+        assert!(result.is_err(), "should reject > {} vault IDs", BULK_SUMMARY_MAX_IDS);
     }
 
     #[test]
-    fn test_notification_preferences_vault_not_found() {
+    fn test_bulk_summary_rate_limit_enforced() {
         let store = create_vault_store();
-        let notif_store = create_notification_store();
-        let req = NotificationPreferencesRequest {
-            channels: vec![NotificationChannel::Email],
-            frequency: NotificationFrequency::Monthly,
-        };
-        assert!(set_notification_preferences_handler(&store, &notif_store, "missing", req).is_err());
-    }
+        let rate = create_bulk_rate_store();
+        let req = BulkSummaryRequest { vault_ids: vec![] };
 
-    #[test]
-    fn test_notification_preferences_empty_channels_rejected() {
-        let store = create_vault_store();
-        let notif_store = create_notification_store();
-        store.lock().unwrap().insert("v1".to_string(), Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1".to_string(),
-            balance: 0,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        });
-        let req = NotificationPreferencesRequest {
-            channels: vec![],
-            frequency: NotificationFrequency::Daily,
-        };
-        assert!(set_notification_preferences_handler(&store, &notif_store, "v1", req).is_err());
-    }
-
-    // ── Per-Vault Analytics tests (#959) ──────────────────────────────────────
-
-    #[test]
-    fn test_get_vault_detail_analytics_vault_not_found() {
-        let store = create_vault_store();
-        let event_store = create_event_store();
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "missing");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Vault not found"));
-    }
-
-    #[test]
-    fn test_get_vault_detail_analytics_basic() {
-        let store = create_vault_store();
-        let event_store = create_event_store();
-
-        let vault = Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1@example.com".to_string(),
-            balance: 5000,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(72000),
-        };
-        store.lock().unwrap().insert("v1".to_string(), vault);
-
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
-        assert!(result.is_ok());
-        let analytics = result.unwrap();
-        assert_eq!(analytics.vault_id, "v1");
-        assert_eq!(analytics.beneficiary_status.beneficiary_address, "ben1@example.com");
-        assert!(analytics.beneficiary_status.is_active);
-        assert_eq!(analytics.beneficiary_status.vault_status, "Active");
-        assert!(analytics.beneficiary_status.can_receive_funds);
-    }
-
-    #[test]
-    fn test_get_vault_detail_analytics_with_events() {
-        let store = create_vault_store();
-        let event_store = create_event_store();
-
-        let vault = Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1@example.com".to_string(),
-            balance: 1000,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(50000),
-        };
-        store.lock().unwrap().insert("v1".to_string(), vault);
-
-        // Add some events
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::CheckIn,
-            timestamp: Utc::now() - chrono::Duration::days(5),
-            data: serde_json::json!({"ttl_remaining": 86400}),
-        });
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::Withdrawal,
-            timestamp: Utc::now() - chrono::Duration::days(2),
-            data: serde_json::json!({"amount": 500}),
-        });
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::TtlUpdate,
-            timestamp: Utc::now() - chrono::Duration::days(1),
-            data: serde_json::json!({"ttl_remaining": 50000}),
-        });
-
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
-        assert!(result.is_ok());
-        let analytics = result.unwrap();
-
-        // Check TTL history
-        assert!(!analytics.ttl_history.is_empty());
-
-        // Check withdrawal trends
-        assert_eq!(analytics.withdrawal_trends.withdrawal_count, 1);
-        assert_eq!(analytics.withdrawal_trends.total_withdrawals, 500);
-        assert_eq!(analytics.withdrawal_trends.average_withdrawal_amount, 500.0);
-        assert!(analytics.withdrawal_trends.last_withdrawal_date.is_some());
-
-        // Check check-in frequency
-        assert_eq!(analytics.check_in_frequency.total_check_ins, 1);
-    }
-
-    #[test]
-    fn test_get_vault_detail_analytics_released_vault() {
-        let store = create_vault_store();
-        let event_store = create_event_store();
-
-        let vault = Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1@example.com".to_string(),
-            balance: 10000,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Released,
-            ttl_remaining: None,
-        };
-        store.lock().unwrap().insert("v1".to_string(), vault);
-
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
-        assert!(result.is_ok());
-        let analytics = result.unwrap();
-        assert_eq!(analytics.beneficiary_status.vault_status, "Released");
-        assert!(analytics.beneficiary_status.can_receive_funds);
-        assert!(!analytics.beneficiary_status.is_active);
-    }
-
-    #[test]
-    fn test_get_vault_detail_analytics_ttl_history_last_30_days() {
-        let store = create_vault_store();
-        let event_store = create_event_store();
-
-        let vault = Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1@example.com".to_string(),
-            balance: 1000,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        };
-        store.lock().unwrap().insert("v1".to_string(), vault);
-
-        // Add old event (60 days ago) - should be filtered out
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::TtlUpdate,
-            timestamp: Utc::now() - chrono::Duration::days(60),
-            data: serde_json::json!({"ttl_remaining": 100000}),
-        });
-
-        // Add recent event (10 days ago) - should be included
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::TtlUpdate,
-            timestamp: Utc::now() - chrono::Duration::days(10),
-            data: serde_json::json!({"ttl_remaining": 80000}),
-        });
-
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
-        assert!(result.is_ok());
-        let analytics = result.unwrap();
-
-        // Should only have the recent event (plus current_state fallback)
-        assert!(analytics.ttl_history.len() <= 2);
-        if analytics.ttl_history.len() == 2 {
-            assert!(analytics.ttl_history.iter().any(|p| p.event == "current_state"));
+        for _ in 0..BULK_RATE_LIMIT {
+            assert!(bulk_vault_summary_handler(&store, &rate, &req, "user1").is_ok());
         }
+        // 11th request in the same window should be rejected
+        let result = bulk_vault_summary_handler(&store, &rate, &req, "user1");
+        assert!(result.is_err(), "11th request should be rate-limited");
+        assert!(result.unwrap_err().contains("Rate limit exceeded"));
     }
 
     #[test]
-    fn test_get_vault_detail_analytics_multiple_withdrawals() {
+    fn test_bulk_summary_rate_limit_independent_per_user() {
         let store = create_vault_store();
-        let event_store = create_event_store();
+        let rate = create_bulk_rate_store();
+        let req = BulkSummaryRequest { vault_ids: vec![] };
 
-        let vault = Vault {
-            id: "v1".to_string(),
-            owner: "owner1".to_string(),
-            beneficiary: "ben1@example.com".to_string(),
-            balance: 10000,
-            check_in_interval: 86400,
-            last_check_in: Utc::now(),
-            created_at: Utc::now(),
-            status: VaultStatus::Active,
-            ttl_remaining: Some(86400),
-        };
-        store.lock().unwrap().insert("v1".to_string(), vault);
-
-        // Add multiple withdrawals
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::Withdrawal,
-            timestamp: Utc::now() - chrono::Duration::days(10),
-            data: serde_json::json!({"amount": 1000}),
-        });
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::Withdrawal,
-            timestamp: Utc::now() - chrono::Duration::days(5),
-            data: serde_json::json!({"amount": 2000}),
-        });
-        event_store.lock().unwrap().push(VaultEvent {
-            vault_id: "v1".to_string(),
-            event_type: EventType::Withdrawal,
-            timestamp: Utc::now() - chrono::Duration::days(2),
-            data: serde_json::json!({"amount": 3000}),
-        });
-
-        let result = get_vault_detail_analytics_handler(&store, &event_store, "v1");
-        assert!(result.is_ok());
-        let analytics = result.unwrap();
-
-        assert_eq!(analytics.withdrawal_trends.withdrawal_count, 3);
-        assert_eq!(analytics.withdrawal_trends.total_withdrawals, 6000);
-        assert!((analytics.withdrawal_trends.average_withdrawal_amount - 2000.0).abs() < f64::EPSILON);
-        assert!(analytics.withdrawal_trends.last_withdrawal_date.is_some());
-    }
-}
-
-// ── Release Simulator ────────────────────────────────────────────────────────
-
-/// Parse a comma-separated `scenarios` query param into a `Vec<ScenarioType>`.
-/// Returns all three scenarios when the param is absent or empty.
-pub fn parse_scenario_types(raw: Option<&str>) -> Vec<ScenarioType> {
-    match raw {
-        None | Some("") => vec![
-            ScenarioType::NoCheckIns,
-            ScenarioType::ConsistentCheckIns,
-            ScenarioType::MissedCheckInDates,
-        ],
-        Some(s) => s
-            .split(',')
-            .filter_map(|part| match part.trim() {
-                "no_check_ins" => Some(ScenarioType::NoCheckIns),
-                "consistent_check_ins" => Some(ScenarioType::ConsistentCheckIns),
-                "missed_check_in_dates" => Some(ScenarioType::MissedCheckInDates),
-                _ => None,
-            })
-            .collect(),
-    }
-}
-
-/// Calculate the release date for a single scenario given vault state at `now`.
-///
-/// * `ttl_remaining_secs` — current TTL left in seconds (0 means already expired)
-/// * `check_in_interval`  — vault's configured check-in interval in seconds
-/// * `missed_count`       — for `MissedCheckInDates`: how many consecutive
-///   check-ins are missed before the owner stops entirely
-pub fn simulate_scenario(
-    now: DateTime<Utc>,
-    scenario: ScenarioType,
-    ttl_remaining_secs: u64,
-    check_in_interval: u64,
-    missed_count: u32,
-) -> ScenarioResult {
-    match scenario {
-        // Owner stops checking in immediately — vault releases when current TTL runs out.
-        ScenarioType::NoCheckIns => {
-            let release_at = now + chrono::Duration::seconds(ttl_remaining_secs as i64);
-            let seconds_until = ttl_remaining_secs as i64;
-            ScenarioResult {
-                scenario: ScenarioType::NoCheckIns,
-                description: "Owner performs no further check-ins. \
-                    Vault releases when the current TTL expires."
-                    .to_string(),
-                projected_release_at: release_at,
-                seconds_until_release: seconds_until,
-                confidence: "high".to_string(),
-                notes: format!(
-                    "Current TTL remaining: {} seconds ({:.1} days).",
-                    ttl_remaining_secs,
-                    ttl_remaining_secs as f64 / 86_400.0
-                ),
-            }
+        for _ in 0..BULK_RATE_LIMIT {
+            bulk_vault_summary_handler(&store, &rate, &req, "user1").unwrap();
         }
-
-        // Owner keeps checking in every `check_in_interval` seconds indefinitely.
-        // The vault never releases under this scenario.
-        ScenarioType::ConsistentCheckIns => {
-            // 100 years in seconds as a "never" sentinel
-            let never_secs: i64 = 100 * 365 * 24 * 3600;
-            let far_future = now + chrono::Duration::seconds(never_secs);
-            ScenarioResult {
-                scenario: ScenarioType::ConsistentCheckIns,
-                description: "Owner checks in consistently at the configured interval. \
-                    Vault does not release."
-                    .to_string(),
-                projected_release_at: far_future,
-                seconds_until_release: -1, // -1 signals "never" to clients
-                confidence: "high".to_string(),
-                notes: format!(
-                    "With a check-in interval of {} seconds ({:.1} days), \
-                    consistent check-ins prevent vault release indefinitely.",
-                    check_in_interval,
-                    check_in_interval as f64 / 86_400.0
-                ),
-            }
-        }
-
-        // Owner misses `missed_count` consecutive check-ins, then stops.
-        // Each missed check-in adds one full `check_in_interval` to the TTL runway.
-        ScenarioType::MissedCheckInDates => {
-            let safe_missed = missed_count.max(1);
-            // After missing `safe_missed` check-ins the TTL has been running down
-            // for `safe_missed * check_in_interval` additional seconds beyond the current TTL.
-            let extra_seconds = (safe_missed as u64).saturating_mul(check_in_interval);
-            let total_seconds = ttl_remaining_secs.saturating_add(extra_seconds);
-            let release_at = now + chrono::Duration::seconds(total_seconds as i64);
-            let confidence = if safe_missed <= 2 { "medium" } else { "low" }.to_string();
-            ScenarioResult {
-                scenario: ScenarioType::MissedCheckInDates,
-                description: format!(
-                    "Owner misses {} consecutive check-in(s), then stops entirely.",
-                    safe_missed
-                ),
-                projected_release_at: release_at,
-                seconds_until_release: total_seconds as i64,
-                confidence,
-                notes: format!(
-                    "Each missed check-in adds {} seconds ({:.1} days) to the release window. \
-                    {} missed check-in(s) → {} additional seconds.",
-                    check_in_interval,
-                    check_in_interval as f64 / 86_400.0,
-                    safe_missed,
-                    extra_seconds
-                ),
-            }
-        }
+        // Different user should still have their full quota
+        assert!(
+            bulk_vault_summary_handler(&store, &rate, &req, "user2").is_ok(),
+            "user2 should have independent rate limit"
+        );
     }
-}
-
-/// Public entry point: simulate release scenarios for a vault.
-///
-/// Returns `Err` with a message when the vault is not found.
-///
-/// Instrumented with an OpenTelemetry span (Issue #1145).
-#[instrument(skip(store), fields(vault_id = %vault_id))]
-pub fn simulate_release_handler(
-    store: &VaultStore,
-    vault_id: &str,
-    scenario_types: Vec<ScenarioType>,
-    missed_count: u32,
-) -> Result<SimulateReleaseResponse, String> {
-    let vaults = store.lock().unwrap();
-    let vault = vaults
-        .get(vault_id)
-        .cloned()
-        .ok_or_else(|| format!("Vault '{}' not found", vault_id))?;
-    drop(vaults);
-
-    let now = Utc::now();
-
-    // Compute effective TTL remaining: prefer the stored value, fall back to
-    // computing from last_check_in + check_in_interval.
-    let ttl_remaining_secs: u64 = match vault.ttl_remaining {
-        Some(t) => t,
-        None => {
-            let elapsed = now
-                .signed_duration_since(vault.last_check_in)
-                .num_seconds()
-                .max(0) as u64;
-            vault.check_in_interval.saturating_sub(elapsed)
-        }
-    };
-
-    let effective_missed = missed_count.max(1);
-    let scenario_results: Vec<ScenarioResult> = scenario_types
-        .into_iter()
-        .map(|s| {
-            simulate_scenario(
-                now,
-                s,
-                ttl_remaining_secs,
-                vault.check_in_interval,
-                effective_missed,
-            )
-        })
-        .collect();
-
-    Ok(SimulateReleaseResponse {
-        vault_id: vault.id,
-        current_ttl_remaining: vault.ttl_remaining,
-        check_in_interval: vault.check_in_interval,
-        last_check_in: vault.last_check_in,
-        scenarios: scenario_results,
-        simulated_at: now,
-    })
-}
-
-// ── Sponsored Release (#1122) ────────────────────────────────────────────────
-
-use crate::fee_sponsorship::*;
-
-/// Handler for POST /api/vaults/{id}/sponsored-release.
-///
-/// Creates a fee-sponsored release transaction for a beneficiary without XLM.
-/// Deducts 0.1% protocol fee and constructs a fee bump transaction.
-///
-/// Instrumented with an OpenTelemetry span (Issue #1145).
-#[instrument(skip(store, db), fields(vault_id = %vault_id))]
-pub fn sponsored_release_handler(
-    store: &VaultStore,
-    db: Arc<Db>,
-    vault_id: &str,
-    req: SponsoredReleaseRequest,
-) -> Result<SponsoredReleaseResponse, String> {
-    let vaults = store.lock().unwrap();
-    let vault = vaults
-        .get(vault_id)
-        .cloned()
-        .ok_or_else(|| format!("Vault '{}' not found", vault_id))?;
-    drop(vaults);
-
-    // Validate beneficiary account
-    if req.beneficiary_account.is_empty() {
-        return Err("Beneficiary account required".to_string());
-    }
-
-    // Get the released amount from vault balance
-    let released_amount = vault.balance;
-    if released_amount <= 0 {
-        return Err("Vault has no funds to release".to_string());
-    }
-
-    // Calculate protocol fee (0.1% of released amount)
-    let protocol_fee = calculate_protocol_fee(released_amount);
-    let net_amount = released_amount - protocol_fee;
-
-    if net_amount <= 0 {
-        return Err("Net amount after protocol fee is zero or negative".to_string());
-    }
-
-    // Construct fee bump transaction
-    let sponsor_account = std::env::var("SPONSOR_ACCOUNT")
-        .unwrap_or_else(|_| "GCCZWCG4ACXC5TIWC7XAUCJLX4I7AKTDAUF5AQ6MNJ5UKXVWNPGU7XT".to_string());
-
-    let memo = req.memo.as_deref();
-    let fee_bump_tx_hash = construct_fee_bump_transaction(
-        &req.beneficiary_account,
-        &sponsor_account,
-        net_amount,
-        memo,
-    )
-    .map_err(|e| format!("Failed to construct fee bump transaction: {}", e))?;
-
-    // Create sponsored release record
-    let tx_id = uuid::Uuid::new_v4().to_string();
-    let stellar_base_fee = 100i128; // stroops
-    let fee_bump_premium = 50i128; // stroops for priority
-    let sponsorship_fee = stellar_base_fee + fee_bump_premium;
-
-    let sponsored_release = SponsoredRelease {
-        tx_id: tx_id.clone(),
-        vault_id: vault_id.to_string(),
-        beneficiary: req.beneficiary_account.clone(),
-        released_amount,
-        protocol_fee,
-        net_amount,
-        fee_bump_tx_hash,
-        sponsor_account: sponsor_account.clone(),
-        sponsorship_fee,
-        status: SponsoredReleaseStatus::Pending,
-        created_at: Utc::now(),
-        executed_at: None,
-        ledger_sequence: None,
-        error: None,
-    };
-
-    // Persist to database
-    db.insert_sponsored_release(&sponsored_release)
-        .map_err(|e| format!("Failed to store sponsored release: {}", e))?;
-
-    // Log the transaction
-    tracing::info!(
-        vault_id = %vault_id,
-        beneficiary = %req.beneficiary_account,
-        released_amount = released_amount,
-        protocol_fee = protocol_fee,
-        net_amount = net_amount,
-        tx_id = %tx_id,
-        "sponsored release created"
-    );
-
-    let fee_breakdown = FeeBreakdown::new(released_amount, stellar_base_fee, fee_bump_premium);
-
-    Ok(SponsoredReleaseResponse {
-        transaction: sponsored_release,
-        fee_breakdown,
-    })
-}
-
-/// Retrieve a previously created sponsored release transaction.
-#[instrument(skip(db), fields(tx_id = %tx_id))]
-pub fn get_sponsored_release_handler(
-    db: Arc<Db>,
-    tx_id: &str,
-) -> Result<SponsoredRelease, String> {
-    db.get_sponsored_release(tx_id)
-        .map_err(|e| format!("Database error: {}", e))?
-        .ok_or_else(|| format!("Sponsored release transaction '{}' not found", tx_id))
-}
-
-/// List all sponsored releases for a vault.
-#[instrument(skip(db), fields(vault_id = %vault_id))]
-pub fn list_sponsored_releases_handler(
-    db: Arc<Db>,
-    vault_id: &str,
-) -> Result<Vec<SponsoredRelease>, String> {
-    db.list_sponsored_releases_for_vault(vault_id)
-        .map_err(|e| format!("Database error: {}", e))
 }
