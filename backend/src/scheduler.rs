@@ -72,6 +72,12 @@ pub async fn run(db: Arc<Db>) {
 
         // 2) TTL insurance scheduler.
         extend_ttl_for_inactive_owners(&db).await;
+
+        // 3) #1101: Reminder escalation for unresponsive vault owners.
+        crate::escalation::run_escalation_check(&db).await;
+
+        // 4) #1102: Webhook delivery retry with exponential backoff.
+        crate::webhook_retry::flush(&db).await;
     }
 }
 

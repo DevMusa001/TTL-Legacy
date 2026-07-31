@@ -680,3 +680,41 @@ pub struct SimulateReleaseResponse {
     pub simulated_at: DateTime<Utc>,
 }
 
+// --- Issue #1143: Vesting Bonus Backend API ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VestingBonusConfig {
+    pub vault_id: String,
+    pub bonus_bps: u32,
+    pub on_time_window_seconds: u64,
+}
+
+/// Request body for POST /api/vaults/{id}/vesting/claim-bonus.
+#[derive(Debug, Deserialize)]
+pub struct ClaimBonusRequest {
+    /// Caller must be the beneficiary; this is the Stellar account address.
+    pub beneficiary: String,
+    /// Optional memo for the claim transaction.
+    pub memo: Option<String>,
+}
+
+/// Response body for POST /api/vaults/{id}/vesting/claim-bonus.
+#[derive(Debug, Serialize)]
+pub struct ClaimBonusResponse {
+    pub vault_id: String,
+    pub claimed_amount: i128,
+    pub bonus_amount: i128,
+    pub transaction_hash: String,
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// Response body for GET /api/vaults/{id}/vesting/bonus.
+#[derive(Debug, Serialize)]
+pub struct VestingBonusResponse {
+    pub vault_id: String,
+    pub configured: bool,
+    pub bonus_bps: Option<u32>,
+    pub on_time_window_seconds: Option<u64>,
+}
+
+
