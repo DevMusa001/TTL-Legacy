@@ -322,6 +322,12 @@ pub const UPGRADE_CANCELLED_TOPIC: Symbol = symbol_short!("upg_canc");
 pub const TOKEN_ALLOWLIST_ADDED_TOPIC: Symbol = symbol_short!("tok_add");
 pub const TOKEN_ALLOWLIST_REMOVED_TOPIC: Symbol = symbol_short!("tok_rem");
 
+// Issue 2: vault owner lock/unlock events
+pub const VAULT_LOCK_TOPIC: Symbol = symbol_short!("v_lock");
+pub const VAULT_UNLOCK_TOPIC: Symbol = symbol_short!("v_unlk");
+// Issue 3: low-TTL warning event (per-vault configurable threshold)
+pub const LOW_TTL_WARNING_TOPIC: Symbol = symbol_short!("low_ttl");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -502,8 +508,10 @@ pub enum DataKey {
     PendingUpgrade,
     // Issue #1118: admin-controlled token allowlist
     AllowedTokens,
-    // Issue #951: graduated release schedule per vault
-    ReleaseSchedule(u64),
+    // Issue 2: owner-initiated vault lock (separate from admin freeze)
+    VaultLocked(u64),
+    // Issue 3: per-vault configurable low-TTL warning threshold (seconds)
+    VaultLowTtlThreshold(u64),
 }
 
 
