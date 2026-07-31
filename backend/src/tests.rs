@@ -1541,3 +1541,162 @@ mod simulator_tests {
         assert_eq!(scenarios[0]["confidence"], "low");
     }
 }
+
+// --- Issue #1143: Vesting Bonus Backend Tests ---
+
+fn vesting_bonus_app() -> Router {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    db.insert_vault(crate::models::Vault {
+        id: "vesting-vault-1".to_string(),
+        owner: "owner1".to_string(),
+        beneficiary: "beneficiary1".to_string(),
+        balance: 1_000_000,
+        check_in_interval: 86400,
+        last_check_in: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        status: crate::models::VaultStatus::Released,
+        ttl_remaining: Some(0),
+    });
+
+    db.upsert_vesting_bonus(&crate::models::VestingBonusConfig {
+        vault_id: "vesting-vault-1".to_string(),
+        bonus_bps: 100,
+        on_time_window_seconds: 604800,
+    })
+    .unwrap();
+
+    db.insert_vault(crate::models::Vault {
+        id: "vesting-vault-2".to_string(),
+        owner: "owner2".to_string(),
+        beneficiary: "beneficiary2".to_string(),
+        balance: 500_000,
+        check_in_interval: 86400,
+        last_check_in: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        status: crate::models::VaultStatus::Released,
+        ttl_remaining: Some(0),
+    });
+
+    Router::new()
+        .route(
+            "/api/vaults/:vault_id/vesting/claim-bonus",
+            post(routes::claim_vesting_bonus),
+        )
+        .route(
+            "/api/vaults/:vault_id/vesting/bonus",
+            get(routes::get_vesting_bonus),
+        )
+        .with_state(Arc::clone(&db))
+}
+
+#[tokio::test]
+async fn test_claim_vesting_bonus_success() {
+    let app = vesting_bonus_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vaults/vesting-vault-1/vesting/claim-bonus")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"beneficiary":"beneficiary1","memo":"test-claim"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["vault_id"], "vesting-vault-1");
+    assert!(json["claimed_amount"].as_i128().unwrap() > 0);
+    assert!(json["bonus_amount"].as_i128().unwrap() >= 0);
+    assert!(!json["transaction_hash"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_claim_vesting_bonus_not_beneficiary() {
+    let app = vesting_bonus_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vaults/vesting-vault-1/vesting/claim-bonus")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"beneficiary":"wrong-beneficiary","memo":null}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_claim_vesting_bonus_no_bonus_configured() {
+    let app = vesting_bonus_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vaults/vesting-vault-2/vesting/claim-bonus")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"beneficiary":"beneficiary1","memo":null}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_get_vesting_bonus_configured() {
+    let app = vesting_bonus_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vaults/vesting-vault-1/vesting/bonus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["vault_id"], "vesting-vault-1");
+    assert!(json["configured"].as_bool().unwrap());
+    assert_eq!(json["bonus_bps"], 100);
+    assert_eq!(json["on_time_window_seconds"], 604800);
+}
+
+#[tokio::test]
+async fn test_get_vesting_bonus_not_configured() {
+    let app = vesting_bonus_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vaults/vesting-vault-2/vesting/bonus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["vault_id"], "vesting-vault-2");
+    assert!(!json["configured"].as_bool().unwrap());
+    assert!(json["bonus_bps"].is_null());
+    assert!(json["on_time_window_seconds"].is_null());
+}

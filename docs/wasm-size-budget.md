@@ -6,13 +6,14 @@ The TTL-Vault contract WASM size is monitored in CI to prevent regressions that 
 
 ## Budget Threshold
 
-**512 KB** — Maximum recommended WASM size for `ttl_vault` contract
+**256 KB** — Maximum recommended WASM size for `ttl_vault` contract
 
 ### Rationale
 
-- **Deployment Cost**: Larger WASM files require more XLM to upload to Soroban
-- **Instruction Budget**: Soroban imposes limits on code size; staying well below 1 MB provides safety margin
+- **Deployment Cost**: Soroban charges per byte uploaded; every kilobyte increases deployment fees
+- **Instruction Budget**: Soroban has hard upload limits; staying well below 512 KB provides safety margin
 - **Performance**: Smaller WASM loads faster and uses less memory during contract execution
+- **Read-Heavy Paths**: Frontends and indexers cache contract metadata; smaller binaries reduce bandwidth
 
 ## Monitoring
 
@@ -20,10 +21,10 @@ The CI pipeline checks the WASM size on every push and pull request:
 
 ```bash
 cargo build --package ttl-vault --target wasm32-unknown-unknown --release
-stat target/wasm32-unknown-unknown/release/ttl_vault.wasm
+stat -c%s target/wasm32-unknown-unknown/release/ttl_vault.wasm
 ```
 
-If the size exceeds 512 KB, the CI build will fail with a clear message indicating the overage.
+If the size exceeds 256 KB, the CI build will fail with a clear message indicating the overage.
 
 ## Optimization Strategies
 
@@ -82,7 +83,7 @@ If legitimate growth requires increasing the threshold:
 
 ```
 ❌ WASM size exceeds threshold by 50 KB
-WASM size: 562 KB (threshold: 512 KB)
+WASM size: 306 KB (threshold: 256 KB)
 ```
 
 Action: Apply one or more optimizations above, then re-push.
