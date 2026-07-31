@@ -14,7 +14,7 @@ use types::{
     EncryptedBackupCodes, GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry,
     MilestoneEntry, MilestoneVestingSchedule, MultiSigConfig, MultiSigOperation, MultiSigProposal,
     OwnershipProof, OwnershipTransferRequest, PasskeyAnalytics, PasskeyHash, PasskeyUsageEntry,
-    PasskeyUsageStat, PauseRecord, PendingBeneficiaryUpdate, ProofOfLifeEntry, ProposalStatus,
+    PasskeyUsageStat, PauseRecord, PendingBeneficiaryUpdate, PendingMultiSigOp, ProofOfLifeEntry, ProposalStatus,
     ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry, StateTransitionEntry,
     TokenCollateral, TokenConversion, TokenHedge, TokenLending, TokenRebalanceConfig, TokenStaking,
     TokenWeight, TtlBorrowRecord, UpgradeProposal, Vault, VaultStatusSummary, VestingBonusConfig,
@@ -45,9 +45,10 @@ use types::{
     OWNERSHIP_TRANSFER_EXPIRED_TOPIC, PASSKEY_ANALYTICS_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
     PASSKEY_LOCKOUT_TOPIC, PASSKEY_RECOVERED_TOPIC, PASSKEY_RECOVERY_INITIATED_TOPIC,
     PASSKEY_ROTATION_ENFORCED_TOPIC, PASSKEY_ROTATION_REQUIRED_TOPIC, PASSKEY_UNLOCKED_TOPIC,
-    PASSKEY_USAGE_TOPIC, PAUSE_TOPIC, PAUSE_VAULT_TOPIC, PING_EXPIRY_TOPIC, POOL_CREATED_TOPIC,
-    PROOF_OF_LIFE_TOPIC, PROXY_CLAIM_TOPIC, RECOVERY_EXTEND_TOPIC, RELEASE_TOPIC,
-    RELEASE_VOTE_PASSED_TOPIC,
+    PASSKEY_USAGE_TOPIC, PAUSE_TOPIC, PAUSE_VAULT_TOPIC, PENDING_MULTISIG_OP_COSIGNED_TOPIC,
+    PENDING_MULTISIG_OP_CREATED_TOPIC, PENDING_MULTISIG_OP_EXECUTED_TOPIC,
+    PENDING_MULTISIG_OP_EXPIRED_TOPIC, PING_EXPIRY_TOPIC, POOL_CREATED_TOPIC,
+    PROOF_OF_LIFE_TOPIC, RECOVERY_EXTEND_TOPIC, RELEASE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
     RELEASE_VOTE_TOPIC, REMOVE_PASSKEY_TOPIC, RESTORE_VAULT_TOPIC, RESUME_VAULT_TOPIC,
     REVERSAL_GRACE_EXPIRED_TOPIC, REVOKE_DELEGATE_TOPIC, ROTATE_PASSKEY_TOPIC,
     SET_BENEFICIARIES_TOPIC, SET_DECAY_RATE_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MAX_TTL_TOPIC,
@@ -119,6 +120,9 @@ mod vault_archiving_tests;
 #[cfg(test)]
 mod beneficiary_owner_check_tests;
 
+#[cfg(test)]
+mod multisig_pending_ops_tests;
+
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
 pub const VAULT_TTL_THRESHOLD: u32 = 1000;
@@ -173,6 +177,9 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
 /// Minimum check-in interval: 1 hour (3600 seconds)
 /// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
 pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
+
+/// Multi-sig pending operation timeout: 15 minutes (900 seconds) - Issue #1117
+pub const PENDING_MULTISIG_OP_EXPIRY: u64 = 900;
 
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -11758,6 +11765,367 @@ impl TtlVaultContract {
             .persistent()
             .get::<DataKey, Vec<u64>>(&DataKey::OpenProposals(vault_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #1117: Pending Multi-Signature Operations ─────────────────────
+
+    /// Creates a pending multi-sig operation requiring cosignatures from registered passkeys.
+    /// 
+    /// On first call, initializes a pending operation with the owner's signature and
+    /// awaits co-signatures from other registered passkeys. The operation expires after
+    /// 15 minutes if not executed.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `operation` - The operation type (Withdraw, UpdateBeneficiary, CancelVault, etc.)
+    /// * `payload` - Serialized operation data (amount for Withdraw, address for UpdateBeneficiary)
+    /// * `address_payload` - Optional address for UpdateBeneficiary or TransferOwnership
+    ///
+    /// # Returns
+    /// The nonce of the created pending operation
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    pub fn create_pending_multisig_op(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        operation: MultiSigOperation,
+        payload: Bytes,
+        address_payload: Option<Address>,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        // Check if multi-sig is configured for this operation
+        let is_required = vault.multisig_required_ops.iter().any(|op| op == operation);
+        if !is_required {
+            // Operation doesn't require multi-sig, execute directly
+            return Err(ContractError::InvalidAmount); // Should use a better error
+        }
+
+        // Get nonce counter
+        let nonce_key = DataKey::PendingMultiSigOpNonce(vault_id);
+        let nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0u64) + 1;
+
+        // Get multi-sig config to determine threshold
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        let now = env.ledger().timestamp();
+        let mut signers = Vec::new(&env);
+        signers.push_back(caller.clone()); // Owner auto-signs
+
+        let pending_op = PendingMultiSigOp {
+            nonce,
+            vault_id,
+            operation: operation.clone(),
+            signers,
+            payload,
+            address_payload,
+            created_at: now,
+            expires_at: now + PENDING_MULTISIG_OP_EXPIRY,
+            threshold: config.threshold,
+        };
+
+        let op_key = DataKey::PendingMultiSigOp(vault_id, nonce);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&op_key, &pending_op);
+        env.storage()
+            .persistent()
+            .extend_ttl(&op_key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Update nonce counter
+        env.storage().persistent().set(&nonce_key, &nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (PENDING_MULTISIG_OP_CREATED_TOPIC, vault_id),
+            (nonce, operation, now + PENDING_MULTISIG_OP_EXPIRY),
+        );
+        Ok(nonce)
+    }
+
+    /// Adds a co-signature to a pending multi-sig operation from a registered passkey.
+    ///
+    /// Validates that the caller is a registered signer (or the owner) and has not already
+    /// signed this operation. When threshold signatures are reached, the operation is ready
+    /// for execution.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `op_nonce` - The operation nonce
+    /// * `caller` - The passkey address cosigning (must be registered)
+    /// * `payload` - Must match the original payload (for replay protection)
+    ///
+    /// # Errors
+    /// * `ContractError::ProposalNotFound` - If operation doesn't exist or has expired
+    /// * `ContractError::NotASigner` - If caller is not a registered signer
+    /// * `ContractError::InvalidAmount` - If caller has already signed or payload mismatch
+    pub fn cosign_pending_multisig_op(
+        env: Env,
+        vault_id: u64,
+        op_nonce: u64,
+        caller: Address,
+        payload: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Check if caller is authorized (owner or registered signer)
+        let is_owner = caller == vault.owner;
+        let is_signer = config.signers.iter().any(|s| s == caller);
+        if !is_owner && !is_signer {
+            return Err(ContractError::NotASigner);
+        }
+
+        let op_key = DataKey::PendingMultiSigOp(vault_id, op_nonce);
+        let mut pending_op = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PendingMultiSigOp>(&op_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        // Check expiry
+        let now = env.ledger().timestamp();
+        if now > pending_op.expires_at {
+            env.storage().persistent().remove(&op_key);
+            return Err(ContractError::ProposalExpired);
+        }
+
+        // Verify payload matches
+        if pending_op.payload != payload {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Check for duplicate signature
+        if pending_op.signers.iter().any(|s| s == caller) {
+            return Err(ContractError::AlreadyApproved);
+        }
+
+        // Add signature
+        pending_op.signers.push_back(caller.clone());
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&op_key, &pending_op);
+        env.storage()
+            .persistent()
+            .extend_ttl(&op_key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (PENDING_MULTISIG_OP_COSIGNED_TOPIC, vault_id),
+            (op_nonce, caller, pending_op.signers.len() as u32),
+        );
+        Ok(())
+    }
+
+    /// Executes a pending multi-sig operation once the threshold of signatures is reached.
+    ///
+    /// After collecting enough co-signatures, the operation is executed with the
+    /// accumulated signatures. Supports Withdraw, UpdateBeneficiary, and CancelVault.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `op_nonce` - The operation nonce
+    /// * `caller` - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::ProposalNotFound` - If operation doesn't exist or has expired
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::ProposalNotApproved` - If threshold not yet reached
+    pub fn execute_pending_multisig_op(
+        env: Env,
+        vault_id: u64,
+        op_nonce: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let op_key = DataKey::PendingMultiSigOp(vault_id, op_nonce);
+        let pending_op = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PendingMultiSigOp>(&op_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        // Check expiry
+        let now = env.ledger().timestamp();
+        if now > pending_op.expires_at {
+            env.storage().persistent().remove(&op_key);
+            return Err(ContractError::ProposalExpired);
+        }
+
+        // Check threshold
+        if (pending_op.signers.len() as u32) < pending_op.threshold {
+            return Err(ContractError::ProposalNotApproved);
+        }
+
+        // Execute based on operation type
+        match pending_op.operation {
+            MultiSigOperation::Withdraw => {
+                let amount = Self::decode_i128(&pending_op.payload)?;
+                Self::execute_multisig_withdraw(&env, vault_id, &caller, amount)?;
+            }
+            MultiSigOperation::UpdateBeneficiary => {
+                let new_beneficiary = pending_op
+                    .address_payload
+                    .clone()
+                    .ok_or(ContractError::InvalidBeneficiary)?;
+                Self::execute_multisig_update_beneficiary(&env, vault_id, new_beneficiary)?;
+            }
+            MultiSigOperation::CancelVault => {
+                Self::execute_multisig_cancel_vault(&env, vault_id, &caller)?;
+            }
+            _ => {
+                return Err(ContractError::InvalidAmount); // Unsupported operation for pending
+            }
+        }
+
+        // Clean up
+        env.storage().persistent().remove(&op_key);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (PENDING_MULTISIG_OP_EXECUTED_TOPIC, vault_id),
+            (op_nonce, pending_op.operation),
+        );
+        Ok(())
+    }
+
+    /// Gets a pending multi-sig operation by nonce.
+    pub fn get_pending_multisig_op(
+        env: Env,
+        vault_id: u64,
+        op_nonce: u64,
+    ) -> Option<PendingMultiSigOp> {
+        let op_key = DataKey::PendingMultiSigOp(vault_id, op_nonce);
+        env.storage().persistent().get(&op_key)
+    }
+
+    // ── Pending Multi-Sig Operation Execution Helpers ────────────────────────
+
+    fn execute_multisig_withdraw(
+        env: &Env,
+        vault_id: u64,
+        caller: &Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut vault = Self::load_vault(env, vault_id);
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+        vault.balance -= amount;
+        Self::save_vault(env, vault_id, &vault);
+
+        let token_client = token::Client::new(env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), caller, &amount);
+
+        Self::record_withdrawal_audit(env, vault_id, caller, amount, true, "multisig_withdraw");
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    fn execute_multisig_update_beneficiary(
+        env: &Env,
+        vault_id: u64,
+        new_beneficiary: Address,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(env, vault_id);
+        if new_beneficiary == vault.owner {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        Self::assert_not_zero_address(env, &new_beneficiary);
+
+        let old_beneficiary = vault.beneficiary.clone();
+        vault.beneficiary = new_beneficiary.clone();
+        Self::save_vault(env, vault_id, &vault);
+
+        Self::remove_beneficiary_vault_id(env, &old_beneficiary, vault_id, vault.check_in_interval);
+        Self::add_beneficiary_vault_id(env, &new_beneficiary, vault_id, vault.check_in_interval);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((BENEFICIARY_UPDATED_TOPIC, vault_id), new_beneficiary);
+        Ok(())
+    }
+
+    fn execute_multisig_cancel_vault(
+        env: &Env,
+        vault_id: u64,
+        caller: &Address,
+    ) -> Result<(), ContractError> {
+        let mut vault = Self::load_vault(env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let refund_amount = vault.balance;
+        if refund_amount > 0 {
+            let token_client = token::Client::new(env, &vault.token_address);
+            token_client.transfer(&env.current_contract_address(), &vault.owner, &refund_amount);
+        }
+
+        vault.balance = 0;
+        vault.status = ReleaseStatus::Cancelled;
+        Self::save_vault(env, vault_id, &vault);
+        Self::remove_owner_vault_id(env, &vault.owner, vault_id, vault.check_in_interval);
+        Self::remove_beneficiary_vault_id(
+            env,
+            &vault.beneficiary,
+            vault_id,
+            vault.check_in_interval,
+        );
+
+        Self::record_state_transition(
+            env,
+            vault_id,
+            ReleaseStatus::Locked,
+            ReleaseStatus::Cancelled,
+            caller,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((CANCEL_TOPIC, vault_id), (&vault.owner, refund_amount));
+        Ok(())
     }
 
     // ── Multi-sig payload helpers ────────────────────────────────────────────
