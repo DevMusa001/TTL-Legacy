@@ -5739,20 +5739,46 @@ fn test_hibernation_emits_entered_event() {
 #[test]
 fn test_hibernation_emits_exited_event() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
 
     client.enter_hibernation(&id, &owner, &7200u64).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 500);
+    let elapsed = 500u64;
+    env.ledger().with_mut(|l| l.timestamp += elapsed);
     client.exit_hibernation(&id, &owner).unwrap();
 
     let events = env.events().all();
-    let found = events.iter().any(|e| {
+    let mut found_event = false;
+    let mut verified_data = false;
+    
+    for e in events.iter() {
         let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
-        if topics.is_empty() { return false; }
+        if topics.is_empty() { continue; }
         let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false)
-    });
-    assert!(found, "hibernation_exited event not emitted");
+        
+        if first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false) {
+            found_event = true;
+            
+            // Verify event data: (exited_at, new_ttl_remaining)
+            let data: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+            if data.len() >= 2 {
+                if let (Ok(exited_at), Ok(ttl_remaining)) = (
+                    data.get(0).unwrap().try_into_val::<u64>(&env),
+                    data.get(1).unwrap().try_into_val::<u64>(&env),
+                ) {
+                    // exited_at should be approximately now (after the elapsed time)
+                    // ttl_remaining should be approximately interval - elapsed = 3600 - 500 = 3100
+                    let expected_ttl = interval.saturating_sub(elapsed);
+                    if ttl_remaining == expected_ttl {
+                        verified_data = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    assert!(found_event, "hibernation_exited event not emitted");
+    assert!(verified_data, "hibernation_exited event data incorrect");
 }
 
 #[test]

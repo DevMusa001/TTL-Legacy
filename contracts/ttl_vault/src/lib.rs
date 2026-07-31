@@ -13282,11 +13282,20 @@ impl TtlVaultContract {
         vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
         env.storage().persistent().remove(&hib_key);
         Self::save_vault(&env, vault_id, &vault);
+        
+        // Calculate the new TTL remaining after exiting hibernation
+        let deadline = vault.last_check_in + vault.check_in_interval;
+        let new_ttl_remaining = if now >= deadline {
+            0u64
+        } else {
+            deadline - now
+        };
+        
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
-            .publish((HIBERNATION_EXITED_TOPIC, vault_id), (caller, now, elapsed));
+            .publish((HIBERNATION_EXITED_TOPIC, vault_id), (now, new_ttl_remaining));
         Ok(())
     }
 
