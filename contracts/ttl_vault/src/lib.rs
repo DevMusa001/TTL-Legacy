@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Bytes,
+    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, AddressPayload, Bytes,
     BytesN, Env, String, Vec,
 };
 
@@ -1288,6 +1288,11 @@ impl TtlVaultContract {
 
         if owner == beneficiary {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
+        }
+
+        // Validate beneficiary is a regular account, not a contract
+        if let Err(e) = Self::assert_beneficiary_is_account(&env, &beneficiary) {
+            panic_with_error!(&env, e);
         }
 
         // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
@@ -6699,6 +6704,9 @@ impl TtlVaultContract {
         }
         Self::assert_not_zero_address(&env, &new_beneficiary);
 
+        // Validate new beneficiary is a regular account, not a contract
+        Self::assert_beneficiary_is_account(&env, &new_beneficiary)?;
+
         let now = env.ledger().timestamp();
         // Timelock: 24 hours
         let timelock: u64 = 86_400;
@@ -8824,6 +8832,32 @@ impl TtlVaultContract {
         let zero = Address::from_contract_id(&env, &BytesN::zero(&env));
         if address == &zero {
             panic_with_error!(env, ContractError::InvalidBeneficiary);
+        }
+    }
+
+    fn assert_beneficiary_is_account(env: &Env, address: &Address) -> Result<(), ContractError> {
+        // Check if the address is a contract by attempting to get its executable type.
+        // If executable_type() returns Some with a contract variant, reject it.
+        // Accounts and contract accounts will have executable types, but we specifically
+        // want to reject contract addresses (not Account type).
+        match address.to_payload() {
+            Ok(payload) => {
+                use soroban_sdk::AddressPayload;
+                match payload {
+                    AddressPayload::AccountIdPublicKeyEd25519(_) => {
+                        // This is a regular account - allowed
+                        Ok(())
+                    }
+                    AddressPayload::ContractIdHash(_) => {
+                        // This is a contract - rejected
+                        Err(ContractError::BeneficiaryMustBeAccount)
+                    }
+                }
+            }
+            Err(_) => {
+                // If we can't determine the payload, reject it as a safety measure
+                Err(ContractError::BeneficiaryMustBeAccount)
+            }
         }
     }
 
