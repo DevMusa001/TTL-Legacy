@@ -36,7 +36,8 @@ use types::{
     DISPUTE_RESOLVED_TOPIC, DUPLICATE_VAULT_TOPIC, EXPIRY_WARNING_THRESHOLD,
     HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC, INACTIVITY_PENALTY_TOPIC,
     INHERITANCE_TOPIC, INTEGRITY_TOPIC, MAX_CUSTOM_METADATA_LEN, MAX_DESCRIPTION_LEN,
-    MAX_METADATA_LEN, MAX_NAME_LEN, MAX_NOTES_LEN, META_REVERT_TOPIC, META_VERSION_TOPIC,
+    MAX_METADATA_LEN, MAX_NAME_LEN, MAX_NOTES_LEN, MAX_RELEASE_MEMO_LEN, META_REVERT_TOPIC,
+    META_VERSION_TOPIC,
     MIN_THRESHOLD_REDISTRIBUTE_TOPIC, MIN_THRESHOLD_SET_TOPIC, MIN_THRESHOLD_SKIP_TOPIC,
     MULTISIG_APPROVED_TOPIC, MULTISIG_CONFIG_TOPIC, MULTISIG_EXECUTED_TOPIC,
     MULTISIG_PROPOSAL_EXPIRY, MULTISIG_PROPOSED_TOPIC, MULTISIG_REJECTED_TOPIC,
@@ -87,6 +88,8 @@ mod bps_invariant_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod release_memo_tests;
 #[cfg(test)]
 mod beneficiary_waitlist_tests;
 #[cfg(test)]
@@ -2778,6 +2781,13 @@ impl TtlVaultContract {
         );
     }
 
+    fn load_release_memo(env: &Env, vault_id: u64) -> Bytes {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReleaseMemo(vault_id))
+            .unwrap_or_else(|| Bytes::new(env))
+    }
+
     fn trigger_release_internal(env: Env, vault_id: u64, mode: ReleaseTrigger) {
         Self::assert_not_paused(&env);
         // Attempt to restore archived vault state before proceeding - Issue #443
@@ -3030,6 +3040,7 @@ impl TtlVaultContract {
         }
 
         Self::mark_release_attempted(&env, vault_id);
+        let release_memo = Self::load_release_memo(&env, vault_id);
 
         if has_release_schedule {
             // Issue #951: graduated release schedule — activate it and keep funds in contract.
@@ -3089,6 +3100,7 @@ impl TtlVaultContract {
                     vault_id,
                     beneficiary: vault.beneficiary.clone(),
                     amount: 0,
+                    memo: release_memo.clone(),
                 },
             );
         } else {
@@ -3120,6 +3132,7 @@ impl TtlVaultContract {
                         vault_id,
                         beneficiary: vault.beneficiary.clone(),
                         amount: release_amount,
+                        memo: release_memo.clone(),
                     },
                 );
             } else {
@@ -7519,6 +7532,44 @@ impl TtlVaultContract {
         env.events()
             .publish((SET_METADATA_TOPIC, vault_id), metadata);
         Ok(())
+    }
+
+    /// Sets (or updates) the owner-supplied release memo for a vault.
+    /// The memo is included in the `RELEASE_TOPIC` event emitted when the
+    /// vault's funds are released. Owner-only; up to `MAX_RELEASE_MEMO_LEN`
+    /// bytes. Passing an empty `Bytes` clears the memo.
+    pub fn set_release_memo(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        memo: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if memo.len() > MAX_RELEASE_MEMO_LEN {
+            return Err(ContractError::InvalidAmount);
+        }
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let key = DataKey::ReleaseMemo(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &memo);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Returns the owner-supplied release memo for a vault, if any.
+    pub fn get_release_memo(env: Env, vault_id: u64) -> Bytes {
+        Self::load_release_memo(&env, vault_id)
     }
 
     /// Returns the custom metadata history (bytes + timestamp) for a vault.
@@ -14015,6 +14066,7 @@ impl TtlVaultContract {
         mode: ReleaseTrigger,
     ) {
         let token_client = token::Client::new(env, &vault.token_address);
+        let release_memo = Self::load_release_memo(env, vault_id);
 
         let triggers_map: Vec<(Address, Vec<ReleaseTrigger>)> = env
             .storage()
@@ -14120,6 +14172,7 @@ impl TtlVaultContract {
                     vault_id,
                     beneficiary: vault.owner.clone(),
                     amount: release_amount,
+                    memo: release_memo.clone(),
                 },
             );
             return;
@@ -14151,6 +14204,7 @@ impl TtlVaultContract {
                         vault_id,
                         beneficiary: entry.address.clone(),
                         amount: share,
+                        memo: release_memo.clone(),
                     },
                 );
             }

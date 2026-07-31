@@ -352,6 +352,8 @@ pub const MAX_NOTES_LEN: u32 = 1024;
 
 /// Maximum length for custom metadata bytes (2KB) - Issue #378
 pub const MAX_CUSTOM_METADATA_LEN: u32 = 2048;
+/// Maximum length, in bytes, of a vault's release memo (Issue #791).
+pub const MAX_RELEASE_MEMO_LEN: u32 = 256;
 
 #[contracttype(export = false)]
 #[derive(Clone)]
@@ -416,6 +418,8 @@ pub enum DataKey {
     CheckInEntry(u64, u32),
     // Issue #873: ring buffer head pointer for check-in history
     CheckInHistoryHead(u64),
+    // Issue #791: owner-supplied release memo, emitted with the release event
+    ReleaseMemo(u64),
     // Issue #873: number of check-in history entries
     CheckInHistoryLen(u64),
     /// Stores the most recently computed adaptive interval suggestion (seconds) - Issue #2
@@ -647,6 +651,7 @@ pub struct ReleaseEvent {
     pub vault_id: u64,
     pub beneficiary: Address,
     pub amount: i128,
+    pub memo: Bytes,
 }
 
 /// A single beneficiary entry: (address, basis_points, minimum_threshold).
