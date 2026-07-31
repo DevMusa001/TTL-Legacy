@@ -491,10 +491,15 @@ pub enum DataKey {
     /// Per-vault admin freeze flag. When `true`, deposit/withdraw/check_in/trigger_release
     /// are all rejected with `ContractError::VaultFrozen`.
     VaultFrozen(u64),
-    /// Pending multi-sig operation - Issue #1117
-    PendingMultiSigOp(u64, u64),  // (vault_id, nonce)
-    /// Counter for pending multi-sig operation nonces - Issue #1117
-    PendingMultiSigOpNonce(u64),
+    // Issue #1117: pending multi-sig operations with nonce
+    PendingMultiSigOp(u64, u64), // (vault_id, nonce)
+    PendingMultiSigOpNonce(u64), // counter per vault
+    // Issue #1120: timelock-gated contract upgrade
+    PendingUpgrade,
+    // Issue #1118: admin-controlled token allowlist
+    AllowedTokens,
+    // Issue #951: graduated release schedule per vault
+    ReleaseSchedule(u64),
 }
 
 
@@ -1710,3 +1715,41 @@ pub const BACKUP_CODES_ENCRYPTED_TOPIC: Symbol = symbol_short!("bkp_enc");
 pub const BACKUP_CODE_USED_TOPIC: Symbol = symbol_short!("bkp_used");
 pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
 pub const ADD_PASSKEY_TOPIC: Symbol = symbol_short!("add_pk");
+
+// ============================================================
+// Issue #951: Graduated Release Schedule
+// ============================================================
+
+/// A single tranche in a graduated release schedule.
+/// The beneficiary can claim this tranche once `release_timestamp` has passed.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseTranche {
+    /// Amount (in stroops) allocated to this tranche.
+    pub amount: i128,
+    /// Unix timestamp after which this tranche can be claimed.
+    pub release_timestamp: u64,
+    /// Whether this tranche has already been claimed.
+    pub claimed: bool,
+}
+
+/// A graduated release schedule attached to a vault.
+/// On `trigger_release`, tranches are not distributed immediately; instead,
+/// the beneficiary calls `claim_tranche` as each tranche unlocks.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseSchedule {
+    /// Ordered list of tranches. Amounts must sum to the vault balance at
+    /// the time `set_release_schedule` is called.
+    pub tranches: Vec<ReleaseTranche>,
+    /// Total amount escrowed across all tranches.
+    pub total_amount: i128,
+    /// Amount already claimed by the beneficiary.
+    pub claimed_amount: i128,
+    /// Whether the schedule has been activated (i.e., `trigger_release` fired).
+    pub active: bool,
+}
+
+// Issue #951: topic constants for release schedule events
+pub const SET_RELEASE_SCHEDULE_TOPIC: Symbol = symbol_short!("rl_sched");
+pub const TRANCHE_CLAIMED_TOPIC: Symbol = symbol_short!("tr_claim");

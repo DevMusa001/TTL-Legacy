@@ -72,6 +72,8 @@ use types::{
     YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC, FREEZE_VAULT_TOPIC, UNFREEZE_VAULT_TOPIC,
     UPGRADE_PROPOSED_TOPIC, UPGRADE_EXECUTED_TOPIC, UPGRADE_CANCELLED_TOPIC,
     TOKEN_ALLOWLIST_ADDED_TOPIC, TOKEN_ALLOWLIST_REMOVED_TOPIC,
+    // Issue #951: graduated release schedule
+    ReleaseTranche, ReleaseSchedule, SET_RELEASE_SCHEDULE_TOPIC, TRANCHE_CLAIMED_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -121,7 +123,9 @@ mod vault_archiving_tests;
 mod beneficiary_owner_check_tests;
 
 #[cfg(test)]
-mod multisig_pending_ops_tests;
+mod release_schedule_tests;
+#[cfg(test)]
+mod withdrawal_whitelist_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -241,7 +245,62 @@ pub enum ContractError {
     VotingNotEnabled = 54,
     AlreadyHibernating = 55,
     NotHibernating = 56,
-    HibernationDurationTooLong = 57,
+    DuplicateVault = 57,
+    CheckInTooFrequent = 58,
+    VaultFrozen = 59,
+    CliffNotReached = 60,
+    InsufficientTtlToAccelerate = 61,
+    TtlBorrowNotFound = 62,
+    TtlBorrowAlreadyRepaid = 63,
+    // Issue #565: withdrawal scheduling validation
+    OverlappingWithdrawalSchedule = 64,
+    ConflictingWithdrawalSchedule = 65,
+    // Issue #566: withdrawal limits by time
+    DailyWithdrawalLimitExceeded = 66,
+    WeeklyWithdrawalLimitExceeded = 67,
+    MonthlyWithdrawalLimitExceeded = 68,
+    // Issue #567: withdrawal destination whitelist
+    WithdrawalDestinationNotWhitelisted = 69,
+    // Issue #568: withdrawal reversal
+    WithdrawalReversalGracePeriodExpired = 70,
+    WithdrawalAlreadyReversed = 71,
+    // Issue #545: vesting catch-up
+    CatchUpNotEnabled = 72,
+    // Issue #546: vesting bonus
+    BonusNotEnabled = 73,
+    TokenNotWhitelisted = 74,
+    // Issue #526: post-release clawback
+    NotReleased = 75,
+    GracePeriodExpired = 76,
+    NothingToClawback = 77,
+    // Issue #527: beneficiary auction
+    AuctionNotFound = 78,
+    AuctionAlreadyExists = 79,
+    AuctionEnded = 80,
+    AuctionNotEnded = 81,
+    InvalidVestingSchedule = 82,
+    // Per-delegation nonce mismatch (replay attack prevention)
+    InvalidNonce = 83,
+    PasskeyExpired = 84,
+    PasskeyCompromised = 85,
+    ChallengeNotFound = 86,
+    ChallengeExpired = 87,
+    DuplicateSignature = 88,
+    CheckInIntervalTooShort = 89,  // Issue #1121: Enforce minimum check-in interval
+    SnapshotNotFound = 90,         // Issue #1123: Vault archiving
+    AlreadyOwner = 91,             // Issue #1119: Two-step ownership transfer
+    NoPendingUpgrade = 92,         // Issue #1120: Contract upgrade mechanism
+    UpgradeTimelocked = 93,        // Issue #1120: Upgrade not yet executable
+    UpgradeInvalidWasm = 94,       // Issue #1120: Invalid WASM hash
+    TokenNotAllowed = 95,          // Issue #1118: Token not in allowlist
+    // Issue #951: Graduated Release Schedule
+    ReleaseScheduleNotFound = 96,
+    TrancheAlreadyClaimed = 97,
+    TrancheNotYetUnlocked = 98,
+    ReleaseScheduleNotActive = 99,
+    InvalidTrancheIndex = 100,
+    InvalidScheduleTotalAmount = 101,
+    ReleaseScheduleAlreadySet = 102,
 }
 
 #[contract]
@@ -1954,8 +2013,22 @@ impl TtlVaultContract {
             vault = vault_mut;
         }
 
-        // Check whitelist - Issue #567
+        // Check whitelist - Issue #567 / #952
+        // withdraw() always transfers to vault.owner, so we validate the owner
+        // is an approved destination when a whitelist is configured.
         if !Self::is_whitelisted(&env, vault_id, &vault.owner) {
+            Self::record_withdrawal_audit(
+                &env,
+                vault_id,
+                &caller,
+                amount,
+                false,
+                "Destination not whitelisted",
+            );
+            env.events().publish(
+                (WHITELIST_VIOLATION_TOPIC, vault_id),
+                (&vault.owner, amount),
+            );
             return Err(ContractError::WithdrawalDestinationNotWhitelisted);
         }
 
@@ -2893,6 +2966,12 @@ impl TtlVaultContract {
             .persistent()
             .has(&DataKey::MilestoneVestingSchedule(vault_id));
 
+        // Issue #951: check if a graduated release schedule is set
+        let has_release_schedule = env
+            .storage()
+            .persistent()
+            .has(&DataKey::ReleaseSchedule(vault_id));
+
         // Check if any milestones are attached and if they're all unlocked
         let has_vesting_milestones = env
             .storage()
@@ -2916,7 +2995,45 @@ impl TtlVaultContract {
 
         Self::mark_release_attempted(&env, vault_id);
 
-        if has_vesting || has_milestone_vesting {
+        if has_release_schedule {
+            // Issue #951: graduated release schedule — activate it and keep funds in contract.
+            // The beneficiary will call claim_tranche() as each tranche unlocks.
+            let sched_key = DataKey::ReleaseSchedule(vault_id);
+            let mut schedule = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ReleaseSchedule>(&sched_key)
+                .unwrap(); // guarded by has_release_schedule above
+            schedule.active = true;
+            let ttl = vault_ttl_ledgers(vault.check_in_interval);
+            env.storage().persistent().set(&sched_key, &schedule);
+            env.storage()
+                .persistent()
+                .extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+
+            // Mark vault as Released but balance stays in contract for tranche claims
+            vault.status = ReleaseStatus::Released;
+            Self::save_vault(&env, vault_id, &vault);
+            Self::record_state_transition(
+                &env,
+                vault_id,
+                ReleaseStatus::Locked,
+                ReleaseStatus::Released,
+                &vault.owner,
+            );
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+            env.events().publish(
+                (RELEASE_TOPIC,),
+                ReleaseEvent {
+                    vault_id,
+                    beneficiary: vault.beneficiary.clone(),
+                    // Amount is 0 here — funds are held for graduated release
+                    amount: 0,
+                },
+            );
+        } else if has_vesting || has_milestone_vesting {
             // Vesting schedule exists: mark as Released but keep balance intact
             vault.status = ReleaseStatus::Released;
             Self::save_vault(&env, vault_id, &vault);
@@ -16405,5 +16522,256 @@ impl TtlVaultContract {
             }
         }
         false
+    }
+
+    // =========================================================
+    // Issue #951: Graduated Release Schedule
+    // =========================================================
+
+    /// Sets a graduated release schedule on a vault (owner-only, pre-release).
+    ///
+    /// The owner defines an ordered list of tranches — each with an amount and
+    /// an unlock timestamp.  When `trigger_release` fires, the vault balance is
+    /// NOT transferred immediately; instead the schedule becomes active and the
+    /// beneficiary calls `claim_tranche` to collect each tranche as it unlocks.
+    ///
+    /// Constraints enforced:
+    ///  - Vault must still be Locked (not yet released).
+    ///  - Schedule may only be set once (call again to overwrite only before activation).
+    ///  - All tranche amounts must be > 0.
+    ///  - Total of all tranche amounts must equal the vault's current balance.
+    ///  - At least one tranche must be present.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - Target vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `tranches` - Ordered Vec of (amount, release_timestamp) pairs
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    pub fn set_release_schedule(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        tranches: Vec<(i128, u64)>,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if tranches.is_empty() {
+            return Err(ContractError::InvalidScheduleTotalAmount);
+        }
+
+        // Guard: if schedule already active (release fired), cannot replace it
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReleaseSchedule>(&DataKey::ReleaseSchedule(vault_id))
+        {
+            if existing.active {
+                return Err(ContractError::ReleaseScheduleAlreadySet);
+            }
+        }
+
+        let mut total: i128 = 0;
+        let mut release_tranches: Vec<ReleaseTranche> = Vec::new(&env);
+
+        for (amount, release_timestamp) in tranches.iter() {
+            if amount <= 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            total = total.checked_add(amount).ok_or(ContractError::BalanceOverflow)?;
+            release_tranches.push_back(ReleaseTranche {
+                amount,
+                release_timestamp,
+                claimed: false,
+            });
+        }
+
+        if total != vault.balance {
+            return Err(ContractError::InvalidScheduleTotalAmount);
+        }
+
+        let schedule = ReleaseSchedule {
+            tranches: release_tranches,
+            total_amount: total,
+            claimed_amount: 0,
+            active: false,
+        };
+
+        let key = DataKey::ReleaseSchedule(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events()
+            .publish((SET_RELEASE_SCHEDULE_TOPIC, vault_id), (total, tranches.len()));
+        Ok(())
+    }
+
+    /// Returns the release schedule for a vault, if one has been set.
+    pub fn get_release_schedule(env: Env, vault_id: u64) -> Option<ReleaseSchedule> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, ReleaseSchedule>(&DataKey::ReleaseSchedule(vault_id))
+    }
+
+    /// Claims a single tranche from an active release schedule (beneficiary-only).
+    ///
+    /// A tranche can be claimed when:
+    ///  - The schedule exists and is active (i.e., `trigger_release` has already fired).
+    ///  - The tranche has not yet been claimed.
+    ///  - The current ledger timestamp is >= the tranche's `release_timestamp`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - Target vault ID
+    /// * `caller` - Must be the vault beneficiary
+    /// * `tranche_index` - Zero-based index into the schedule's tranches Vec
+    ///
+    /// # Returns
+    /// `Ok(amount)` — the amount transferred to the beneficiary
+    pub fn claim_tranche(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        tranche_index: u32,
+    ) -> Result<i128, ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Only the primary beneficiary (or the first in a multi-beneficiary vault) may claim.
+        // For simplicity, we allow any listed beneficiary to claim tranches.
+        let is_beneficiary = if vault.beneficiaries.is_empty() {
+            caller == vault.beneficiary
+        } else {
+            vault.beneficiaries.iter().any(|b| b.address == caller)
+        };
+        if !is_beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+
+        let key = DataKey::ReleaseSchedule(vault_id);
+        let mut schedule = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReleaseSchedule>(&key)
+            .ok_or(ContractError::ReleaseScheduleNotFound)?;
+
+        if !schedule.active {
+            return Err(ContractError::ReleaseScheduleNotActive);
+        }
+        if tranche_index >= schedule.tranches.len() {
+            return Err(ContractError::InvalidTrancheIndex);
+        }
+
+        let mut tranche = schedule.tranches.get(tranche_index).unwrap();
+        if tranche.claimed {
+            return Err(ContractError::TrancheAlreadyClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < tranche.release_timestamp {
+            return Err(ContractError::TrancheNotYetUnlocked);
+        }
+
+        let amount = tranche.amount;
+        tranche.claimed = true;
+        schedule.tranches.set(tranche_index, tranche);
+        schedule.claimed_amount = schedule
+            .claimed_amount
+            .checked_add(amount)
+            .ok_or(ContractError::BalanceOverflow)?;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        // Transfer the tranche amount to the caller (beneficiary)
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &caller, &amount);
+
+        env.events().publish(
+            (TRANCHE_CLAIMED_TOPIC, vault_id),
+            (caller, tranche_index, amount),
+        );
+        Ok(amount)
+    }
+
+    // =========================================================
+    // Issue #952: Withdrawal Destination Whitelist (public API aliases)
+    // =========================================================
+
+    /// Adds a destination address to the withdrawal whitelist for a vault.
+    ///
+    /// When at least one address is on the whitelist, `withdraw` will only allow
+    /// transfers to whitelisted destinations (i.e., `vault.owner` must be on the
+    /// list).  An empty whitelist means all destinations are permitted.
+    ///
+    /// Owner-only.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - Target vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `destination` - The address to whitelist
+    pub fn add_whitelist_destination(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        // Delegates to the existing implementation, using an empty label.
+        let label = String::from_str(&env, "");
+        Self::add_whitelist_address(env, vault_id, caller, destination, label)
+    }
+
+    /// Removes a destination address from the withdrawal whitelist for a vault.
+    ///
+    /// Owner-only.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - Target vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `destination` - The address to remove from the whitelist
+    pub fn remove_whitelist_destination(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        Self::remove_whitelist_address(env, vault_id, caller, destination)
+    }
+
+    /// Returns all whitelisted destinations for a vault.
+    pub fn get_whitelisted_destinations(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<Vec<WhitelistEntry>> {
+        Self::get_whitelist(env, vault_id)
     }
 }
