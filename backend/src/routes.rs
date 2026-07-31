@@ -15,9 +15,19 @@ use crate::{
     audit,
     db::Db,
     error::AppError,
-    handlers::{parse_scenario_types, simulate_release_handler, export_vaults_handler},
-    models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
-    AppState,
+    handlers::{
+        claim_vesting_bonus_handler,
+        get_vesting_bonus_handler,
+        parse_scenario_types,
+        simulate_release_handler,
+    },
+    models::{
+        ClaimBonusRequest,
+        ReminderPreferences,
+        SetPreferencesRequest,
+        SimulateReleaseQuery,
+        SimulateReleaseResponse,
+    },
 };
 
 #[derive(Deserialize)]
@@ -198,81 +208,28 @@ pub async fn get_sponsored_releases(
     Ok(Json(result))
 }
 
-// ── Audit Log Export (#1128) ──────────────────────────────────────────────────
+// --- Issue #1143: Vesting Bonus endpoints ---
 
-#[derive(Deserialize)]
-pub struct ExportQuery {
-    pub format: String,
-    pub from: Option<String>,
-    pub to: Option<String>,
-}
-
-/// GET /api/vaults/:vault_id/export?format=csv|json&from=&to=
-#[instrument(skip(state, headers), fields(vault_id = %vault_id))]
-pub async fn export_vault(
-    State(state): State<Arc<AppState>>,
+/// POST /api/vaults/:vault_id/vesting/claim-bonus
+/// Claim vesting bonus on behalf of the beneficiary.
+pub async fn claim_vesting_bonus(
+    State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
-    Query(query): Query<ExportQuery>,
     headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let user_id = headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let format = match query.format.as_str() {
-        "csv" | "json" => query.format,
-        _ => {
-            return Err(AppError::InvalidInput(
-                "format must be csv or json".into(),
-            ))
-        }
-    };
-
-    let from = query
-        .from
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
-    let to = query
-        .to
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
-
-    let result = export_vaults_handler(
-        &state.db.vault_store,
-        &state.db.event_store,
-        &state.db.audit_store,
-        &vault_id,
-        &format,
-        from,
-        to,
-        if user_id.is_empty() { None } else { Some(user_id) },
-    )
-    .map_err(|e| AppError::InvalidInput(e))?;
-
-    let content_type = if format == "csv" {
-        "text/csv"
-    } else {
-        "application/json"
-    };
-
-    Ok(Response::builder()
-        .header("Content-Type", content_type)
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", format!("vault-{}.{}", vault_id, format)))
-        .body(Body::from(result))
-        .unwrap())
+    Json(req): Json<ClaimBonusRequest>,
+) -> Result<(StatusCode, Json<crate::models::ClaimBonusResponse>), AppError> {
+    let result = claim_vesting_bonus_handler(Arc::clone(&db), headers, &vault_id, req)
+        .map_err(|e| AppError::InvalidInput(e))?;
+    Ok((StatusCode::OK, Json(result)))
 }
 
-// ── Rate Limited Stub Endpoints (#1127) ──────────────────────────────────────
-
-pub async fn stub_checkin() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"error": "not_implemented", "message": "checkin endpoint not yet available"}))
-}
-
-pub async fn stub_release() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"error": "not_implemented", "message": "release endpoint not yet available"}))
-}
-
-pub async fn stub_email_token() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"error": "not_implemented", "message": "email-token endpoint not yet available"}))
+/// GET /api/vaults/:vault_id/vesting/bonus
+/// Return current vesting bonus configuration for the vault.
+pub async fn get_vesting_bonus(
+    State(db): State<Arc<Db>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<crate::models::VestingBonusResponse>, AppError> {
+    let result = get_vesting_bonus_handler(Arc::clone(&db), &vault_id)
+        .map_err(|e| AppError::InvalidInput(e))?;
+    Ok(Json(result))
 }

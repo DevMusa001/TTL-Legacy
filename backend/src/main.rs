@@ -202,20 +202,12 @@ async fn main() {
                 .get(routes::get_sponsored_releases),
         )
         .route(
-            "/api/vaults/:vault_id/export",
-            get(routes::export_vault),
+            "/api/vaults/:vault_id/vesting/claim-bonus",
+            post(routes::claim_vesting_bonus),
         )
         .route(
-            "/api/checkin",
-            post(routes::stub_checkin).layer(middleware::from_fn_with_state(checkin_limiter, rate_limit::rate_limit_middleware)),
-        )
-        .route(
-            "/api/release",
-            post(routes::stub_release).layer(middleware::from_fn_with_state(release_limiter, rate_limit::rate_limit_middleware)),
-        )
-        .route(
-            "/api/email-token",
-            post(routes::stub_email_token).layer(middleware::from_fn_with_state(email_token_limiter, rate_limit::rate_limit_middleware)),
+            "/api/vaults/:vault_id/vesting/bonus",
+            get(routes::get_vesting_bonus),
         )
         .layer(build_cors_layer())
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))

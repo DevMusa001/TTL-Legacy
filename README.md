@@ -193,6 +193,7 @@ The script will display the target network and identity, then require you to typ
 ```rust
 create_vault(beneficiary: Address, check_in_interval: u64) -> u64
 get_vault(vault_id: u64) -> Vault
+get_deposit_total(vault_id: u64) -> Result<i128, ContractError>
 get_ttl_remaining(vault_id: u64) -> Option<u64>
 ```
 

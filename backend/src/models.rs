@@ -680,51 +680,41 @@ pub struct SimulateReleaseResponse {
     pub simulated_at: DateTime<Utc>,
 }
 
-// ── Issue #1099: Vault Health Score ──────────────────────────────────────────
+// --- Issue #1143: Vesting Bonus Backend API ---
 
-/// Per-factor breakdown used in the health score response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthFactors {
-    /// 0-30: how much TTL buffer remains relative to check-in interval (30% weight)
-    pub ttl_buffer: u8,
-    /// 0-20: check-in streak contribution (20% weight)
-    pub streak: u8,
-    /// 0-30: balance relative to a 1000-unit healthy threshold (30% weight)
-    pub balance: u8,
-    /// 0-20: passkey diversity contribution (20% weight)
-    pub passkey_diversity: u8,
-}
-
-/// Response body for `GET /api/vaults/{id}/health`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultHealthResponse {
-    pub score: u8,
-    pub factors: HealthFactors,
-    /// RFC-3339 timestamp when this score was computed.
-    pub computed_at: DateTime<Utc>,
-}
-
-// ── Issue #1100: Bulk Vault Summary ──────────────────────────────────────────
-
-/// Request body for `POST /api/vaults/bulk-summary`.
-#[derive(Debug, Deserialize)]
-pub struct BulkSummaryRequest {
-    pub vault_ids: Vec<String>,
-}
-
-/// A single vault summary entry in the bulk response.
-/// `None` fields indicate the vault was not found.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultSummaryEntry {
+pub struct VestingBonusConfig {
     pub vault_id: String,
-    pub status: Option<VaultStatus>,
-    pub ttl_remaining: Option<u64>,
-    pub balance: Option<i128>,
-    pub last_check_in: Option<DateTime<Utc>>,
+    pub bonus_bps: u32,
+    pub on_time_window_seconds: u64,
 }
 
-/// Response body for `POST /api/vaults/bulk-summary`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BulkSummaryResponse {
-    pub summaries: Vec<VaultSummaryEntry>,
+/// Request body for POST /api/vaults/{id}/vesting/claim-bonus.
+#[derive(Debug, Deserialize)]
+pub struct ClaimBonusRequest {
+    /// Caller must be the beneficiary; this is the Stellar account address.
+    pub beneficiary: String,
+    /// Optional memo for the claim transaction.
+    pub memo: Option<String>,
 }
+
+/// Response body for POST /api/vaults/{id}/vesting/claim-bonus.
+#[derive(Debug, Serialize)]
+pub struct ClaimBonusResponse {
+    pub vault_id: String,
+    pub claimed_amount: i128,
+    pub bonus_amount: i128,
+    pub transaction_hash: String,
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// Response body for GET /api/vaults/{id}/vesting/bonus.
+#[derive(Debug, Serialize)]
+pub struct VestingBonusResponse {
+    pub vault_id: String,
+    pub configured: bool,
+    pub bonus_bps: Option<u32>,
+    pub on_time_window_seconds: Option<u64>,
+}
+
+
