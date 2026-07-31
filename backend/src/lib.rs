@@ -9,6 +9,13 @@ pub mod error;
 pub mod routes;
 pub mod otel;
 pub mod fee_sponsorship;
+pub mod escalation;
+pub mod webhook_retry;
+pub mod cache;
+pub mod consensus;
+pub mod contract_version_check;
+pub mod metrics;
+pub mod two_factor;
 
 pub use models::*;
 pub use handlers::*;

@@ -14,11 +14,11 @@ mod tests {
         let beneficiary = Address::generate(&env);
 
         let contract_id = env.register_contract(None, TtlVaultContract);
-        let client: TtlVaultContractClient<'static> = unsafe { core::mem::transmute(client) };
+        let client = TtlVaultContractClient::new(&env, &contract_id);
 
         // Setup: initialize contract
         let xlm_token = Address::generate(&env);
-        client.initialize(&admin, &xlm_token);
+        client.initialize(&xlm_token, &admin);
 
         (env, owner, beneficiary, client)
     }
@@ -147,5 +147,26 @@ mod tests {
                 interval
             );
         }
+    }
+
+    /// Test that update_check_in_interval also rejects intervals below minimum
+    #[test]
+    fn test_update_check_in_interval_rejects_below_minimum() {
+        let (env, owner, beneficiary, client) = setup();
+        // First create a valid vault
+        let vault_id = client.create_vault(&owner, &beneficiary, &MIN_CHECK_IN_INTERVAL, &None);
+        // Try to update to an interval below minimum
+        let result = client.try_update_check_in_interval(&vault_id, &owner, &(MIN_CHECK_IN_INTERVAL - 1));
+        assert!(result.is_err(), "update_check_in_interval should reject interval below minimum");
+    }
+
+    /// Test that update_check_in_interval accepts intervals at or above minimum
+    #[test]
+    fn test_update_check_in_interval_accepts_valid_interval() {
+        let (env, owner, beneficiary, client) = setup();
+        let vault_id = client.create_vault(&owner, &beneficiary, &MIN_CHECK_IN_INTERVAL, &None);
+        let two_days = 2u64 * 86400u64;
+        let result = client.try_update_check_in_interval(&vault_id, &owner, &two_days);
+        assert!(result.is_ok(), "update_check_in_interval should accept 2-day interval");
     }
 }
