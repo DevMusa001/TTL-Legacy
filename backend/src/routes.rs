@@ -14,6 +14,7 @@ use crate::{
     error::AppError,
     handlers::{parse_scenario_types, simulate_release_handler},
     models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
+    AppState,
 };
 
 #[derive(Deserialize)]
@@ -192,4 +193,88 @@ pub async fn get_sponsored_releases(
         .map_err(|e| AppError::InvalidInput(e))?;
 
     Ok(Json(result))
+}
+
+// ── #1101: Escalation endpoints ──────────────────────────────────────────────
+
+/// GET /api/vaults/:vault_id/escalation-state
+/// Retrieve the current escalation state for a vault.
+pub async fn get_escalation_state(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<Json<crate::models::EscalationState>, AppError> {
+    match state.db.get_escalation_state(vault_id)? {
+        Some(s) => Ok(Json(s)),
+        None => Ok(Json(crate::models::EscalationState {
+            vault_id,
+            last_escalation_tier: None,
+            escalated_at: None,
+        })),
+    }
+}
+
+/// GET /api/vaults/:vault_id/escalation-events
+/// List escalation audit events for a vault.
+pub async fn list_escalation_events(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<Json<Vec<crate::models::EscalationEvent>>, AppError> {
+    let events = state.db.get_escalation_events(vault_id)?;
+    Ok(Json(events))
+}
+
+// ── #1102: Webhook delivery endpoints ────────────────────────────────────────
+
+/// POST /api/vaults/:vault_id/webhooks
+/// Register a webhook endpoint and enqueue an initial test delivery.
+pub async fn register_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Json(req): Json<crate::models::RegisterWebhookRequest>,
+) -> Result<(StatusCode, Json<crate::models::WebhookDelivery>), AppError> {
+    let payload = serde_json::json!({
+        "event": "webhook_registered",
+        "vault_id": vault_id,
+        "endpoint_url": req.endpoint_url,
+    });
+    let delivery = crate::webhook_retry::enqueue(
+        &state.db,
+        &vault_id,
+        "webhook_registered",
+        payload,
+        &req.endpoint_url,
+    )
+    .map_err(AppError::InvalidInput)?;
+    Ok((StatusCode::CREATED, Json(delivery)))
+}
+
+/// GET /api/vaults/:vault_id/webhooks
+/// Retrieve the webhook delivery log for a vault.
+pub async fn list_webhook_deliveries(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Vec<crate::models::WebhookDelivery>>, AppError> {
+    let log = crate::webhook_retry::get_delivery_log(&state.db, &vault_id)
+        .map_err(AppError::InvalidInput)?;
+    Ok(Json(log))
+}
+
+// ── #1104: Vault Timeline endpoints ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct TimelineQuery {
+    pub kind: Option<String>,
+}
+
+/// GET /api/vaults/:vault_id/events
+/// Returns the vault status timeline, optionally filtered by event kind.
+pub async fn list_vault_timeline(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<Vec<crate::models::TimelineEvent>>, AppError> {
+    let events = state
+        .db
+        .get_timeline_events(&vault_id, query.kind.as_deref())?;
+    Ok(Json(events))
 }

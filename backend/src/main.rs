@@ -19,6 +19,8 @@ mod otel;
 mod routes;
 mod scheduler;
 mod two_factor;
+mod escalation;
+mod webhook_retry;
 
 #[cfg(test)]
 mod tests;
@@ -190,6 +192,26 @@ async fn main() {
             "/api/vaults/:vault_id/sponsored-release",
             post(routes::create_sponsored_release)
                 .get(routes::get_sponsored_releases),
+        )
+        // #1101: Escalation
+        .route(
+            "/api/vaults/:vault_id/escalation-state",
+            get(routes::get_escalation_state),
+        )
+        .route(
+            "/api/vaults/:vault_id/escalation-events",
+            get(routes::list_escalation_events),
+        )
+        // #1102: Webhook delivery
+        .route(
+            "/api/vaults/:vault_id/webhooks",
+            post(routes::register_webhook)
+                .get(routes::list_webhook_deliveries),
+        )
+        // #1104: Vault timeline
+        .route(
+            "/api/vaults/:vault_id/events",
+            get(routes::list_vault_timeline),
         )
         .layer(build_cors_layer())
         .with_state(state);
