@@ -89,7 +89,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
-mod release_memo_tests;
+mod vault_pause_release_tests;
 #[cfg(test)]
 mod beneficiary_waitlist_tests;
 #[cfg(test)]
@@ -306,8 +306,7 @@ pub enum ContractError {
     UpgradeTimelocked = 93,        // Issue #1120: Upgrade not yet executable
     UpgradeInvalidWasm = 94,       // Issue #1120: Invalid WASM hash
     TokenNotAllowed = 95,          // Issue #1118: Token not in allowlist
-    // Issue 2: vault is owner-locked; operations are temporarily frozen
-    VaultOwnerLocked = 96,
+    VaultPaused = 96,              // Issue #790: vault-level pause blocks trigger_release
 }
 
 #[contract]
@@ -2793,6 +2792,9 @@ impl TtlVaultContract {
         // Attempt to restore archived vault state before proceeding - Issue #443
         Self::try_restore_archived_vault(&env, vault_id);
         let mut vault = Self::load_vault(&env, vault_id);
+        if vault.is_paused {
+            panic_with_error!(&env, ContractError::VaultPaused);
+        }
         if Self::check_vault_frozen(&env, vault_id) {
             panic_with_error!(&env, ContractError::VaultFrozen);
         }
