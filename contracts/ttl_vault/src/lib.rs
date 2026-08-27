@@ -118,6 +118,10 @@ mod beneficiary_confirmation_tests;
 #[cfg(test)]
 mod min_checkin_interval_tests;
 
+// Issue #1264 #1265 #1266 #1267: dedicated guard tests
+#[cfg(test)]
+mod bug_fix_tests_1264_1265_1266_1267;
+
 #[cfg(test)]
 mod vault_archiving_tests;
 

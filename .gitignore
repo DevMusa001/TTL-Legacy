@@ -4,10 +4,22 @@ target/
 **/__snapshots__/
 *.snap
 *.snap.new
+*.insta.yaml
 
 # Build artifacts
 *.wasm
 *.d
+*.optimized.wasm
+
+# Soroban / Stellar CLI generated files
+.soroban/
+.stellar/
+contract-ids.json
+
+# Fuzz corpus and artifacts generated during fuzzing runs
+contracts/ttl_vault/fuzz/corpus/
+contracts/ttl_vault/fuzz/artifacts/
+contracts/ttl_vault/fuzz/target/
 
 # Environment files
 .env
@@ -32,3 +44,14 @@ dist/
 
 # Logs
 *.log
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html
+coverage/
+*.profraw
+*.profdata
+
+# Temporary / misc
+*.tmp
+*.bak
