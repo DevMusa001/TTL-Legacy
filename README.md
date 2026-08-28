@@ -1,6 +1,7 @@
 # TTL-Legacy — Micro-Endowment Check-In Vault on Stellar
 
-[![CI](https://github.com/success-OG/TTL-Legacy/actions/workflows/ci.yml/badge.svg)](https://github.com/success-OG/TTL-Legacy/actions/workflows/ci.yml)
+[![CI](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml/badge.svg)](https://github.com/OxDev-max/TTL-Legacy/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/OxDev-max/TTL-Legacy/branch/main/graph/badge.svg)](https://codecov.io/gh/OxDev-max/TTL-Legacy)
 
 A decentralized "Dead Man's Switch" built on Stellar/Soroban smart contracts.
 
@@ -29,11 +30,17 @@ This Soroban implementation makes TTL-Legacy:
 - **Create a Vault**: Set a beneficiary address and check-in interval
 - **Check-In**: Extend the contract TTL to reset the countdown
 - **Automatic Release**: Funds transfer to beneficiary when TTL lapses
+- **Beneficiary Conditional Acceptance**: Beneficiary can accept role only if funds exceed threshold
+- **Beneficiary Conflict Resolution**: Automated conflict resolution when multiple beneficiaries claim same vault
 - **Passkey Auth**: WebAuthn-based authentication for all owner actions
 - **Reminder System**: Backend sends encrypted email/SMS check-in reminders
 - **Legacy Dashboard**: Minimalist frontend to manage vault state and history
 - **Native XLM Support**: Built-in support for Stellar Lumens
 - **Token Ready**: Architecture supports custom Stellar tokens (roadmap item)
+- **Withdrawal Audit Trail**: Track all withdrawal attempts (successful and failed) with comprehensive details
+- **Withdrawal Batching**: Batch multiple small withdrawals into single transaction for efficiency
+- **Withdrawal Notifications**: Real-time alerts to vault owners for all withdrawal attempts
+- **Withdrawal Dispute**: Allow disputing unauthorized withdrawals within 24-hour grace period
 
 ## 🛠️ Quick Start
 
@@ -42,18 +49,62 @@ This Soroban implementation makes TTL-Legacy:
 - Rust (1.70+)
 - Soroban CLI
 - Stellar CLI
+- [just](https://just.systems/man/en/packages.html) (optional but recommended — centralizes all dev commands)
+
+### Using just
+
+Install `just` once, then run `just --list` to see every available target:
+
+```
+Available recipes:
+    audit               # Run cargo-audit (install with: cargo install cargo-audit)
+    build               # Build both Soroban contracts for wasm32 release
+    ci                  # Run build + test + clippy in one shot (useful before opening a PR)
+    clippy              # Run clippy (warnings treated as errors, matching CI)
+    deploy-mainnet      # Deploy to Stellar mainnet (requires STELLAR_MAINNET_RPC_URL; prompts for confirmation)
+    deploy-mainnet-force# Force-redeploy to mainnet without the existing-contract prompt
+    deploy-testnet      # Deploy to Stellar testnet (prompts if a contract already exists)
+    deploy-testnet-force# Force-redeploy to testnet without confirmation prompt
+    docker-down         # Stop and remove local dev stack containers
+    docker-up           # Start local dev stack (PostgreSQL, backend, Stellar Quickstart)
+    env-setup           # Copy .env.example to .env (skips if .env already exists)
+    fmt                 # Auto-format all code
+    fmt-check           # Check code formatting
+    test                # Run the full ttl_vault test suite
+```
 
 ### Build
 
 ```bash
+just build
+# or without just:
 ./scripts/build.sh
 ```
 
 ### Test
 
 ```bash
+just test
+# or without just:
 ./scripts/test.sh
 ```
+
+### Local Development Setup (Docker)
+
+For fastest local setup, use Docker Compose:
+
+```bash
+docker-compose up -d
+```
+
+This will start:
+- **PostgreSQL** on `localhost:5432`
+- **Backend** on `localhost:3000`
+- **Stellar Quickstart** on `localhost:8000`
+
+The `docker-compose.override.yml` configures development-specific settings (standalone Stellar, loose auth, mounted volumes).
+
+Database health check ensures the service is ready before the backend starts.
 
 ### Setup Environment
 
@@ -99,14 +150,42 @@ stellar keys generate deployer --network testnet
 ./scripts/deploy_testnet.sh
 ```
 
+### Deploy to Mainnet
+
+Required environment variables before running:
+
+| Variable | Description |
+|---|---|
+| `STELLAR_MAINNET_RPC_URL` | Mainnet RPC endpoint (e.g. `https://mainnet.sorobanrpc.com`) |
+| `DEPLOYER_IDENTITY` | Stellar CLI key name to sign the deployment (default: `deployer-mainnet`) |
+
+```bash
+# Configure your mainnet identity first
+stellar keys generate deployer-mainnet --network mainnet
+
+# Set required env var
+export STELLAR_MAINNET_RPC_URL=https://mainnet.sorobanrpc.com
+
+# Deploy (will prompt for confirmation)
+./scripts/deploy_mainnet.sh
+```
+
+The script will display the target network and identity, then require you to type `mainnet` before proceeding.
+
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
 - [TTL & State Archival Logic](docs/ttl-logic.md)
+- [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+- [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
+- [Beneficiary Conflict Resolution](docs/beneficiary-conflict-resolution.md)
+- [Withdrawal Features](docs/withdrawal-features.md)
 - [Threat Model & Security](docs/security.md)
 - [Security Policy & Vulnerability Disclosure](SECURITY.md)
 - [Roadmap](docs/roadmap.md)
+- [Vesting Schedules](docs/vesting-schedules.md)
+- [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
 
 ## 🎓 Smart Contract API
 
@@ -115,6 +194,7 @@ stellar keys generate deployer --network testnet
 ```rust
 create_vault(beneficiary: Address, check_in_interval: u64) -> u64
 get_vault(vault_id: u64) -> Vault
+get_deposit_total(vault_id: u64) -> Result<i128, ContractError>
 get_ttl_remaining(vault_id: u64) -> Option<u64>
 ```
 
@@ -133,6 +213,14 @@ update_beneficiary(vault_id: u64, new_beneficiary: Address)
 trigger_release(vault_id: u64)
 is_expired(vault_id: u64) -> bool
 get_release_status(vault_id: u64) -> ReleaseStatus
+```
+
+### Hibernation
+
+```rust
+enter_hibernation(vault_id: u64, caller: Address, duration_seconds: u64)
+exit_hibernation(vault_id: u64, caller: Address)
+get_hibernation(vault_id: u64) -> Option<HibernationEntry>
 ```
 
 ## 🧪 Testing
