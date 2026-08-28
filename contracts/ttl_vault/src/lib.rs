@@ -127,6 +127,8 @@ mod beneficiary_owner_check_tests;
 mod storage_key_collision_tests;
 #[cfg(test)]
 mod beneficiary_update_validation_tests;
+#[cfg(test)]
+mod ttl_remaining_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -6140,6 +6142,16 @@ impl TtlVaultContract {
     /// The TTL is calculated as the time remaining until the vault expires
     /// based on the last check-in time and the check-in interval.
     ///
+    /// # Expected behavior
+    /// * The value is recalculated on every call from the current ledger timestamp.
+    ///   Nothing is cached, so the result strictly decreases as ledgers advance and
+    ///   never returns a value from an earlier ledger.
+    /// * It decreases by exactly the elapsed time between two calls while no
+    ///   check-in happens.
+    /// * A successful `check_in` moves `last_check_in` to the current timestamp, so
+    ///   the next call reports the full `check_in_interval` again.
+    /// * Once the deadline is reached the result is `None`, not `Some(0)`.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault
@@ -6149,7 +6161,9 @@ impl TtlVaultContract {
     /// `None` if the vault does not exist or the TTL has already lapsed.
     pub fn get_ttl_remaining(env: Env, vault_id: u64) -> Option<u64> {
         let vault = Self::try_load_vault(&env, vault_id)?;
-        let deadline = vault.last_check_in + vault.check_in_interval;
+        let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
+        // Read the live ledger timestamp on every call so the result reflects the
+        // current ledger rather than the state at the last check-in.
         let now = env.ledger().timestamp();
         if now >= deadline {
             None
