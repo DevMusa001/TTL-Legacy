@@ -179,6 +179,7 @@ struct VaultDetailView: View {
     @State private var show2FASetup = false
     @State private var show2FAVerify = false
     @State private var twoFactorStatus: TwoFactorStatus?
+    @State private var showShareLink = false
 
     var body: some View {
         List {
@@ -221,6 +222,16 @@ struct VaultDetailView: View {
         }
         .navigationTitle("Vault")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: { showShareLink = true }) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+            }
+        }
+        .sheet(isPresented: $showShareLink) {
+            VaultShareLinkView(vault: vault)
+        }
         .sheet(isPresented: $show2FASetup) {
             TwoFactorSetupView(vaultID: vault.id)
         }
@@ -531,6 +542,8 @@ struct DeepLinkView: View {
                 BeneficiaryAcceptanceView(vaultID: vaultID, token: token)
             case .vaultAction(let vaultID, let action):
                 VaultActionDeepLinkView(vaultID: vaultID, action: action)
+            case .vaultPreview(let vaultID):
+                VaultPreviewDeepLinkView(vaultID: vaultID)
             }
         }
     }
@@ -696,5 +709,40 @@ struct BeneficiaryAcceptanceView: View {
             }
             isAccepting = false
         }
+    }
+}
+
+// MARK: - Vault Preview Deep Link View
+
+/// Displayed when the user opens a `https://ttl-legacy.app/vaults/{id}/preview` link.
+/// Shows a read-only vault summary and, if the vault is loaded locally, surfaces the
+/// full `VaultShareLinkView` share sheet so the recipient can pass the link on.
+struct VaultPreviewDeepLinkView: View {
+    let vaultID: String
+    @EnvironmentObject var vaultStore: VaultStore
+    @Environment(\.dismiss) var dismiss
+    @State private var showShareSheet = false
+
+    private var vault: Vault? { vaultStore.vaults.first { $0.id == vaultID } }
+
+    var body: some View {
+        Group {
+            if let vault {
+                VaultShareLinkView(vault: vault)
+            } else {
+                VStack(spacing: 24) {
+                    ProgressView()
+                    Text("Loading vault preview…")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("Vault Preview")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Dismiss") { dismiss() } }
+                }
+            }
+        }
+        .task { if vaultStore.vaults.isEmpty { await vaultStore.load() } }
     }
 }
