@@ -7,7 +7,9 @@ use soroban_sdk::{
 
 pub mod ranking;
 mod types;
-use types::{
+// The contract's `#[contracttype]` types are re-exported publicly so that
+// client crates (integration tests, fuzz targets) can reference them.
+pub use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryClaimDelegation, BeneficiaryCommitment,
     BeneficiaryEntry, BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
     CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, StorageKey, DisputeStatus,
