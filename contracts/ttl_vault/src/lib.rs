@@ -125,6 +125,8 @@ mod vault_archiving_tests;
 mod beneficiary_owner_check_tests;
 #[cfg(test)]
 mod storage_key_collision_tests;
+#[cfg(test)]
+mod beneficiary_update_validation_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -7013,6 +7015,13 @@ impl TtlVaultContract {
         let old_beneficiary = vault.beneficiary.clone();
         let new_beneficiary = pending.new_beneficiary.clone();
 
+        // Re-validate at apply time: ownership may have changed during the timelock.
+        if vault.owner == new_beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        Self::assert_not_zero_address(&env, &new_beneficiary);
+        Self::assert_beneficiary_is_account(&env, &new_beneficiary)?;
+
         // Enforce beneficiary capacity only when the beneficiary actually changes
         if old_beneficiary != new_beneficiary {
             Self::assert_beneficiary_capacity(&env, &new_beneficiary);
@@ -9123,9 +9132,17 @@ impl TtlVaultContract {
     }
 
     fn assert_not_zero_address(env: &Env, address: &Address) {
-        let zero = Address::from_contract_id(&env, &BytesN::zero(&env));
-        if address == &zero {
+        let zero_bytes = BytesN::<32>::zero(&env);
+        if address == &Address::from_contract_id(&env, &zero_bytes) {
             panic_with_error!(env, ContractError::InvalidBeneficiary);
+        }
+        // An account whose ed25519 key is all zeroes is unspendable, so funds sent
+        // there would be permanently locked.
+        if let Ok(soroban_sdk::AddressPayload::AccountIdPublicKeyEd25519(key)) = address.to_payload()
+        {
+            if key == zero_bytes {
+                panic_with_error!(env, ContractError::InvalidBeneficiary);
+            }
         }
     }
 
