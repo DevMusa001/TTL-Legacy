@@ -1,34 +1,79 @@
+# ── Rust / Cargo ────────────────────────────────────────────────────────────
 target/
+**/*.rs.bk
+Cargo.lock.bk
 
-# Test snapshots
-**/__snapshots__/
-*.snap
-*.snap.new
-
-# Build artifacts
+# ── Soroban / WASM build artifacts ─────────────────────────────────────────
 *.wasm
 *.d
 
-# Environment files
+# ── Test snapshots & fuzz artifacts ─────────────────────────────────────────
+**/__snapshots__/
+*.snap
+*.snap.new
+contracts/ttl_vault/fuzz/artifacts/
+contracts/ttl_vault/fuzz/corpus/*/crash-*
+contracts/ttl_vault/fuzz/corpus/*/timeout-*
+
+# ── Environment files ────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
+.env.mainnet
+.env.testnet
 
-# Editor / IDE
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Node (frontend/backend tooling)
+# ── Node (frontend / mobile tooling) ─────────────────────────────────────────
 node_modules/
 dist/
 .cache/
+.next/
+.nuxt/
+*.tsbuildinfo
 
-# Logs
+# ── Android build artifacts ───────────────────────────────────────────────────
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/**/*.apk
+mobile/android/**/*.aab
+mobile/android/**/*.keystore
+
+# ── iOS / Xcode build artifacts ───────────────────────────────────────────────
+mobile/ios/build/
+mobile/ios/**/*.xcworkspace/xcuserdata/
+mobile/ios/**/*.xcodeproj/xcuserdata/
+mobile/ios/DerivedData/
+mobile/ios/**/*.ipa
+mobile/ios/Pods/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Coverage & profiling ─────────────────────────────────────────────────────
+lcov.info
+coverage/
+*.profraw
+*.profdata
+
+# ── Deployment artifacts ──────────────────────────────────────────────────────
+deploy-artifacts/
+smoke-results/
+
+# ── Temporary & misc ──────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+.DS_Store
