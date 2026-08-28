@@ -210,6 +210,14 @@ async fn main() {
             "/api/vaults/:vault_id/vesting/bonus",
             get(routes::get_vesting_bonus),
         )
+        .route(
+            "/notifications/unsubscribe",
+            get(routes::unsubscribe),
+        )
+        .route(
+            "/reminders/check-in",
+            get(routes::resolve_reminder_token),
+        )
         .layer(build_cors_layer())
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
         .with_state(state);

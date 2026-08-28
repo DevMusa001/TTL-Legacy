@@ -142,6 +142,33 @@ pub async fn unsubscribe(
     }
 }
 
+// ── Token-based reminder check-in endpoint (#1286) ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct ReminderTokenQuery {
+    pub token: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ResolveReminderTokenResponse {
+    pub vault_id: String,
+    pub owner: String,
+}
+
+#[instrument(skip(state))]
+pub async fn resolve_reminder_token(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ReminderTokenQuery>,
+) -> Result<Json<ResolveReminderTokenResponse>, AppError> {
+    let db = &state.db;
+    match db.resolve_reminder_token(&query.token) {
+        Ok((vault_id, owner)) => Ok(Json(ResolveReminderTokenResponse { vault_id, owner })),
+        Err(_) => Err(AppError::InvalidInput(
+            "Invalid or expired reminder token".into(),
+        )),
+    }
+}
+
 
 // ── Release Simulator endpoint ────────────────────────────────────────────────
 
