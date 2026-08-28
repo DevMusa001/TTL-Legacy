@@ -1,5 +1,7 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Vec};
 
+const FULL_ALLOCATION_BPS: u32 = 10_000;
+
 pub const RANKING_SET_TOPIC: soroban_sdk::Symbol = symbol_short!("rank_set");
 pub const DISTRIBUTED_BY_RANK_TOPIC: soroban_sdk::Symbol = symbol_short!("dist_rank");
 
@@ -44,7 +46,7 @@ pub fn set_rank(env: &Env, caller: &Address, beneficiary: Address, priority: u32
     let allocation_bps = ranks
         .get(beneficiary.clone())
         .map(|b| b.allocation_bps)
-        .unwrap_or(10_000);
+        .unwrap_or(FULL_ALLOCATION_BPS);
 
     ranks.set(
         beneficiary.clone(),
