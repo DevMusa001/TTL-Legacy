@@ -32,3 +32,22 @@ dist/
 
 # Logs
 *.log
+
+# Mutation testing (cargo-mutants)
+mutants-report.txt
+mutants.out/
+mutants.out.partial/
+.mutants/
+
+# Code coverage
+lcov.info
+tarpaulin-report.html
+coverage/
+*.profraw
+*.profdata
+
+# Fuzzer artifacts (corpus is committed; crash artifacts are not)
+fuzz/artifacts/
+
+# Stray PR description files generated at repo root
+pr-description-*.md
