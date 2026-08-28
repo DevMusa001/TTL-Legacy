@@ -1402,6 +1402,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: Vec::new(&env),
             metadata,
@@ -5953,6 +5954,20 @@ impl TtlVaultContract {
         Self::load_vault(&env, vault_id).created_at
     }
 
+    /// Returns the ledger sequence number at which the vault was created.
+    /// Dashboards and analytics tools can use this to determine how long
+    /// a vault has been active without relying on external event history.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The ledger sequence number when the vault was created
+    pub fn get_vault_age(env: Env, vault_id: u64) -> u64 {
+        Self::load_vault(&env, vault_id).creation_ledger
+    }
+
     /// Returns the check-in interval for a vault.
     ///
     /// # Arguments
@@ -6980,7 +6995,12 @@ impl TtlVaultContract {
 
         env.events().publish(
             (symbol_short!("ben_init"), vault_id),
-            (new_beneficiary, now + timelock),
+            (new_beneficiary.clone(), now + timelock),
+        );
+
+        env.events().publish(
+            (BENEFICIARY_UPDATED_TOPIC, vault_id),
+            (vault.beneficiary.clone(), new_beneficiary.clone()),
         );
 
         Ok(())
@@ -7899,6 +7919,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: Vec::new(&env),
             metadata,
@@ -9552,6 +9573,7 @@ impl TtlVaultContract {
             check_in_interval: original.check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: original.beneficiaries.clone(),
             metadata: original.metadata.clone(),
@@ -9696,6 +9718,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries,
             metadata,

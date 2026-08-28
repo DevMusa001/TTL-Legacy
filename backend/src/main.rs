@@ -18,6 +18,7 @@ mod models;
 mod notifications;
 mod otel;
 mod rate_limit;
+mod request_id;
 mod routes;
 mod scheduler;
 mod two_factor;
@@ -212,6 +213,7 @@ async fn main() {
         )
         .layer(build_cors_layer())
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
+        .layer(middleware::from_fn(request_id::request_id_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

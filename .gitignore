@@ -1,18 +1,21 @@
+# Build artifacts
 target/
+*.wasm
+*.d
 
 # Test snapshots
 **/__snapshots__/
 *.snap
 *.snap.new
 
-# Build artifacts
-*.wasm
-*.d
+# Cargo lock for libraries (keep for binaries/apps)
+# Cargo.lock  # keep this commented - we DO want Cargo.lock for the binary crate
 
 # Environment files
 .env
 .env.local
 .env.*.local
+!.env.example
 
 # Editor / IDE
 .vscode/
@@ -32,3 +35,29 @@ dist/
 
 # Logs
 *.log
+logs/
+
+# Coverage / profiling artifacts
+tarpaulin-report.html
+lcov.info
+*.profraw
+*.profdata
+cobertura.xml
+
+# Fuzz corpus (auto-generated, not committed)
+contracts/ttl_vault/fuzz/corpus/
+
+# Soroban / Stellar CLI
+.stellar/
+
+# Docker volumes / local data
+postgres-data/
+redis-data/
+
+# Temporary files
+tmp/
+*.tmp
+*.bak
+
+# PR description files (auto-generated)
+pr-description-*.md
