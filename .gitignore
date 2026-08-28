@@ -32,3 +32,15 @@ dist/
 
 # Logs
 *.log
+
+# Playwright E2E artifacts
+test-results/
+playwright-report/
+.playwright/
+playwright/.cache/
+
+# Coverage / profiling
+lcov.info
+*.profraw
+*.profdata
+coverage/

@@ -5,6 +5,7 @@ use axum::{
     extract::{FromRef, State},
     http::{HeaderValue, Method, StatusCode},
     middleware,
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -29,17 +30,27 @@ mod tests;
 
 pub use consensus::NodeCache;
 pub use db::Db;
-pub use db::AppState;
+// Note: db::AppState is NOT re-exported here — main.rs defines its own AppState
+// that includes the Metrics field (issue #1195).
+
+use crate::metrics::Metrics;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
     pub consensus: Arc<NodeCache>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl FromRef<AppState> for Arc<Db> {
     fn from_ref(state: &AppState) -> Arc<Db> {
         Arc::clone(&state.db)
+    }
+}
+
+impl FromRef<AppState> for Arc<Metrics> {
+    fn from_ref(state: &AppState) -> Arc<Metrics> {
+        Arc::clone(&state.metrics)
     }
 }
 
@@ -107,6 +118,21 @@ async fn consensus_health_handler(
     }
 }
 
+/// GET /metrics — Prometheus text exposition endpoint (issue #1195).
+///
+/// Returns all application metrics in Prometheus text format
+/// (content-type: text/plain; version=0.0.4; charset=utf-8).
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.metrics.render();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry distributed tracing.
@@ -163,9 +189,12 @@ async fn main() {
         scheduler::run(scheduler_db).await;
     });
 
+    let metrics = Metrics::new();
+
     let state = AppState {
         db,
         consensus,
+        metrics,
     };
 
     let global_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(100, 60));
@@ -178,6 +207,7 @@ async fn main() {
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
             post(routes::set_preferences).layer(middleware::from_fn_with_state(sensitive_limiter.clone(), rate_limit::rate_limit_middleware))
