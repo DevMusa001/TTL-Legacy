@@ -1,5 +1,7 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, panic_with_error};
 
+const BASIS_POINTS_100_PERCENT: i128 = 10_000;
+
 pub const MATCH_SET_TOPIC: soroban_sdk::Symbol = symbol_short!("match_set");
 pub const MATCHED_DISTRIBUTION_TOPIC: soroban_sdk::Symbol = symbol_short!("match_dst");
 
@@ -42,7 +44,7 @@ pub fn set_match(
     match_bps: u32,
 ) {
     caller.require_auth();
-    if match_bps > 10_000 {
+    if match_bps as i128 > BASIS_POINTS_100_PERCENT {
         panic_with_error!(&env, crate::ContractError::InvalidBps);
     }
 
@@ -86,7 +88,7 @@ pub fn compute_matched_amounts(
 
     for (source_addr, pair) in matches.iter() {
         if let Some(source_amount) = base_distributions.get(source_addr.clone()) {
-            let matched_amount = (source_amount * pair.match_bps as i128) / 10_000;
+            let matched_amount = (source_amount * pair.match_bps as i128) / BASIS_POINTS_100_PERCENT;
             if matched_amount > 0 {
                 let existing = matched_amounts.get(pair.matched.clone()).unwrap_or(0);
                 matched_amounts.set(pair.matched.clone(), existing + matched_amount);
