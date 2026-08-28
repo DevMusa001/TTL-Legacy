@@ -67,6 +67,38 @@
 - State validation before mutations
 - TTL extension on all storage operations
 
+## Backend HTTP Security Headers
+
+The above threat model covers the on-chain contract; this section covers the
+`backend/` HTTP API (Issue #1181).
+
+`security_headers::security_headers_middleware` is installed as the
+outermost layer of the axum router in `main.rs`, so it applies to every
+response — including CORS/rate-limit rejections and error responses, not
+just successful ones. It appends the following headers unconditionally:
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Content-Security-Policy` | `default-src 'self'` (see below) | Restricts the origins scripts/styles/etc. may load from, mitigating XSS |
+| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains` | Forces HTTPS for this origin and its subdomains for 2 years |
+| `X-Content-Type-Options` | `nosniff` | Stops browsers from MIME-sniffing a response away from its declared `Content-Type` |
+| `X-Frame-Options` | `DENY` | Prevents the API's responses from being framed, mitigating clickjacking |
+| `Referrer-Policy` | `no-referrer` | Never leaks the request URL (which may embed vault IDs or tokens) via the `Referer` header |
+
+**Overriding CSP for development**: set the `CSP_POLICY` environment
+variable to replace the default `default-src 'self'` — for example, to allow
+a local frontend dev server on a different origin:
+
+```
+CSP_POLICY="default-src 'self' http://localhost:3001"
+```
+
+The other four headers are intentionally not configurable: there is no
+legitimate per-deployment reason to weaken HSTS, `nosniff`, frame-denial, or
+referrer suppression. If `CSP_POLICY` is set to a value that isn't a valid
+HTTP header (e.g. contains a newline), the middleware logs a warning and
+falls back to the default policy rather than dropping the header entirely.
+
 ## Audit Status
 
 Not yet audited. Community review welcome.

@@ -13,6 +13,7 @@ use tower_http::cors::CorsLayer;
 mod consensus;
 mod db;
 mod error;
+mod security_headers;
 mod handlers;
 mod models;
 mod notifications;
@@ -212,6 +213,9 @@ async fn main() {
         )
         .layer(build_cors_layer())
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
+        // Outermost layer so every response — including CORS/rate-limit
+        // rejections — carries the baseline security headers.
+        .layer(middleware::from_fn(security_headers::security_headers_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
