@@ -616,6 +616,12 @@ impl Db {
                 CREATE TABLE IF NOT EXISTS unsubscribed_users (
                     owner TEXT PRIMARY KEY
                 );
+                CREATE TABLE IF NOT EXISTS reminder_tokens (
+                    token      TEXT PRIMARY KEY,
+                    vault_id   TEXT NOT NULL,
+                    owner      TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 "#,
             ),
             (
@@ -1015,6 +1021,37 @@ impl Db {
         let token = uuid::Uuid::new_v4().to_string();
         self.store_unsubscribe_token(&token, owner);
         token
+    }
+
+    // ── Token-based reminder links (#1286) ──────────────────────────────────
+
+    pub fn store_reminder_token(&self, token: &str, vault_id: &str, owner: &str) {
+        let _ = self.conn.lock().unwrap().execute(
+            r#"INSERT OR REPLACE INTO reminder_tokens (token, vault_id, owner, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![token, vault_id, owner, chrono::Utc::now().to_rfc3339()],
+        );
+    }
+
+    pub fn generate_reminder_token(&self, vault_id: &str, owner: &str) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        self.store_reminder_token(&token, vault_id, owner);
+        token
+    }
+
+    pub fn resolve_reminder_token(&self, token: &str) -> Result<(String, String), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT vault_id, owner FROM reminder_tokens WHERE token = ?1",
+            params![token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "invalid or expired reminder token".to_string())
+    }
+
+    pub fn generate_reminder_url(&self, vault_id: &str, owner: &str, base_url: &str) -> String {
+        let token = self.generate_reminder_token(vault_id, owner);
+        format!("{base_url}/reminders/check-in?token={token}")
     }
 
     // ── Audit Log persistence (#961) ─────────────────────────────────────────

@@ -158,6 +158,16 @@ pub struct UnsubscribeToken {
     pub created_at: DateTime<Utc>,
 }
 
+// ── Token-based reminder links (#1286) ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderToken {
+    pub token: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub created_at: DateTime<Utc>,
+}
+
 // ── Channel fallback delivery log (#827) ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
