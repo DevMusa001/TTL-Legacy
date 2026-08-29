@@ -10,6 +10,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 
+mod auth;
 mod consensus;
 mod db;
 mod error;
@@ -234,6 +235,12 @@ async fn main() {
             "/api/vaults/:vault_id/vesting/bonus",
             get(routes::get_vesting_bonus),
         )
+        .route(
+            "/api/vaults/:vault_id/release-history",
+            get(routes::get_vault_release_history),
+        )
+        .route("/api/auth/token", post(auth::login))
+        .route("/api/auth/refresh", post(auth::refresh))
         .layer(build_cors_layer())
         .layer(middleware::from_fn(sanitization::sanitize_request))
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
