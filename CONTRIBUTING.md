@@ -206,6 +206,52 @@ git commit -m "Update fuzz corpus after extended fuzzing run"
 
 For more details, see [contracts/ttl_vault/fuzz/README.md](contracts/ttl_vault/fuzz/README.md).
 
+## Conventional Commits
+
+TTL-Legacy enforces the [Conventional Commits](https://www.conventionalcommits.org/) specification.
+All **PR titles** and **squash-merge commit messages** must follow this format:
+
+```
+<type>(<optional scope>): <short description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+### Allowed Types
+
+| Type       | When to use                                          |
+|------------|------------------------------------------------------|
+| `feat`     | A new feature                                        |
+| `fix`      | A bug fix                                            |
+| `docs`     | Documentation-only changes                           |
+| `refactor` | Code change that is neither a fix nor a feature      |
+| `perf`     | Performance improvement                              |
+| `test`     | Adding or updating tests                             |
+| `build`    | Changes to the build system or external dependencies |
+| `ci`       | CI/CD configuration changes                          |
+| `chore`    | Other changes that do not modify src or test files   |
+| `revert`   | Reverts a previous commit                            |
+| `security` | Security fix or hardening                            |
+
+### Examples
+
+```
+feat(vault): add batch check-in endpoint
+fix(check-in): return VaultNotFound instead of raw panic string
+docs(contributing): add conventional commit guide
+security(auth): enforce passkey nonce replay protection
+ci(release): add git-cliff changelog automation
+refactor(backend): extract sanitization middleware
+```
+
+### Why?
+
+Commit messages are parsed by [git-cliff](https://git-cliff.org/) to auto-generate
+`CHANGELOG.md` on every release.  A CI job (`commitlint.yml`) validates PR titles
+against these rules on every pull request.
+
 ## Style Guide
 - Follow standard Rust idiomatic practices.
 - Use /// for all public function documentation.
