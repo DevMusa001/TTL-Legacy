@@ -32,6 +32,8 @@ jobs:
           - fuzz_deposit
           - fuzz_withdraw
           - fuzz_check_in
+          - fuzz_xdr_scval
+          - fuzz_contract_xdr
       # Continue fuzzing other targets even if one fails
       fail-fast: false
     timeout-minutes: 30

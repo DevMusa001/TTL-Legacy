@@ -712,37 +712,53 @@ struct BeneficiaryAcceptanceView: View {
     }
 }
 
-// MARK: - Vault Preview Deep Link View
+// MARK: - Offline Queue Banner
 
-/// Displayed when the user opens a `https://ttl-legacy.app/vaults/{id}/preview` link.
-/// Shows a read-only vault summary and, if the vault is loaded locally, surfaces the
-/// full `VaultShareLinkView` share sheet so the recipient can pass the link on.
-struct VaultPreviewDeepLinkView: View {
-    let vaultID: String
-    @EnvironmentObject var vaultStore: VaultStore
-    @Environment(\.dismiss) var dismiss
-    @State private var showShareSheet = false
-
-    private var vault: Vault? { vaultStore.vaults.first { $0.id == vaultID } }
+/// Shows a sticky banner when the device is offline and/or there are queued check-ins pending.
+struct OfflineQueueBanner: View {
+    @ObservedObject var monitor: OfflineStatusViewModel
 
     var body: some View {
-        Group {
-            if let vault {
-                VaultShareLinkView(vault: vault)
-            } else {
-                VStack(spacing: 24) {
-                    ProgressView()
-                    Text("Loading vault preview…")
-                        .foregroundStyle(.secondary)
+        if !monitor.isConnected || monitor.queuedCount > 0 {
+            HStack(spacing: 8) {
+                Image(systemName: monitor.isConnected ? "clock.arrow.circlepath" : "wifi.slash")
+                    .foregroundStyle(.white)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(monitor.isConnected ? "Syncing queued check-ins…" : "You're offline")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                    if monitor.queuedCount > 0 {
+                        Text("\(monitor.queuedCount) check-in(s) queued — will sync automatically")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .navigationTitle("Vault Preview")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("Dismiss") { dismiss() } }
-                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(monitor.isConnected ? Color.orange : Color.red)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+}
+
+@MainActor
+final class OfflineStatusViewModel: ObservableObject {
+    @Published var isConnected: Bool = NetworkMonitor.shared.isConnected
+    @Published var queuedCount: Int = OfflineCheckInQueue.shared.count
+
+    private var timer: Timer?
+
+    init() {
+        // Poll every 2 seconds — lightweight and avoids Combine dependency.
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isConnected = NetworkMonitor.shared.isConnected
+                self?.queuedCount = OfflineCheckInQueue.shared.count
             }
         }
-        .task { if vaultStore.vaults.isEmpty { await vaultStore.load() } }
     }
+
+    deinit { timer?.invalidate() }
 }
