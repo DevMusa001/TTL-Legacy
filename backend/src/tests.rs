@@ -382,6 +382,119 @@ async fn test_cors_rejected_origin() {
     }
 }
 
+// ── Issue #1179: Hardened CORS tests ─────────────────────────────────────────
+
+/// Build a small test router with `build_cors_layer()` applied.
+/// `app_env` and `allowed_origins` are injected via environment variables.
+fn build_cors_test_app(app_env: &str, allowed_origins: &str) -> Router {
+    // Set env vars before building the layer; clear them after.
+    std::env::set_var("APP_ENV", app_env);
+    std::env::set_var("ALLOWED_ORIGINS", allowed_origins);
+    let cors = crate::build_cors_layer();
+    std::env::remove_var("APP_ENV");
+    std::env::remove_var("ALLOWED_ORIGINS");
+
+    let state = test_state(Arc::new(Db::open(":memory:").unwrap()));
+    Router::new()
+        .route("/health", get(health_handler))
+        .layer(cors)
+        .with_state(state)
+}
+
+/// With `APP_ENV=production` and a valid origin in the whitelist, the
+/// `access-control-allow-origin` header should reflect the allowed origin.
+#[tokio::test]
+async fn test_cors_hardened_allowed_origin() {
+    let app = build_cors_test_app("production", "http://allowed.example.com");
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://allowed.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The allowed origin must appear in the response header.
+    let allow_origin = res.headers().get("access-control-allow-origin");
+    assert!(
+        allow_origin.is_some(),
+        "access-control-allow-origin must be present for an allowed origin"
+    );
+    assert_eq!(
+        allow_origin.unwrap(),
+        "http://allowed.example.com",
+        "access-control-allow-origin must match the allowed origin"
+    );
+}
+
+/// With `APP_ENV=production` and a disallowed origin, the
+/// `access-control-allow-origin` header must not reflect the disallowed origin.
+#[tokio::test]
+async fn test_cors_hardened_disallowed_origin() {
+    let app = build_cors_test_app("production", "http://allowed.example.com");
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://evil.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let allow_origin = res.headers().get("access-control-allow-origin");
+    match allow_origin {
+        Some(val) => assert_ne!(
+            val, "http://evil.example.com",
+            "disallowed origin must not appear in access-control-allow-origin"
+        ),
+        None => {} // No header is also acceptable — origin was rejected.
+    }
+}
+
+/// With `APP_ENV=development`, the CORS layer should be permissive and allow
+/// cross-origin requests from any origin (wildcard or reflected).
+#[tokio::test]
+async fn test_cors_development_mode_allows_all() {
+    let app = build_cors_test_app("development", "");
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://any-origin.local")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // In permissive mode, the response status must be 2xx (not blocked)
+    // and the allow-origin header must be present.
+    assert!(
+        res.status().is_success() || res.status().as_u16() == 204,
+        "dev CORS must not block preflight: got status {}",
+        res.status()
+    );
+    let allow_origin = res.headers().get("access-control-allow-origin");
+    assert!(
+        allow_origin.is_some(),
+        "access-control-allow-origin must be present in development mode"
+    );
+}
+
 // ── #824: Scheduler resilience tests ─────────────────────────────────────────
 
 #[tokio::test]
