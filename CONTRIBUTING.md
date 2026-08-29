@@ -206,65 +206,51 @@ git commit -m "Update fuzz corpus after extended fuzzing run"
 
 For more details, see [contracts/ttl_vault/fuzz/README.md](contracts/ttl_vault/fuzz/README.md).
 
-## Mutation Testing
+## Conventional Commits
 
-Mutation testing measures how well the test suite detects bugs by automatically
-introducing small code changes (_mutants_) and checking whether the tests catch
-them. A surviving mutant indicates a gap in test coverage. This is especially
-valuable for financial smart-contract logic where missed edge cases can lead to
-fund loss.
-
-### Install
-
-```bash
-cargo install cargo-mutants
-```
-
-### Run
-
-```bash
-# Mutate the core vault contract source and run the full test suite against each mutant.
-cargo mutants --package ttl-vault -- contracts/ttl_vault/src/
-```
-
-> **Tip:** Limit runs to a single source file to keep turnaround fast during
-> development:
->
-> ```bash
-> cargo mutants --package ttl-vault -- contracts/ttl_vault/src/lib.rs
-> ```
-
-### Critical Paths to Focus On
-
-Focus mutation testing efforts on the following high-risk functions:
-
-| Function | Why it matters |
-|---|---|
-| `trigger_release` | Transfers funds to beneficiaries — incorrect logic leads to fund loss |
-| `check_in` | Controls the liveness countdown — a bug could prevent or cause premature release |
-| `withdraw` | Owner withdrawal — incorrect balance or auth checks could drain vaults |
-
-### Interpreting Surviving Mutants
-
-After `cargo-mutants` finishes, it prints a summary:
+TTL-Legacy enforces the [Conventional Commits](https://www.conventionalcommits.org/) specification.
+All **PR titles** and **squash-merge commit messages** must follow this format:
 
 ```
-20 mutants tested in 3m 14s. 18 killed, 2 survived, 0 unviable.
+<type>(<optional scope>): <short description>
+
+[optional body]
+
+[optional footer(s)]
 ```
 
-A **surviving** mutant means the tests did not catch the introduced change.
-Open `mutants.out/outcomes.json` (or the printed list) to see which mutations
-survived and which source line they modified.
+### Allowed Types
 
-### Writing Tests to Kill Surviving Mutants
+| Type       | When to use                                          |
+|------------|------------------------------------------------------|
+| `feat`     | A new feature                                        |
+| `fix`      | A bug fix                                            |
+| `docs`     | Documentation-only changes                           |
+| `refactor` | Code change that is neither a fix nor a feature      |
+| `perf`     | Performance improvement                              |
+| `test`     | Adding or updating tests                             |
+| `build`    | Changes to the build system or external dependencies |
+| `ci`       | CI/CD configuration changes                          |
+| `chore`    | Other changes that do not modify src or test files   |
+| `revert`   | Reverts a previous commit                            |
+| `security` | Security fix or hardening                            |
 
-1. Identify the surviving mutant's source location from the `cargo-mutants` output.
-2. Understand what logical change was introduced (e.g., `>=` flipped to `>`).
-3. Write a targeted unit or integration test that would fail with the mutated code.
-4. Re-run `cargo mutants` to confirm the new test kills the mutant.
+### Examples
 
-See [docs/integration-testing-guide.md](docs/integration-testing-guide.md) for a
-more detailed walkthrough, CI integration, and a GitHub Actions YAML snippet.
+```
+feat(vault): add batch check-in endpoint
+fix(check-in): return VaultNotFound instead of raw panic string
+docs(contributing): add conventional commit guide
+security(auth): enforce passkey nonce replay protection
+ci(release): add git-cliff changelog automation
+refactor(backend): extract sanitization middleware
+```
+
+### Why?
+
+Commit messages are parsed by [git-cliff](https://git-cliff.org/) to auto-generate
+`CHANGELOG.md` on every release.  A CI job (`commitlint.yml`) validates PR titles
+against these rules on every pull request.
 
 ## Style Guide
 - Follow standard Rust idiomatic practices.

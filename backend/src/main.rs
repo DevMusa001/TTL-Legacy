@@ -19,6 +19,7 @@ mod notifications;
 mod otel;
 mod rate_limit;
 mod routes;
+mod sanitization;
 mod scheduler;
 mod two_factor;
 mod escalation;
@@ -234,6 +235,7 @@ async fn main() {
             get(routes::get_vesting_bonus),
         )
         .layer(build_cors_layer())
+        .layer(middleware::from_fn(sanitization::sanitize_request))
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
         .with_state(state);
 
