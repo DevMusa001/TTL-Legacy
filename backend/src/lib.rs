@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod models;
 pub mod handlers;
+pub mod security_headers;
 pub mod websocket;
 pub mod db;
 pub mod templates;
