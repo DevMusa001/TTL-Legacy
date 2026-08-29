@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,11 +30,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build crate
-        run: cargo build --package ttl-vault --lib
+      - name: Build contracts
+        run: cargo build --workspace
 
       - name: Build release WASM
-        run: cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+        run: |
+          cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+          cargo build --package zk-verifier --target wasm32-unknown-unknown --release
 
       - name: Check WASM size
         run: |
@@ -67,13 +68,13 @@ jobs:
             }
 
       - name: Run tests
-        run: cargo test --package ttl-vault
+        run: cargo test --workspace
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --package ttl-vault -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -90,13 +91,9 @@ jobs:
 
       - name: Validate OpenAPI specification
         run: |
-          if command -v spectacle &> /dev/null; then
-            spectacle docs/openapi.yaml
-          fi
-          python3 -m pip install openapi-spec-validator 2>/dev/null || true
-          if command -v openapi-spec-validator &> /dev/null; then
-            openapi-spec-validator docs/openapi.yaml
-          fi
+          python3 -m pip install openapi-spec-validator --quiet
+          python3 -m openapi_spec_validator docs/openapi.yaml
+          echo "✅ OpenAPI spec validation passed"
 
       - name: Check version consistency
         run: |

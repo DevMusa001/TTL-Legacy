@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod models;
 pub mod handlers;
 pub mod security_headers;
@@ -17,6 +18,8 @@ pub mod consensus;
 pub mod contract_version_check;
 pub mod metrics;
 pub mod two_factor;
+/// Issue #1199: request input sanitization middleware
+pub mod sanitization;
 
 pub use models::*;
 pub use handlers::*;

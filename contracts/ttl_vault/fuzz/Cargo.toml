@@ -9,6 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+stellar-xdr = "21.2.0"
+ttl-vault = { path = "..", features = ["testutils"] }
 
 [[bin]]
 name = "fuzz_vesting"
@@ -37,5 +40,17 @@ doc = false
 [[bin]]
 name = "fuzz_check_in"
 path = "src/fuzz_check_in.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_xdr_scval"
+path = "src/fuzz_xdr_scval.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_contract_xdr"
+path = "src/fuzz_contract_xdr.rs"
 test = false
 doc = false
