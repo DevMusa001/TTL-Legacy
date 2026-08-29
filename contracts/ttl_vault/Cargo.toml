@@ -9,6 +9,12 @@ workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Enables the generated contract client and test-harness support so that
+# other crates (integration tests, fuzz targets) can register and invoke
+# the contract through soroban-sdk testutils.
+testutils = ["soroban-sdk/testutils"]
+
 [dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
 

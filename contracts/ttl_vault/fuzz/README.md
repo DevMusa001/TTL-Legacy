@@ -86,6 +86,44 @@ Tests the `check_in` entry point with arbitrary vault states and timestamps:
 - Check-in history and streak tracking
 - No saturating arithmetic overflow in elapsed time calculations
 
+### 6. `fuzz_xdr_scval`
+**File**: `src/fuzz_xdr_scval.rs`
+
+Tests the XDR deserialization path that contract function inputs go through.
+Soroban contract arguments are XDR-encoded `ScVal`s; this target feeds
+arbitrary bytes through `ScVal::from_xdr` / `Vec<ScVal>::from_xdr` (the exact
+deserialization the host performs before invoking a contract function):
+- Single `ScVal` and full `ScVec` argument lists
+- Lossless encode → decode round trips
+- Malformed, truncated, and oversized XDR
+
+**Invariants tested**:
+- Malformed XDR is rejected with an error, never a panic
+- Any successfully decoded value survives a decode → encode → decode round trip
+- The multi-sig numeric payload decoders (`decode_i128` / `decode_u64`
+  semantics) never panic on arbitrary payload bytes
+
+### 7. `fuzz_contract_xdr`
+**File**: `src/fuzz_contract_xdr.rs`
+
+Full-stack fuzz target: registers the real `ttl_vault` contract in a Soroban
+test environment and drives its input-parsing paths:
+- **mode 0** - a single `ScVal` decoded from raw XDR, dispatched to
+  one-argument entry points (`pause`, `propose_upgrade`, `validate_upgrade`, ...)
+- **mode 1** - a `Vec<ScVal>` decoded from raw XDR (the full argument list of a
+  call), dispatched to multi-argument entry points (`file_dispute`, `deposit`,
+  `check_in`, `propose_multisig`, ...)
+- **mode 2** - a structured multi-sig payload (operation + arbitrary `Bytes`
+  payload) pushed through `propose_multisig` → `approve_multisig` →
+  `execute_multisig`, exercising the contract's internal payload parsers
+  (`decode_i128` / `decode_u64`)
+
+**Invariants tested**:
+- Malformed XDR never panics — deserialization fails with an error
+- Semantically invalid `ScVal`s are rejected during conversion, not by panicking
+- Arbitrary payloads (short, empty, oversized) produce contract errors, never
+  panics
+
 ## Building Fuzz Targets
 
 ### Prerequisites
@@ -108,6 +146,9 @@ cargo +nightly fuzz build
 ```bash
 cargo +nightly fuzz build fuzz_create_vault
 ```
+
+> Note: `fuzz_contract_xdr` links the contract and soroban-sdk testutils, so
+> its first build takes longer than the pure-parsing targets.
 
 ## Running Fuzz Tests
 

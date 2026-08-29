@@ -7,17 +7,19 @@ use soroban_sdk::{
 
 pub mod ranking;
 mod types;
-use types::{
+// The contract's `#[contracttype]` types are re-exported publicly so that
+// client crates (integration tests, fuzz targets) can reference them.
+pub use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryClaimDelegation, BeneficiaryCommitment,
-    BeneficiaryEntry, BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
+    BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
     CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, StorageKey, DisputeStatus,
     EncryptedBackupCodes, GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry,
     MilestoneEntry, MilestoneVestingSchedule, MultiSigConfig, MultiSigOperation, MultiSigProposal,
     OwnershipProof, OwnershipTransferRequest, PasskeyAnalytics, PasskeyHash, PasskeyUsageEntry,
     PasskeyUsageStat, PauseRecord, PendingBeneficiaryUpdate, PendingMultiSigOp, ProofOfLifeEntry, ProposalStatus,
-    ReleaseCondition, ReleaseEvent, ReleaseStatus, ReleaseVoteEntry, StateTransitionEntry,
+    ReleaseCondition, ReleaseEvent, ReleaseVoteEntry, StateTransitionEntry,
     TokenCollateral, TokenConversion, TokenHedge, TokenLending, TokenRebalanceConfig, TokenStaking,
-    TokenWeight, TtlBorrowRecord, UpgradeProposal, Vault, VaultStatusSummary, VestingBonusConfig,
+    TokenWeight, TtlBorrowRecord, UpgradeProposal, VaultStatusSummary, VestingBonusConfig,
     VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim, VestingSchedule,
     WhitelistEntry, WithdrawalLimit, WithdrawalReversal, WithdrawalScheduleEntry,
     WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
@@ -118,6 +120,10 @@ mod beneficiary_confirmation_tests;
 #[cfg(test)]
 mod min_checkin_interval_tests;
 
+// Issue #1264 #1265 #1266 #1267: dedicated guard tests
+#[cfg(test)]
+mod bug_fix_tests_1264_1265_1266_1267;
+
 #[cfg(test)]
 mod vault_archiving_tests;
 
@@ -125,6 +131,9 @@ mod vault_archiving_tests;
 mod beneficiary_owner_check_tests;
 #[cfg(test)]
 mod storage_key_collision_tests;
+// Issue #1263: structured VaultNotFound error on check-in for non-existent vault
+#[cfg(test)]
+mod checkin_nonexistent_vault_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -146,9 +155,22 @@ pub const INSTANCE_TTL_LEDGERS: u32 = 200_000;
 
 /// Approximate ledger close time in seconds (Stellar mainnet ~5s).
 const LEDGER_SECOND: u32 = 5;
+/// Number of seconds in one minute.
+const SECONDS_PER_MINUTE: u64 = 60;
+/// Number of seconds in one hour.
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+/// Number of seconds in one day.
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+/// Number of days in the simplified financial-year calculation.
+const DAYS_PER_YEAR: u64 = 365;
+/// Basis points representing 100%.
+pub const BASIS_POINTS_100_PERCENT: i128 = 10_000;
+/// Default maximum vault TTL (10 years, in seconds).
+const DEFAULT_MAX_TTL_SECONDS: u64 = 10 * DAYS_PER_YEAR * SECONDS_PER_DAY;
 /// Soroban maximum persistent entry TTL in ledgers (~180 days at 5s/ledger).
 const MAX_PERSISTENT_TTL: u32 = 3_110_400;
-
+/// Maximum number of snapshots retained per vault.
+const MAX_SNAPSHOTS_PER_VAULT: u32 = 1_000;
 /// Maximum number of vault IDs accepted by `get_vault_batch_status` in a single call.
 const MAX_BATCH_STATUS_SIZE: u32 = 100;
 
@@ -180,6 +202,13 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
 /// Minimum check-in interval: 1 hour (3600 seconds)
 /// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
 pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
+
+/// Maximum check-in interval: 10 years (315_360_000 seconds)
+/// Issue #1165: an unconditional ceiling — independent of the optional
+/// admin-configured MaxCheckInInterval — prevents an astronomically large
+/// interval (e.g. near u64::MAX) from overflowing TTL arithmetic or making
+/// automatic release practically unreachable.
+pub const MAX_CHECK_IN_INTERVAL: u64 = 315_360_000;
 
 /// Maximum number of beneficiaries allowed per vault.
 pub const MAX_BENEFICIARIES: u32 = 20;
@@ -513,7 +542,7 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .get(&StorageKey::MaxTtlSeconds)
-            .unwrap_or(315_360_000)
+            .unwrap_or(DEFAULT_MAX_TTL_SECONDS)
     }
 
     /// Sets the TTL decay rate as a percentage per month.
@@ -530,7 +559,7 @@ impl TtlVaultContract {
     /// * Panics if `decay_rate` is 0 or > 10000
     pub fn set_ttl_decay_rate(env: Env, decay_rate: u32) {
         Self::require_admin(&env);
-        if decay_rate == 0 || decay_rate > 10_000 {
+        if decay_rate == 0 || decay_rate as i128 > BASIS_POINTS_100_PERCENT {
             panic_with_error!(&env, ContractError::InvalidBps);
         }
         env.storage()
@@ -1000,13 +1029,13 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
 
-        // Calculate yield: (staked_amount * annual_yield_bps * time_elapsed) / (10000 * 365 * 86400)
+        // Calculate yield using annualized basis-point interest.
         let now = env.ledger().timestamp();
         let time_elapsed = now.saturating_sub(staking.staking_start);
         let yield_amount = (staking.staked_amount as i128)
             .checked_mul(staking.annual_yield_bps as i128)
             .and_then(|v| v.checked_mul(time_elapsed as i128))
-            .and_then(|v| v.checked_div(10000 * 365 * 86400))
+            .and_then(|v| v.checked_div(BASIS_POINTS_100_PERCENT * DAYS_PER_YEAR as i128 * SECONDS_PER_DAY as i128))
             .unwrap_or(0);
 
         if yield_amount <= 0 {
@@ -1046,7 +1075,7 @@ impl TtlVaultContract {
                 // Split yield between beneficiary and reinvestment
                 let beneficiary_amount = (yield_amount as i128)
                     .checked_mul(*beneficiary_bps as i128)
-                    .and_then(|v| v.checked_div(10000))
+                    .and_then(|v| v.checked_div(BASIS_POINTS_100_PERCENT))
                     .unwrap_or(0);
                 let reinvest_amount = yield_amount.saturating_sub(beneficiary_amount);
 
@@ -1128,7 +1157,7 @@ impl TtlVaultContract {
                 .storage()
                 .instance()
                 .get(&StorageKey::MaxTtlSeconds)
-                .unwrap_or(315_360_000),
+                .unwrap_or(DEFAULT_MAX_TTL_SECONDS),
             ttl_decay_rate: env
                 .storage()
                 .instance()
@@ -1160,7 +1189,7 @@ impl TtlVaultContract {
         if config.max_ttl_seconds == 0 {
             panic_with_error!(&env, ContractError::InvalidInterval);
         }
-        if config.ttl_decay_rate > 10_000 {
+        if config.ttl_decay_rate as i128 > BASIS_POINTS_100_PERCENT {
             panic_with_error!(&env, ContractError::InvalidBps);
         }
         let now = env.ledger().timestamp();
@@ -1342,6 +1371,11 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::CheckInIntervalTooShort);
         }
 
+        // Issue #1165: Enforce maximum check-in interval (10 years)
+        if check_in_interval > MAX_CHECK_IN_INTERVAL {
+            panic_with_error!(&env, ContractError::IntervalTooHigh);
+        }
+
         Self::assert_interval_in_bounds(&env, check_in_interval);
 
         if owner == beneficiary {
@@ -1402,6 +1436,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: Vec::new(&env),
             metadata,
@@ -1604,7 +1639,7 @@ impl TtlVaultContract {
             let elapsed = now.saturating_sub(original_last_check_in);
             let missed = (elapsed / vault.check_in_interval).saturating_sub(1);
             if missed > 0 && vault.balance > 0 {
-                let penalty_per = vault.balance * (penalty_bps as i128) / 10_000;
+                let penalty_per = vault.balance * (penalty_bps as i128) / BASIS_POINTS_100_PERCENT;
                 let total_penalty = (penalty_per * missed as i128).min(vault.balance);
                 if total_penalty > 0 {
                     let token_client = token::Client::new(&env, &vault.token_address);
@@ -3100,10 +3135,19 @@ impl TtlVaultContract {
             } else {
                 total
             };
+
+            // Issue #1167: guard directly against a zero-amount transfer at the
+            // actual release site, independent of the earlier `total == 0` checks,
+            // so no future change upstream can silently let a no-op release
+            // through and emit a misleading release event.
+            if release_amount == 0 {
+                panic_with_error!(&env, ContractError::EmptyVault);
+            }
+
             let token_client = token::Client::new(&env, &vault.token_address);
 
             // Calculate burn amount based on vault's burn_percentage (basis points)
-            let burn_amount: i128 = (release_amount * vault.burn_percentage as i128) / 10_000;
+            let burn_amount: i128 = (release_amount * vault.burn_percentage as i128) / BASIS_POINTS_100_PERCENT;
             let net_amount: i128 = release_amount - burn_amount;
             if burn_amount > 0 {
                 // Emit burn event; funds are effectively removed from circulation
@@ -3220,7 +3264,7 @@ impl TtlVaultContract {
         };
 
         // Apply decay: new_ttl = remaining * (1 - decay_rate / 10000)
-        let decayed_ttl = remaining * (10_000 - decay_rate as u64) / 10_000;
+        let decayed_ttl = remaining * (BASIS_POINTS_100_PERCENT as u64 - decay_rate as u64) / BASIS_POINTS_100_PERCENT as u64;
         let new_deadline = now + decayed_ttl;
 
         // Update last_check_in to reflect the decay application
@@ -3474,7 +3518,7 @@ impl TtlVaultContract {
                 let share = if i as u32 == last_idx {
                     amount - distributed
                 } else {
-                    amount * (entry.bps as i128) / 10_000
+                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -3532,7 +3576,7 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
         let total_bps: u32 = beneficiaries.iter().map(|e| e.bps).sum();
-        if total_bps != 10_000 {
+        if total_bps != BASIS_POINTS_100_PERCENT as u32 {
             return Err(ContractError::InvalidBps);
         }
         for entry in beneficiaries.iter() {
@@ -3637,7 +3681,7 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBps);
         }
         let total_bps: u32 = new_beneficiaries.iter().map(|e| e.bps).sum();
-        if total_bps != 10_000 {
+        if total_bps != BASIS_POINTS_100_PERCENT as u32 {
             return Err(ContractError::InvalidBps);
         }
         for entry in new_beneficiaries.iter() {
@@ -3715,7 +3759,7 @@ impl TtlVaultContract {
 
         // Calculate total BPS after adding new beneficiary
         let current_total: u32 = vault.beneficiaries.iter().map(|e| e.bps).sum();
-        if current_total + percentage > 10_000 {
+        if current_total as i128 + percentage as i128 > BASIS_POINTS_100_PERCENT {
             return Err(ContractError::InvalidBps);
         }
 
@@ -4229,7 +4273,7 @@ impl TtlVaultContract {
         {
             return Err(ContractError::VestingNotFound);
         }
-        if penalty_bps == 0 || penalty_bps > 10_000 {
+        if penalty_bps == 0 || penalty_bps as i128 > BASIS_POINTS_100_PERCENT {
             return Err(ContractError::InvalidBps);
         }
         let config = VestingPenaltyConfig {
@@ -4625,7 +4669,7 @@ impl TtlVaultContract {
                 let on_time_count = claimable.saturating_sub(late_count);
                 let on_time_amount = per_installment * on_time_count as i128;
                 let late_amount = per_installment * late_count as i128;
-                let penalty = late_amount * penalty_cfg.penalty_bps as i128 / 10_000;
+                let penalty = late_amount * penalty_cfg.penalty_bps as i128 / BASIS_POINTS_100_PERCENT;
                 let penalized = on_time_amount + late_amount - penalty;
                 // For the final batch keep vault.balance as ceiling to avoid dust mismatch.
                 if unlocked >= schedule.num_installments {
@@ -4659,7 +4703,7 @@ impl TtlVaultContract {
                 let share = if i as u32 == last_idx {
                     amount - distributed
                 } else {
-                    amount * (entry.bps as i128) / 10_000
+                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -4862,7 +4906,7 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBps);
         }
         let total_bps: u32 = milestones.iter().map(|m| m.bps).sum();
-        if total_bps != 10_000 {
+        if total_bps != BASIS_POINTS_100_PERCENT as u32 {
             return Err(ContractError::InvalidBps);
         }
         // Ensure no milestone is pre-fulfilled
@@ -5194,7 +5238,7 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
         let total_bps: u32 = entries.iter().map(|e| e.bps).sum();
-        if total_bps != 10_000 {
+        if total_bps != BASIS_POINTS_100_PERCENT as u32 {
             return Err(ContractError::InvalidBps);
         }
         let key = StorageKey::VestingStagger(vault_id);
@@ -5262,10 +5306,10 @@ impl TtlVaultContract {
                 // But since we don't track original balance, we'll just use BPS * (current_balance / remaining_bps).
                 // Better: assume vault.balance is the total pool for staggered vesting if no other vesting is set.
                 let per_installment =
-                    (vault.balance * entry.bps as i128 / 10_000) / entry.num_installments as i128;
+                    (vault.balance * entry.bps as i128 / BASIS_POINTS_100_PERCENT) / entry.num_installments as i128;
                 let amount = if unlocked >= entry.num_installments {
                     // Last installment takes the remaining share for this beneficiary
-                    (vault.balance * entry.bps as i128 / 10_000)
+                    (vault.balance * entry.bps as i128 / BASIS_POINTS_100_PERCENT)
                 } else {
                     per_installment * claimable as i128
                 };
@@ -5580,7 +5624,7 @@ impl TtlVaultContract {
                 let share = if is_last {
                     schedule.total_amount - total_claimable - schedule.claimed_amount
                 } else {
-                    schedule.total_amount * (milestone.bps as i128) / 10_000
+                    schedule.total_amount * (milestone.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 total_claimable += share;
                 any_claimable = true;
@@ -5619,7 +5663,7 @@ impl TtlVaultContract {
                 let share = if i as u32 == last_idx {
                     total_claimable - distributed
                 } else {
-                    total_claimable * (entry.bps as i128) / 10_000
+                    total_claimable * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -5867,7 +5911,7 @@ impl TtlVaultContract {
         timestamps.push_back(timestamp);
 
         // Limit snapshots to the last 1000 per vault
-        if timestamps.len() > 1000 {
+        if timestamps.len() > MAX_SNAPSHOTS_PER_VAULT {
             if let Some(oldest_timestamp) = timestamps.first() {
                 env.storage().persistent().remove(&StorageKey::VaultSnapshot(vault_id, oldest_timestamp));
                 timestamps.remove(0);
@@ -5898,6 +5942,23 @@ impl TtlVaultContract {
     /// # Returns
     /// The Unix timestamp of the last check-in
     pub fn get_vault_last_check_in(env: Env, vault_id: u64) -> u64 {
+        Self::load_vault(&env, vault_id).last_check_in
+    }
+
+    /// Lightweight query for a vault's last check-in timestamp — Issue #1166.
+    ///
+    /// Alias of `get_vault_last_check_in` under the shorter name the backend
+    /// reminder service and frontend dashboard expect, so owner-activity
+    /// monitoring doesn't need to fetch (or know the shape of) the full
+    /// vault record just to read this one field.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The Unix timestamp of the last check-in
+    pub fn get_last_check_in(env: Env, vault_id: u64) -> u64 {
         Self::load_vault(&env, vault_id).last_check_in
     }
 
@@ -5951,6 +6012,20 @@ impl TtlVaultContract {
     /// The Unix timestamp when the vault was created
     pub fn get_vault_created_at(env: Env, vault_id: u64) -> u64 {
         Self::load_vault(&env, vault_id).created_at
+    }
+
+    /// Returns the ledger sequence number at which the vault was created.
+    /// Dashboards and analytics tools can use this to determine how long
+    /// a vault has been active without relying on external event history.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The ledger sequence number when the vault was created
+    pub fn get_vault_age(env: Env, vault_id: u64) -> u64 {
+        Self::load_vault(&env, vault_id).creation_ledger
     }
 
     /// Returns the check-in interval for a vault.
@@ -6017,11 +6092,11 @@ impl TtlVaultContract {
     ///
     /// # Panics
     /// * Panics if the caller is not the vault owner
-    /// * Panics if `percentage` > 10_000
+    /// * Panics if `percentage` exceeds 100%
     pub fn set_burn_percentage(env: Env, vault_id: u64, percentage: u32) {
         let mut vault = Self::load_vault(&env, vault_id);
         vault.owner.require_auth();
-        if percentage > 10_000 {
+        if percentage as i128 > BASIS_POINTS_100_PERCENT {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
         vault.burn_percentage = percentage;
@@ -6980,7 +7055,12 @@ impl TtlVaultContract {
 
         env.events().publish(
             (symbol_short!("ben_init"), vault_id),
-            (new_beneficiary, now + timelock),
+            (new_beneficiary.clone(), now + timelock),
+        );
+
+        env.events().publish(
+            (BENEFICIARY_UPDATED_TOPIC, vault_id),
+            (vault.beneficiary.clone(), new_beneficiary.clone()),
         );
 
         Ok(())
@@ -7080,6 +7160,9 @@ impl TtlVaultContract {
         }
         if new_interval < MIN_CHECK_IN_INTERVAL {
             return Err(ContractError::CheckInIntervalTooShort);
+        }
+        if new_interval > MAX_CHECK_IN_INTERVAL {
+            return Err(ContractError::IntervalTooHigh);
         }
         Self::assert_interval_in_bounds(&env, new_interval);
         let mut vault = Self::load_vault(&env, vault_id);
@@ -7899,6 +7982,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: Vec::new(&env),
             metadata,
@@ -9552,6 +9636,7 @@ impl TtlVaultContract {
             check_in_interval: original.check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries: original.beneficiaries.clone(),
             metadata: original.metadata.clone(),
@@ -9664,7 +9749,7 @@ impl TtlVaultContract {
             Some(entries) => {
                 if !entries.is_empty() {
                     let total_bps: u32 = entries.iter().map(|e| e.bps).sum();
-                    if total_bps != 10_000 {
+                    if total_bps != BASIS_POINTS_100_PERCENT as u32 {
                         panic_with_error!(&env, ContractError::InvalidBps);
                     }
                     for entry in entries.iter() {
@@ -9696,6 +9781,7 @@ impl TtlVaultContract {
             check_in_interval,
             last_check_in: timestamp,
             created_at: timestamp,
+            creation_ledger: env.ledger().sequence() as u64,
             status: ReleaseStatus::Locked,
             beneficiaries,
             metadata,
@@ -13574,9 +13660,9 @@ impl TtlVaultContract {
     /// Computes the check-in score as a value in 0-10000 from on-time and total counts.
     fn compute_check_in_score(on_time: u32, total: u32) -> u32 {
         if total == 0 {
-            return 10000;
+            return BASIS_POINTS_100_PERCENT as u32;
         }
-        ((on_time as u64 * 10000) / total as u64) as u32
+        ((on_time as u64 * BASIS_POINTS_100_PERCENT as u64) / total as u64) as u32
     }
 
     // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
@@ -14158,7 +14244,7 @@ impl TtlVaultContract {
                 continue;
             }
 
-            let initial_share = release_amount * (entry.bps as i128) / 10_000;
+            let initial_share = release_amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT;
             if entry.minimum_threshold > 0 && initial_share < entry.minimum_threshold {
                 env.events().publish(
                     (MIN_THRESHOLD_SKIP_TOPIC,),
@@ -14194,7 +14280,7 @@ impl TtlVaultContract {
             return;
         }
 
-        if total_qualifying_bps < 10_000 && total_qualifying_bps > 0 {
+        if total_qualifying_bps < BASIS_POINTS_100_PERCENT as u32 && total_qualifying_bps > 0 {
             env.events().publish(
                 (BENEFICIARY_REBALANCED_TOPIC, vault_id),
                 BeneficiaryRebalancedEvent {
@@ -14278,9 +14364,9 @@ impl TtlVaultContract {
             .get(&StorageKey::CountdownConfig(vault_id))
             .unwrap_or_else(|| {
                 let mut t = Vec::new(&env);
-                t.push_back(604_800u64); // 7 days
-                t.push_back(259_200u64); // 3 days
-                t.push_back(86_400u64); // 1 day
+                t.push_back(7 * SECONDS_PER_DAY); // 7 days
+                t.push_back(3 * SECONDS_PER_DAY); // 3 days
+                t.push_back(SECONDS_PER_DAY); // 1 day
                 CountdownConfig { thresholds: t }
             })
     }
@@ -14355,7 +14441,7 @@ impl TtlVaultContract {
         {
             for schedule in schedules.iter() {
                 // Check for overlapping withdrawals (within 1 hour window)
-                if (new_timestamp as i128 - schedule.timestamp as i128).abs() < 3600 {
+                if (new_timestamp as i128 - schedule.timestamp as i128).abs() < SECONDS_PER_HOUR as i128 {
                     return false;
                 }
             }
@@ -14895,7 +14981,7 @@ impl TtlVaultContract {
                 let share = if i as u32 == last_idx {
                     amount - distributed
                 } else {
-                    amount * (entry.bps as i128) / 10_000
+                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -14950,7 +15036,7 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
-        if bonus_bps == 0 || bonus_bps > 10_000 {
+        if bonus_bps == 0 || bonus_bps as i128 > BASIS_POINTS_100_PERCENT {
             return Err(ContractError::InvalidBps);
         }
         let config = VestingBonusConfig {
@@ -15061,7 +15147,7 @@ impl TtlVaultContract {
         }
 
         let bonus = if all_on_time {
-            base_amount * bonus_cfg.bonus_bps as i128 / 10_000
+            base_amount * bonus_cfg.bonus_bps as i128 / BASIS_POINTS_100_PERCENT
         } else {
             0
         };
@@ -15093,7 +15179,7 @@ impl TtlVaultContract {
                     let share = if i as u32 == last_idx {
                         fallback - distributed
                     } else {
-                        fallback * (entry.bps as i128) / 10_000
+                        fallback * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                     };
                     if share > 0 {
                         token_client.transfer(
@@ -15143,7 +15229,7 @@ impl TtlVaultContract {
                 let share = if i as u32 == last_idx {
                     total_amount - distributed
                 } else {
-                    total_amount * (entry.bps as i128) / 10_000
+                    total_amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -15271,13 +15357,13 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        // Calculate accrued interest: amount * rate * elapsed / (10000 * 365 * 86400)
+        // Calculate accrued interest using annualized basis-point interest.
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(lending.lent_at);
         let interest = (lending.amount as i128)
             .checked_mul(lending.interest_rate_bps as i128)
             .and_then(|v| v.checked_mul(elapsed as i128))
-            .and_then(|v| v.checked_div(10000 * 365 * 86400))
+            .and_then(|v| v.checked_div(BASIS_POINTS_100_PERCENT * DAYS_PER_YEAR as i128 * SECONDS_PER_DAY as i128))
             .unwrap_or(0);
 
         lending.repaid = true;
@@ -15336,7 +15422,7 @@ impl TtlVaultContract {
         if collateral_amount <= 0 || vault.balance < collateral_amount {
             return Err(ContractError::InsufficientBalance);
         }
-        if collateral_ratio_bps < 10_000 {
+        if collateral_ratio_bps < BASIS_POINTS_100_PERCENT as u32 {
             return Err(ContractError::InvalidBps);
         }
 
@@ -15602,7 +15688,7 @@ impl TtlVaultContract {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
-        if late_penalty_bps > 10_000 {
+        if late_penalty_bps as i128 > BASIS_POINTS_100_PERCENT {
             return Err(ContractError::InvalidBps);
         }
         lender.require_auth();
@@ -15679,7 +15765,7 @@ impl TtlVaultContract {
 
         let now = env.ledger().timestamp();
         let penalty = if now > lending.repayment_deadline {
-            lending.amount * (lending.late_penalty_bps as i128) / 10_000
+            lending.amount * (lending.late_penalty_bps as i128) / BASIS_POINTS_100_PERCENT
         } else {
             0
         };
@@ -16295,7 +16381,7 @@ impl TtlVaultContract {
         }
 
         let timestamp = env.ledger().timestamp();
-        let grace_period = 86_400u64; // 24 hours
+        let grace_period = SECONDS_PER_DAY; // 24 hours
         let dispute_expires_at = timestamp + grace_period;
 
         let dispute = WithdrawalDispute {
