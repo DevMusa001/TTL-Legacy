@@ -1,7 +1,3 @@
-# ── Rust / Cargo ────────────────────────────────────────────────────────────
-target/
-**/*.rs.bk
-Cargo.lock.bk
 
 # ── Soroban / WASM build artifacts ─────────────────────────────────────────
 *.wasm
@@ -11,11 +7,24 @@ Cargo.lock.bk
 **/__snapshots__/
 *.snap
 *.snap.new
-contracts/ttl_vault/fuzz/artifacts/
-contracts/ttl_vault/fuzz/corpus/*/crash-*
-contracts/ttl_vault/fuzz/corpus/*/timeout-*
+*.insta.yaml
 
-# ── Environment files ────────────────────────────────────────────────────────
+# Build artifacts
+*.wasm
+*.d
+*.optimized.wasm
+
+# Soroban / Stellar CLI generated files
+.soroban/
+.stellar/
+contract-ids.json
+
+# Fuzz corpus and artifacts generated during fuzzing runs
+contracts/ttl_vault/fuzz/corpus/
+contracts/ttl_vault/fuzz/artifacts/
+contracts/ttl_vault/fuzz/target/
+
+# Environment files
 .env
 .env.local
 .env.*.local
@@ -34,9 +43,9 @@ Thumbs.db
 # ── Node (frontend / mobile tooling) ─────────────────────────────────────────
 node_modules/
 dist/
+build/
 .cache/
-.next/
-.nuxt/
+.parcel-cache/
 *.tsbuildinfo
 
 # ── Android build artifacts ───────────────────────────────────────────────────
@@ -57,23 +66,14 @@ mobile/ios/Pods/
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
-logs/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
-# ── Coverage & profiling ─────────────────────────────────────────────────────
+# Coverage reports
 lcov.info
+tarpaulin-report.html
 coverage/
 *.profraw
 *.profdata
 
-# ── Deployment artifacts ──────────────────────────────────────────────────────
-deploy-artifacts/
-smoke-results/
-
-# ── Temporary & misc ──────────────────────────────────────────────────────────
+# Temporary / misc
 *.tmp
 *.bak
-*.orig
-.DS_Store

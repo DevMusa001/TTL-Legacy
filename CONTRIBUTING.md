@@ -267,73 +267,51 @@ git commit -m "Update fuzz corpus after extended fuzzing run"
 
 For more details, see [contracts/ttl_vault/fuzz/README.md](contracts/ttl_vault/fuzz/README.md).
 
-## Troubleshooting FAQ
+## Conventional Commits
 
-### Docker containers not starting
+TTL-Legacy enforces the [Conventional Commits](https://www.conventionalcommits.org/) specification.
+All **PR titles** and **squash-merge commit messages** must follow this format:
 
-Check logs and verify ports are free:
-```bash
-docker-compose logs
 ```
-Ensure nothing else is bound to ports **5432** (PostgreSQL), **3000** (backend), or **8000** (Stellar Quickstart).
-If a port is already in use, stop the conflicting process or change the port mapping in `docker-compose.override.yml`.
+<type>(<optional scope>): <short description>
 
-### `cargo build` fails with `wasm32` target missing
+[optional body]
 
-The `wasm32-unknown-unknown` target must be added to your Rust toolchain:
-```bash
-rustup target add wasm32-unknown-unknown
+[optional footer(s)]
 ```
 
-### Stellar CLI `account not found`
+### Allowed Types
 
-Your deployer account doesn't exist on the network yet. Fund it via Friendbot (testnet only):
-```bash
-curl "https://friendbot.stellar.org?addr=<YOUR_ADDRESS>"
+| Type       | When to use                                          |
+|------------|------------------------------------------------------|
+| `feat`     | A new feature                                        |
+| `fix`      | A bug fix                                            |
+| `docs`     | Documentation-only changes                           |
+| `refactor` | Code change that is neither a fix nor a feature      |
+| `perf`     | Performance improvement                              |
+| `test`     | Adding or updating tests                             |
+| `build`    | Changes to the build system or external dependencies |
+| `ci`       | CI/CD configuration changes                          |
+| `chore`    | Other changes that do not modify src or test files   |
+| `revert`   | Reverts a previous commit                            |
+| `security` | Security fix or hardening                            |
+
+### Examples
+
 ```
-Replace `<YOUR_ADDRESS>` with the public key printed by `stellar keys address <key-name>`.
-
-### Backend fails to start: `DATABASE_URL not set`
-
-You haven't configured the environment file:
-```bash
-cp .env.example .env
+feat(vault): add batch check-in endpoint
+fix(check-in): return VaultNotFound instead of raw panic string
+docs(contributing): add conventional commit guide
+security(auth): enforce passkey nonce replay protection
+ci(release): add git-cliff changelog automation
+refactor(backend): extract sanitization middleware
 ```
-Open `.env` and fill in the `DATABASE_URL` and other required values. The example file documents each variable.
 
-### Frontend cannot reach backend
+### Why?
 
-Verify that `VITE_API_BASE_URL` in your `.env` matches the port the backend is running on (default: `http://localhost:3000`). Restart the frontend dev server after changing `.env` values.
-
-## OpenAPI Spec Update Workflow
-
-All changes to backend routes **must** be accompanied by a corresponding update to
-`docs/openapi.yaml`. This is enforced in CI via `openapi-spec-validator`.
-
-### Steps When Adding or Changing a Route
-
-1. **Implement the route** in `backend/src/routes.rs` and `backend/src/handlers.rs`.
-2. **Update `docs/openapi.yaml`** — add or modify the path, method, request body,
-   parameters, and response schemas.
-3. **Update `backend/tests/openapi_contract_test.rs`** — add the new route to the
-   `ROUTES` constant.
-4. **Run validation locally**:
-   ```bash
-   python3 -m pip install openapi-spec-validator
-   python3 -m openapi_spec_validator docs/openapi.yaml
-   ```
-5. **Open your PR** — CI will validate the spec automatically.
-
-### Why This Matters
-
-A stale OpenAPI spec misleads API consumers (mobile apps, third-party integrations)
-and breaks contract tests. Keeping the spec in sync is a first-class requirement,
-not a nice-to-have.
-
-### Spec Linting
-
-The CI pipeline runs `openapi-spec-validator` against `docs/openapi.yaml` on every
-push and pull request. A failing validation blocks merge.
+Commit messages are parsed by [git-cliff](https://git-cliff.org/) to auto-generate
+`CHANGELOG.md` on every release.  A CI job (`commitlint.yml`) validates PR titles
+against these rules on every pull request.
 
 ## Style Guide
 - Follow standard Rust idiomatic practices.
