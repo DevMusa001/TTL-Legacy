@@ -131,6 +131,9 @@ mod vault_archiving_tests;
 mod beneficiary_owner_check_tests;
 #[cfg(test)]
 mod storage_key_collision_tests;
+// Issue #1263: structured VaultNotFound error on check-in for non-existent vault
+#[cfg(test)]
+mod checkin_nonexistent_vault_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
