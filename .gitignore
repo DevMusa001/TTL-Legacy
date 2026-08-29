@@ -39,6 +39,7 @@ contracts/ttl_vault/fuzz/target/
 *~
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # ── Node (frontend / mobile tooling) ─────────────────────────────────────────
 node_modules/

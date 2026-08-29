@@ -179,6 +179,7 @@ struct VaultDetailView: View {
     @State private var show2FASetup = false
     @State private var show2FAVerify = false
     @State private var twoFactorStatus: TwoFactorStatus?
+    @State private var showShareLink = false
 
     var body: some View {
         List {
@@ -221,6 +222,16 @@ struct VaultDetailView: View {
         }
         .navigationTitle("Vault")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: { showShareLink = true }) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+            }
+        }
+        .sheet(isPresented: $showShareLink) {
+            VaultShareLinkView(vault: vault)
+        }
         .sheet(isPresented: $show2FASetup) {
             TwoFactorSetupView(vaultID: vault.id)
         }
@@ -531,6 +542,8 @@ struct DeepLinkView: View {
                 BeneficiaryAcceptanceView(vaultID: vaultID, token: token)
             case .vaultAction(let vaultID, let action):
                 VaultActionDeepLinkView(vaultID: vaultID, action: action)
+            case .vaultPreview(let vaultID):
+                VaultPreviewDeepLinkView(vaultID: vaultID)
             }
         }
     }
