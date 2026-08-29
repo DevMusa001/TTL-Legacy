@@ -1,5 +1,9 @@
 
-# Test snapshots
+# ── Soroban / WASM build artifacts ─────────────────────────────────────────
+*.wasm
+*.d
+
+# ── Test snapshots & fuzz artifacts ─────────────────────────────────────────
 **/__snapshots__/
 *.snap
 *.snap.new
@@ -24,19 +28,19 @@ contracts/ttl_vault/fuzz/target/
 .env
 .env.local
 .env.*.local
+.env.mainnet
+.env.testnet
 
-# Editor / IDE
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Node (frontend/backend tooling)
+# ── Node (frontend / mobile tooling) ─────────────────────────────────────────
 node_modules/
 dist/
 build/
@@ -44,7 +48,23 @@ build/
 .parcel-cache/
 *.tsbuildinfo
 
-# Logs
+# ── Android build artifacts ───────────────────────────────────────────────────
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/**/*.apk
+mobile/android/**/*.aab
+mobile/android/**/*.keystore
+
+# ── iOS / Xcode build artifacts ───────────────────────────────────────────────
+mobile/ios/build/
+mobile/ios/**/*.xcworkspace/xcuserdata/
+mobile/ios/**/*.xcodeproj/xcuserdata/
+mobile/ios/DerivedData/
+mobile/ios/**/*.ipa
+mobile/ios/Pods/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
 
 # Coverage reports
