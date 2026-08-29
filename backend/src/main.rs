@@ -11,15 +11,18 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 
+mod auth;
 mod consensus;
 mod db;
 mod error;
+mod security_headers;
 mod handlers;
 mod models;
 mod notifications;
 mod otel;
 mod rate_limit;
 mod routes;
+mod sanitization;
 mod scheduler;
 mod two_factor;
 mod escalation;
@@ -48,15 +51,30 @@ impl FromRef<AppState> for Arc<Db> {
     }
 }
 
-impl FromRef<AppState> for Arc<Metrics> {
-    fn from_ref(state: &AppState) -> Arc<Metrics> {
-        Arc::clone(&state.metrics)
-    }
-}
-
+/// Builds the CORS layer based on `APP_ENV` and `ALLOWED_ORIGINS` environment variables.
+///
+/// # Behaviour
+///
+/// | `APP_ENV`                   | `ALLOWED_ORIGINS`  | Result                                              |
+/// |-----------------------------|--------------------|----------------------------------------------------|
+/// | unset **or** `development`  | any / empty        | `CorsLayer::permissive()` — wildcard, dev mode      |
+/// | `production` / `staging`    | non-empty list     | Origin whitelist with `Vary: Origin` header         |
+/// | `production` / `staging`    | empty              | `CorsLayer::new()` — blocks all cross-origin        |
+///
+/// Issue #1179: CORS Policy Hardening
 fn build_cors_layer() -> CorsLayer {
+    let app_env = std::env::var("APP_ENV").unwrap_or_default();
+    let is_production = !app_env.is_empty() && app_env != "development";
+
+    // In development (or when APP_ENV is unset), allow everything.
+    if !is_production {
+        return CorsLayer::permissive();
+    }
+
+    // Production / staging: honour the ALLOWED_ORIGINS whitelist.
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
     if allowed_origins.is_empty() {
+        // No origins configured → block all cross-origin requests.
         return CorsLayer::new();
     }
 
@@ -75,6 +93,8 @@ fn build_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers(tower_http::cors::Any)
+        // Instruct caches / CDNs that the response varies by origin.
+        .vary([axum::http::header::ORIGIN])
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
@@ -240,8 +260,18 @@ async fn main() {
             "/api/vaults/:vault_id/vesting/bonus",
             get(routes::get_vesting_bonus),
         )
+        .route(
+            "/api/vaults/:vault_id/release-history",
+            get(routes::get_vault_release_history),
+        )
+        .route("/api/auth/token", post(auth::login))
+        .route("/api/auth/refresh", post(auth::refresh))
         .layer(build_cors_layer())
+        .layer(middleware::from_fn(sanitization::sanitize_request))
         .layer(middleware::from_fn_with_state(global_limiter, rate_limit::rate_limit_middleware))
+        // Outermost layer so every response — including CORS/rate-limit
+        // rejections — carries the baseline security headers.
+        .layer(middleware::from_fn(security_headers::security_headers_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
