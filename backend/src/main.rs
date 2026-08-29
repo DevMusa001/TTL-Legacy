@@ -21,6 +21,7 @@ mod models;
 mod notifications;
 mod otel;
 mod rate_limit;
+mod request_id;
 mod routes;
 mod sanitization;
 mod scheduler;
