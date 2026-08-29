@@ -203,6 +203,13 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
 /// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
 pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
 
+/// Maximum check-in interval: 10 years (315_360_000 seconds)
+/// Issue #1165: an unconditional ceiling — independent of the optional
+/// admin-configured MaxCheckInInterval — prevents an astronomically large
+/// interval (e.g. near u64::MAX) from overflowing TTL arithmetic or making
+/// automatic release practically unreachable.
+pub const MAX_CHECK_IN_INTERVAL: u64 = 315_360_000;
+
 /// Maximum number of beneficiaries allowed per vault.
 pub const MAX_BENEFICIARIES: u32 = 20;
 
@@ -1362,6 +1369,11 @@ impl TtlVaultContract {
         // Issue #1121: Enforce minimum check-in interval (1 hour)
         if check_in_interval < MIN_CHECK_IN_INTERVAL {
             panic_with_error!(&env, ContractError::CheckInIntervalTooShort);
+        }
+
+        // Issue #1165: Enforce maximum check-in interval (10 years)
+        if check_in_interval > MAX_CHECK_IN_INTERVAL {
+            panic_with_error!(&env, ContractError::IntervalTooHigh);
         }
 
         Self::assert_interval_in_bounds(&env, check_in_interval);
@@ -3122,6 +3134,15 @@ impl TtlVaultContract {
             } else {
                 total
             };
+
+            // Issue #1167: guard directly against a zero-amount transfer at the
+            // actual release site, independent of the earlier `total == 0` checks,
+            // so no future change upstream can silently let a no-op release
+            // through and emit a misleading release event.
+            if release_amount == 0 {
+                panic_with_error!(&env, ContractError::EmptyVault);
+            }
+
             let token_client = token::Client::new(&env, &vault.token_address);
 
             // Calculate burn amount based on vault's burn_percentage (basis points)
@@ -5923,6 +5944,23 @@ impl TtlVaultContract {
         Self::load_vault(&env, vault_id).last_check_in
     }
 
+    /// Lightweight query for a vault's last check-in timestamp — Issue #1166.
+    ///
+    /// Alias of `get_vault_last_check_in` under the shorter name the backend
+    /// reminder service and frontend dashboard expect, so owner-activity
+    /// monitoring doesn't need to fetch (or know the shape of) the full
+    /// vault record just to read this one field.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// The Unix timestamp of the last check-in
+    pub fn get_last_check_in(env: Env, vault_id: u64) -> u64 {
+        Self::load_vault(&env, vault_id).last_check_in
+    }
+
     /// Returns the balance of a vault.
     ///
     /// # Arguments
@@ -7102,6 +7140,9 @@ impl TtlVaultContract {
         }
         if new_interval < MIN_CHECK_IN_INTERVAL {
             return Err(ContractError::CheckInIntervalTooShort);
+        }
+        if new_interval > MAX_CHECK_IN_INTERVAL {
+            return Err(ContractError::IntervalTooHigh);
         }
         Self::assert_interval_in_bounds(&env, new_interval);
         let mut vault = Self::load_vault(&env, vault_id);
